@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.5.3
+// @version      0.5.4
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
-// @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
+// @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.meta.js
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_xmlhttpRequest
@@ -242,7 +242,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.3' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.4' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
