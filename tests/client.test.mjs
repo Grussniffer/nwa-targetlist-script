@@ -4,9 +4,10 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const coreSource = await readFile(new URL('../src/core.js', import.meta.url), 'utf8');
+const exportSource = await readFile(new URL('../src/export.js', import.meta.url), 'utf8');
 const platformSource = await readFile(new URL('../src/platform.js', import.meta.url), 'utf8');
 const appSource = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
-const source = `${coreSource}\n${platformSource}\n${appSource}`;
+const source = `${coreSource}\n${exportSource}\n${platformSource}\n${appSource}`;
 // Read the configured address without mounting; all requests below are manual mocks.
 const configSource = appSource.match(/^const CONFIG = .*;$/m)[0];
 const { serviceBase, version: scriptVersion } = vm.runInNewContext(
@@ -58,6 +59,10 @@ class Element {
   }
   attachShadow() { return this.shadow = new Element('shadow-root'); }
   get lastChild() { return this.children.at(-1); }
+  focus() { if (this.getRootNode()) this.getRootNode().activeElement = this; }
+  getRootNode() { let node = this; while (node.parentNode) node = node.parentNode; return node; }
+  select() { this.selected = true; }
+  click() { return this.emit('click'); }
   emit(type, additions = {}) {
     const event = { key: '', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...additions };
     for (const listener of this.listeners.get(type) || []) listener(event);
@@ -72,14 +77,16 @@ function textContent(element) {
 }
 async function flush() { for (let index = 0; index < 12; index++) await Promise.resolve(); }
 
-function fixture(saved = null, preferences = null, existingHost = null, initialNow = NOW, visibility = 'visible') {
+function fixture(saved = null, preferences = null, existingHost = null, initialNow = NOW, visibility = 'visible', clipboard = {}) {
   let clock = initialNow;
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
   const body = new Element('body'); const requests = []; const navigations = []; const storage = new Map(); const writes = []; const timers = []; const timeouts = new Map(); const timeoutDelays = new Map();
   const document = new Element('document');
+  const copied = []; const copyCommands = [];
   Object.assign(document, { body, visibilityState: visibility,
     getElementById: id => descendants(body).find(element => element.id === id), createElement: tag => new Element(tag),
-    createElementNS: (namespace, tag) => { const node = new Element(tag); node.namespaceURI = namespace; return node; } });
+    createElementNS: (namespace, tag) => { const node = new Element(tag); node.namespaceURI = namespace; return node; },
+    execCommand: command => { copyCommands.push(command); return clipboard.fallback !== false; } });
   if (existingHost) body.append(existingHost);
   let nextTimer = 1;
   const storageKey = `targetlist.session.${serviceBase}`;
@@ -87,7 +94,11 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   if (saved) storage.set(storageKey, saved);
   if (preferences) storage.set(preferencesKey, preferences);
   const context = vm.createContext({
-    URL, Intl, Date: Clock, console,
+    URL, Blob, Intl, Date: Clock, console,
+    navigator: { clipboard: { writeText: async value => {
+      if (clipboard.reject) throw new Error('Mock clipboard unavailable');
+      copied.push(value);
+    } } },
     window: { location: { assign: url => navigations.push(url) } },
     document,
     GM_xmlhttpRequest: options => { requests.push(options); },
@@ -128,7 +139,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const deletion = requests.at(-1); response(deletion, null, 204); await flush();
     return deletion;
   }
-  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel,
+  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel, copied, copyCommands,
     settings: () => find(element => element.className === 'settings-toggle'),
     text: () => textContent(root), setNow: value => { clock = value; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
@@ -1725,4 +1736,80 @@ test('approval starts a fresh target request and ignores an older target refresh
   app.response(newPool, { player, targets: [{ ...target, name: 'Approved Pool' }], warnings: [] });
   app.response(oldPool, { player, targets: [{ ...target, name: 'Old Pool' }], warnings: [] }); await flush();
   app.button('Targets').emit('click'); assert.match(app.text(), /Approved Pool/); assert.equal(app.text().includes('Old Pool'), false);
+});
+
+test('local CSV and Markdown exports offer the full authorized pool or the currently shown rows', async () => {
+  const other = { ...target, id: 98766, name: 'Other Target', estimatedStats: 900000, reason: 'Another approved reason' };
+  const app = fixture(); await app.signIn([{ ...target, reason: 'Approved chain reason' }, other]);
+  const before = app.requests.length;
+  const scope = app.find(element => element.attributes.get('aria-label') === 'Export scope');
+  assert.equal(scope.value, 'all');
+  app.button('Export CSV').emit('click');
+  const preview = app.find(element => element.attributes.get('aria-label') === 'Exported target list');
+  assert.equal(preview.readOnly, true);
+  assert.match(preview.value, /Target Player/); assert.match(preview.value, /Other Target/);
+  assert.match(preview.value, /500000/); assert.match(preview.value, /Approved chain reason/);
+  assert.equal(preview.value.includes(KEY), false); assert.equal(preview.value.includes(SESSION), false);
+  const snapshot = preview.value;
+  const search = app.find(element => element.type === 'search'); search.value = 'Target Player'; search.emit('input');
+  assert.equal(preview.value, snapshot, 'editing a filter does not silently change the open snapshot');
+  scope.value = 'shown'; scope.emit('change');
+  app.button('Export Markdown').emit('click');
+  const markdown = app.find(element => element.attributes.get('aria-label') === 'Exported target list');
+  assert.match(markdown.value, /\|.*Target Player.*\|/);
+  assert.equal(markdown.value.includes('Other Target'), false);
+  assert.match(markdown.value, /https:\/\/www\.torn\.com\/profiles\.php\?XID=98765/);
+  assert.equal(app.requests.length, before, 'exporting and filtering only read the in-memory authorized pool');
+});
+
+test('exports remain available for a freshly authorized empty target pool', async () => {
+  const app = fixture(); await app.signIn([]); const before = app.requests.length;
+  assert.equal(app.button('Export CSV').disabled, false);
+  app.button('Export CSV').emit('click');
+  const csv = app.find(element => element.attributes.get('aria-label') === 'Exported target list').value;
+  assert.match(csv, /"ID","Name"/); assert.equal(csv.includes('Target Player'), false);
+  app.button('Export Markdown').emit('click');
+  assert.match(app.find(element => element.attributes.get('aria-label') === 'Exported target list').value, /\|/);
+  assert.equal(app.requests.length, before);
+});
+
+test('copy export uses the clipboard with a selectable preview fallback for WebViews', async () => {
+  for (const fallback of [null, true, false]) {
+    const app = fixture(null, null, null, NOW, 'visible', { reject: fallback !== null, fallback });
+    await app.signIn(); app.button('Export CSV').emit('click');
+    const preview = app.find(element => element.attributes.get('aria-label') === 'Exported target list');
+    app.button('Copy export').emit('click'); await flush();
+    if (fallback === null) {
+      assert.deepEqual(app.copied, [preview.value]); assert.deepEqual(app.copyCommands, []);
+    } else {
+      assert.equal(preview.selected, true); assert.deepEqual(app.copyCommands, ['copy']);
+      if (fallback === false) assert.match(app.text(), /select|manually/i);
+    }
+  }
+});
+
+test('stale pool authorization blocks export until a fresh feed arrives', async () => {
+  const app = fixture(); await app.signIn(); const retained = app.button('Export CSV');
+  const before = app.requests.length; app.setNow(NOW + 30000); retained.emit('click');
+  assert.equal(descendants(app.root).some(element => element.attributes.get('aria-label') === 'Exported target list'), false);
+  assert.equal(app.requests.length, before, 'the export action must not issue hidden provider or database requests');
+  app.button('Refresh list').emit('click');
+  assert.equal(app.button('Export CSV').disabled, true, 'a pending feed has no authorized export snapshot');
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
+  app.button('Export CSV').emit('click');
+  assert.match(app.find(element => element.attributes.get('aria-label') === 'Exported target list').value, /Target Player/);
+});
+
+test('sign out and expiry clear the export text and retained controls cannot export again', async () => {
+  for (const interruption of ['logout', 'expiry']) {
+    const app = fixture(); await app.signIn(); const retained = app.button('Export CSV'); retained.emit('click');
+    const preview = app.find(element => element.attributes.get('aria-label') === 'Exported target list');
+    assert.match(preview.value, /Target Player/);
+    if (interruption === 'logout') await app.signOut();
+    else { app.setNow(NOW + 3600000); app.timers[0](); await flush(); }
+    assert.equal(preview.value, '', `${interruption} clears text even from the removed textarea node`);
+    retained.emit('click');
+    assert.equal(descendants(app.root).some(element => element.attributes.get('aria-label') === 'Exported target list'), false);
+    assert.equal(app.storage.has(app.storageKey), false);
+  }
 });

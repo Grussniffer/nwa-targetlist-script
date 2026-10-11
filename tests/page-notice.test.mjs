@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const core = await readFile(new URL('../src/core.js', import.meta.url), 'utf8');
+const exportSource = await readFile(new URL('../src/export.js', import.meta.url), 'utf8');
 const platform = await readFile(new URL('../src/platform.js', import.meta.url), 'utf8');
 const app = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
 const { pageTargetId } = vm.runInNewContext(`${core}\nTargetListCore;`, { URL });
@@ -133,7 +134,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
     setTimeout: (callback, delay = 0) => { const id = nextTimeout++; timeouts.set(id, { callback, delay }); return id; },
     clearTimeout: id => timeouts.delete(id),
   });
-  vm.runInContext(`(() => {\n${core}\n${platform}\n${app}\n})();`, context);
+  vm.runInContext(`(() => {\n${core}\n${exportSource}\n${platform}\n${app}\n})();`, context);
   function shortTimeouts() { for (const [id, entry] of [...timeouts]) if (entry.delay < 1000) { timeouts.delete(id); entry.callback(); } }
   function mutation() { for (const observer of observers) if (observer.active) observer.callback([{ target: content || body }]); shortTimeouts(); }
   function response(request, data, status = 200) { assert.ok(request, 'an expected request exists'); request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url }); }

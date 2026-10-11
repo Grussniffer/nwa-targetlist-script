@@ -485,6 +485,110 @@ async function submitSuggestion(page) {
   await shadow(page, '.suggestionform', 'submit');
 }
 
+async function checkExportDownload(page, download, preview, mime, mode) {
+  const blob = await page.evaluate(async () => {
+    const value = window.__exports.blobs.at(-1);
+    return { bytes: [...new Uint8Array(await value.arrayBuffer())], type: value.type, size: value.size };
+  });
+  const bytes = Buffer.from(blob.bytes), text = bytes.toString('utf8');
+  // Native textareas normalize CRLF to LF; CSV files retain their RFC row ends.
+  // Decode raw bytes here because Blob.text() consumes a UTF-8 BOM.
+  assert.equal(text.replace(/\r\n/g, '\n'), preview, `${mode}: download content matches the preview`);
+  assert.match(blob.type, mime);
+  assert.equal(blob.size, bytes.length);
+  const failure = await download.failure();
+  if (failure === null) {
+    assert.deepEqual(await readFile(await download.path()), bytes, `${mode}: saved download bytes match its Blob`);
+  } else {
+    // Some managed Chromium environments cancel even a plain Blob download.
+    // Keep checking the real download event, filename and exact Blob bytes,
+    // and report that saving the file to disk was not verified on this host.
+    assert.equal(failure, 'canceled', `${mode}: unexpected download failure`);
+    console.log(`LIMIT ${mode}: Chromium canceled the mock file save; download event, filename, MIME and exact Blob bytes verified.`);
+  }
+}
+
+async function checkExports(pageContext, scripts, mode) {
+  const viewport = mode === 'PDA' ? { width: 320, height: 844 } : { width: 1280, height: 960 };
+  const page = await mount(viewport, scripts, pageContext, () => {
+    window.__mock.targets[0].name = 'Willow Ægir';
+    window.__mock.targets[0].reason = 'Approved, with "quotes" and a second line\nfor NWA.';
+    window.__exports = { blobs: [], copied: [], fallback: [], clipboardFailure: false };
+    const originalCreateObjectURL = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = blob => { window.__exports.blobs.push(blob); return originalCreateObjectURL(blob); };
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      async writeText(text) {
+        if (window.__exports.clipboardFailure) throw new Error('Mock WebView clipboard unavailable');
+        window.__exports.copied.push(text);
+      }
+    } });
+    document.execCommand = command => {
+      const textarea = window.__targetlistShadow.querySelector('[aria-label="Exported target list"]');
+      window.__exports.fallback.push({ command, value: textarea?.value,
+        start: textarea?.selectionStart, end: textarea?.selectionEnd });
+      return true;
+    };
+  }, undefined, 'https://www.torn.com/index.php');
+  await login(page);
+  await shadow(page, 'input[type=search]', 'fill', 'Willow');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 1);
+  const before = await page.evaluate(() => window.__mock.requests.length);
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Export scope"]').value), 'all');
+  await clickButton(page, 'Export CSV');
+  const csv = await page.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Exported target list"]').value);
+  assert.match(csv, /Willow Ægir/); assert.match(csv, /Granite/); assert.match(csv, /Mystery/); assert.match(csv, /OldEstimate/);
+  assert.match(csv, /Approved, with ""quotes"" and a second line\nfor NWA\./);
+  assert.equal(csv.includes('MockLimitedKey01'), false); assert.equal(csv.includes('mock-session-token'), false);
+  const date = await page.evaluate(() => new Date(Date.now()).toISOString().slice(0, 10));
+  let downloadReady = page.waitForEvent('download', { timeout: 5000 });
+  await clickButton(page, 'Download export');
+  let download = await downloadReady;
+  assert.equal(download.suggestedFilename(), `nwa-targetlist-${date}.csv`);
+  await checkExportDownload(page, download, csv, /^text\/csv/, mode);
+  await clickButton(page, 'Copy export');
+  await wait(page, () => window.__exports.copied.length === 1);
+  assert.equal((await page.evaluate(() => window.__exports.copied[0])).replace(/\r\n/g, '\n'), csv);
+  await shadow(page, '[aria-label="Export scope"]', 'select', 'shown');
+  await clickButton(page, 'Export Markdown');
+  const markdown = await page.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Exported target list"]').value);
+  assert.match(markdown, /^# NWA target list/); assert.match(markdown, /Willow Ægir/);
+  assert.equal(markdown.includes('Granite'), false); assert.equal(markdown.includes('Mystery'), false);
+  assert.match(markdown, /https:\/\/www\.torn\.com\/profiles\.php\?XID=101/);
+  downloadReady = page.waitForEvent('download', { timeout: 5000 });
+  await clickButton(page, 'Download export'); download = await downloadReady;
+  assert.equal(download.suggestedFilename(), `nwa-targetlist-${date}.md`);
+  await checkExportDownload(page, download, markdown, /^text\/markdown/, mode);
+  await page.evaluate(() => { window.__exports.clipboardFailure = true; });
+  await clickButton(page, 'Copy export');
+  await wait(page, () => window.__exports.fallback.length === 1);
+  assert.deepEqual(await page.evaluate(() => window.__exports.fallback[0]),
+    { command: 'copy', value: markdown, start: 0, end: markdown.length }, `${mode}: denied clipboard falls back to the selected preview`);
+  assert.equal(await page.evaluate(() => window.__mock.requests.length), before, `${mode}: exporting never issues another API request`);
+  const geometry = await page.evaluate(() => {
+    const root = window.__targetlistShadow, textarea = root.querySelector('[aria-label="Exported target list"]');
+    const rect = textarea.getBoundingClientRect(), panel = root.querySelector('.panel').getBoundingClientRect();
+    return { left: rect.left, right: rect.right, width: innerWidth,
+      panelLeft: panel.left, panelRight: panel.right,
+      fontSize: getComputedStyle(textarea).fontSize,
+      overflow: root.querySelector('.scroll').scrollWidth > root.querySelector('.scroll').clientWidth + 1 };
+  });
+  assert(geometry.left >= 0 && geometry.right <= geometry.width && geometry.panelLeft >= 0
+    && geometry.panelRight <= geometry.width && !geometry.overflow, `${mode}: ${JSON.stringify(geometry)}`);
+  if (mode === 'PDA') assert.equal(geometry.fontSize, '16px', 'mobile export text avoids iOS focus zoom');
+  await page.screenshot({ path: path.join(artifacts, `browser-export-${mode === 'PDA' ? 'pda-320' : 'desktop'}.png`), fullPage: true });
+  await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    window.__retainedExport = root.querySelector('[aria-label="Exported target list"]');
+    window.__retainedExportButton = [...root.querySelectorAll('button')].find(node => node.textContent === 'Export CSV');
+  });
+  await signOut(page);
+  assert.equal(await page.evaluate(() => window.__retainedExport.value), '', `${mode}: logout clears removed preview text`);
+  await page.evaluate(() => window.__retainedExportButton.click());
+  assert.equal(await page.evaluate(() => Boolean(window.__targetlistShadow.querySelector('[aria-label="Exported target list"]'))), false);
+  await page.close();
+  console.log(`PASS ${mode} local all/shown CSV and Markdown snapshots, download events/content and MIME types, Unicode/reasons, clipboard fallback, mobile bounds and logout cleanup`);
+}
+
 async function assertDock(page) {
   const geometry = await page.evaluate(() => {
     const root = window.__targetlistShadow;
@@ -1831,9 +1935,13 @@ try {
   } finally { await pdaContext.close(); }
 
   await checkDeltaRendering(context, [source], 'GM');
+  await checkExports(context, [source], 'GM');
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
-  try { await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA'); }
+  try {
+    await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+  }
   finally { await deltaPdaContext.close(); }
 
   assert.equal(networkRequests, 0, 'Browser attempted external network access');

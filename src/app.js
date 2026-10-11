@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -66,6 +66,7 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '',
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
+  let exportSnapshot = null, exportView = null;
   const css = document.createElement('style');
   css.textContent = `
     :host{all:initial;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#edf4f4;font-size:14px;line-height:1.5}
@@ -102,6 +103,11 @@ function mountTargetList(platform, storageWarning = '') {
     .stat strong{display:block;color:#e4f5f3;font-size:15px}.toolbar{display:grid;grid-template-columns:1fr 160px;gap:10px;margin:14px 0}
     .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.controls label{display:flex;align-items:center;gap:5px}.controls input{width:74px;padding:5px 8px}.controls button{margin-left:auto}
     .stat-range-summary{font-size:12px;color:#a8b9c2;margin-top:8px;overflow-wrap:anywhere}
+    .exports,.export-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .exports label{display:flex;align-items:center;gap:6px}.exports select{padding:6px 8px}
+    .export-preview{margin-top:12px;padding:12px;background:#101c24;border:1px solid #354956;border-radius:9px}
+    .export-preview textarea{display:block;width:100%;height:180px;margin-top:8px;resize:vertical;font-family:monospace;font-size:12px;white-space:pre}
+    .export-preview .notice{margin-top:8px}.export-preview .export-status{margin-top:8px;color:#baf8e7;font-size:12px}
     .count{margin:15px 0 10px;font-size:12px;color:#a8b9c2}.cards{display:grid;gap:10px}.card{border:1px solid #354956;border-radius:10px;padding:14px;background:#192b36}
     .cardhead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.name{font-weight:750;font-size:15px}.badge{font-size:10px;font-weight:750;padding:4px 7px;border-radius:5px;white-space:nowrap;background:#20473e;color:#a4efd9}
     .badge.warn{background:#4e3e26;color:#f6d290}.badge.muted{background:#2c3944;color:#bbcad4}
@@ -115,7 +121,7 @@ function mountTargetList(platform, storageWarning = '') {
     .success{background:#20473e;color:#baf8e7;padding:10px 13px;border-radius:8px;margin:12px 0;font-size:13px}
     .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:13px;color:#d4e4e9}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
     .queueheader h3{font-size:16px}.queuefooter{margin-top:12px}.suggestioncard .actions button{padding:6px 10px}.suggestioncard .name{overflow-wrap:anywhere}
-    @media(pointer:coarse){input,select,textarea{font-size:16px}}
+    @media(pointer:coarse){input,select,textarea,.export-preview textarea{font-size:16px}}
     @media(max-width:480px){.panel{top:calc(var(--nwa-viewport-top,0px) + 8px);right:60px;width:calc(100vw - 68px);max-height:calc(100vh - 16px);max-height:calc(var(--nwa-viewport-height,100dvh) - 16px)}
       .scroll{padding:14px}.toolbar{grid-template-columns:1fr}.statgrid{grid-template-columns:repeat(2,1fr)}
       .metrics{grid-template-columns:1fr 1fr}.cardhead{flex-wrap:wrap}.badge{white-space:normal}.actions{gap:8px}.header{padding:12px 14px}.suggestionfields{grid-template-columns:1fr}}
@@ -186,6 +192,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function clearSession() {
     cancelFind(); state.findAfterLogin = false;
+    clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
     state.feedTargets = []; state.feedCursor = null;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
@@ -303,6 +310,78 @@ function mountTargetList(platform, storageWarning = '') {
   function authorizedPoolFresh() {
     const age = Date.now() - state.poolLoadedAt;
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
+  }
+  function canExport() {
+    return Boolean(state.token && state.player && Date.parse(state.expiresAt) > Date.now()
+      && authorizedPoolFresh() && !state.loading && !state.busy && !state.removingKey);
+  }
+  function updateExportControls() {
+    if (panelUi?.exportButtons) for (const control of panelUi.exportButtons) control.disabled = !canExport();
+  }
+  function clearExport() {
+    if (exportView) { exportView.textarea.value = ''; exportView.node.remove(); }
+    exportSnapshot = null; exportView = null;
+  }
+  function exportAccess() {
+    if (canExport()) return true;
+    clearExport(); message('Refresh the target list before exporting.'); updateExportControls(); return false;
+  }
+  async function copyExport() {
+    if (!exportAccess() || !exportSnapshot || !exportView) return;
+    const snapshot = exportSnapshot, view = exportView, generation = state.generation;
+    let copied = false;
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+        await navigator.clipboard.writeText(snapshot.text); copied = true;
+      }
+    } catch { /* Older WebViews can still copy selected text. */ }
+    if (generation !== state.generation || snapshot !== exportSnapshot || view !== exportView) return;
+    if (!exportAccess()) return;
+    if (!copied) {
+      view.textarea.focus?.(); view.textarea.select?.();
+      try { copied = document.execCommand?.('copy') === true; } catch { /* Keep the selected text for manual copying. */ }
+    }
+    view.status.textContent = copied ? 'Export copied.' : 'Select and copy the export text on this device.';
+  }
+  function downloadExport() {
+    if (!exportAccess() || !exportSnapshot || !exportView) return;
+    let url = null, anchor = null;
+    try {
+      url = URL.createObjectURL(new Blob([exportSnapshot.text], { type: exportSnapshot.mime }));
+      anchor = element('a'); anchor.href = url; anchor.download = exportSnapshot.filename; anchor.hidden = true;
+      root.append(anchor); anchor.click();
+      exportView.status.textContent = 'Download requested. If no file appears, use Copy export.';
+    } catch {
+      exportView.status.textContent = 'File downloads are unavailable here. Use Copy export or select the text.';
+    } finally {
+      anchor?.remove();
+      if (url) setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* The WebView may already have released it. */ } }, 30000);
+    }
+  }
+  function showExport(format) {
+    if (!exportAccess()) return;
+    const now = Date.now(), shown = panelUi.exportScope.value === 'shown';
+    const targets = shown ? C.select(state.targets, state.player, state, now).map(row => row.target) : state.targets;
+    let serialized;
+    try { serialized = TargetListExport.serialize(format, targets, { now }); }
+    catch { message('The target list could not be exported. Try again.'); return; }
+    exportSnapshot = { ...serialized, filename: `nwa-targetlist-${new Date(now).toISOString().slice(0, 10)}.${serialized.extension}` };
+    if (!exportView) {
+      const node = element('section', null, 'export-preview'); node.setAttribute('aria-label', 'Target list export');
+      const label = element('strong');
+      const textarea = element('textarea'); textarea.readOnly = true; textarea.spellcheck = false;
+      textarea.setAttribute('aria-label', 'Exported target list');
+      const actions = element('div', null, 'export-actions');
+      actions.append(button('Copy export', () => void copyExport()), button('Download export', downloadExport), button('Close export', clearExport));
+      const status = element('div', '', 'export-status'); status.setAttribute('role', 'status');
+      node.append(label, element('div', '', 'muted'), textarea, actions,
+        element('div', 'This is a snapshot. In Torn PDA, use Copy export if file downloads are unavailable.', 'notice'), status);
+      exportView = { node, label, detail: node.children[1], textarea, status };
+      panelUi.exportHost.append(node);
+    }
+    exportView.label.textContent = exportSnapshot.filename;
+    exportView.detail.textContent = `${targets.length} ${shown ? 'shown' : 'total'} targets · ${new Date(now).toISOString()}`;
+    exportView.textarea.value = exportSnapshot.text; exportView.status.textContent = ''; message('');
   }
   let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null;
   let pageNoticeEstimate = null, pageNoticeEstimateDetail = null, pageNoticeDetail = null, pageNoticeDetails = null;
@@ -765,6 +844,7 @@ function mountTargetList(platform, storageWarning = '') {
   let orderedRowsKey = null, orderedIds = [], mountedIds = [], emptyCard = null;
   const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
   function resetPanel() {
+    clearExport();
     content.replaceChildren(); cardContainer = null; countNode = null; panelUi = null; renderedKind = null;
     suggestionContainer = null; suggestionSignature = null; cardNodes.clear();
     orderedRowsKey = null; orderedIds = []; mountedIds = []; emptyCard = null;
@@ -786,6 +866,7 @@ function mountTargetList(platform, storageWarning = '') {
     for (const [key, node] of panelUi.stats) setText(node, C.compact(player.battleStats[key]));
     panelUi.updateRangeSummary();
     setText(panelUi.refresh, state.loading ? 'Loading…' : 'Refresh list'); panelUi.refresh.disabled = state.loading;
+    updateExportControls();
     // Background changes must not overwrite a number the member is still typing.
     for (const [property, node] of panelUi.ratios) if (root.activeElement !== node) node.value = panelUi.percent(state[property]);
     if (root.activeElement !== panelUi.age) panelUi.age.value = String(state.estimateDays);
@@ -914,6 +995,17 @@ function mountTargetList(platform, storageWarning = '') {
     content.append(ageControls);
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
     ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; content.append(ageCaution);
+    const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
+    const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
+    for (const [value, label] of [['all', 'All targets'], ['shown', 'Shown targets']]) {
+      const option = element('option', label); option.value = value; exportScope.append(option);
+    }
+    exportScope.value = 'all'; scopeLabel.append(exportScope); exports.append(scopeLabel);
+    panelUi.exportScope = exportScope; panelUi.exportButtons = [];
+    for (const [format, label] of [['csv', 'Export CSV'], ['markdown', 'Export Markdown']]) {
+      const control = button(label, () => showExport(format)); panelUi.exportButtons.push(control); exports.append(control);
+    }
+    panelUi.exportHost = element('div'); content.append(exports, panelUi.exportHost);
     countNode = element('div', null, 'count'); cardContainer = element('div', null, 'cards'); content.append(countNode, cardContainer);
     const note = element('div', null, 'footnote');
     panelUi.estimateNote = element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
@@ -999,6 +1091,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function renderCards() {
     if (!state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
+    updateExportControls();
     const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
     const selected = new Map();
     let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0;

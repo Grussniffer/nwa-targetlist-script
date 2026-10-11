@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.6.0
+// @version      0.6.1
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -175,6 +175,76 @@ const TargetListCore = (() => {
   return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
 })();
 
+const TargetListExport = (() => {
+  const csvHeaders = ['ID', 'Name', 'Faction ID', 'Faction', 'Estimated stats', 'Estimate source',
+    'Estimate updated at', 'Reason', 'Status', 'Status description', 'Status until', 'Checked at',
+    'Last active', 'Reserved by another member', 'Reservation expires at', 'Profile URL', 'Attack URL'];
+  const markdownHeaders = ['Player', 'Faction', 'Estimated stats', 'Estimate source', 'Estimate updated',
+    'Reason', 'Status', 'Checked at', 'Last active', 'Attack'];
+
+  function text(value) { return typeof value === 'string' ? value : ''; }
+  function id(value) { return Number.isSafeInteger(value) && value > 0 && value <= 2147483647 ? value : ''; }
+  function stat(value) { return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : ''; }
+  function date(value) {
+    if (!Number.isFinite(value)) return '';
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : '';
+  }
+  function unixDate(value) { return typeof value === 'number' && value > 0 ? date(value * 1000) : ''; }
+  function stringDate(value) { return typeof value === 'string' && value.trim() ? date(Date.parse(value)) : ''; }
+  function record(target) {
+    const value = target && typeof target === 'object' ? target : {};
+    const playerId = id(value.id);
+    const factionId = id(value.faction?.id);
+    return [playerId, text(value.name), factionId, text(value.faction?.name), stat(value.estimatedStats),
+      text(value.estimateSource), unixDate(value.estimateUpdatedAt), text(value.reason).trim() || text(value.notes).trim(),
+      text(value.status?.state), text(value.status?.description), unixDate(value.status?.until), stringDate(value.checkedAt),
+      unixDate(value.lastAction), typeof value.reserved === 'boolean' ? String(value.reserved) : '',
+      stringDate(value.reservationExpiresAt), playerId ? `https://www.torn.com/profiles.php?XID=${playerId}` : '',
+      playerId ? `https://www.torn.com/page.php?sid=attack&user2ID=${playerId}` : ''];
+  }
+  function csvCell(value) {
+    let safe = String(value);
+    // Quotes alone do not prevent spreadsheets from evaluating a text cell.
+    if (typeof value === 'string' && (/^[\s\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f]*[=+\-@]/u.test(safe)
+        || /^[\t\r\n]/u.test(safe))) safe = `'${safe}`;
+    return `"${safe.replace(/"/g, '""')}"`;
+  }
+  function markdown(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/[\\`*_{}\[\]()!#|~]/g, '\\$&').replace(/\r\n?|\n/g, '<br>');
+  }
+  function markdownRow(row) {
+    const [playerId, name, factionId, faction, stats, source, updated, reason, status, description,
+      until, checked, active, reserved, reservationExpires, profile, attack] = row;
+    const playerLabel = `${markdown(name)}${playerId ? `${name ? ' ' : ''}\\[${playerId}\\]` : ''}`;
+    const factionLabel = `${markdown(faction)}${factionId ? `${faction ? ' ' : ''}\\[${factionId}\\]` : ''}`;
+    const statusLines = [status, description && description !== status ? description : '',
+      until ? `Until: ${until}` : '', reserved ? `Reserved by another member: ${reserved}` : '',
+      reservationExpires ? `Reservation expires: ${reservationExpires}` : ''].filter(Boolean).map(markdown);
+    return [profile ? `[${playerLabel}](${profile})` : playerLabel,
+      factionId ? `[${factionLabel}](https://www.torn.com/factions.php?step=profile&ID=${factionId})` : factionLabel,
+      markdown(stats), markdown(source), markdown(updated), markdown(reason), statusLines.join('<br>'),
+      markdown(checked), markdown(active), attack ? `[Attack](${attack})` : ''];
+  }
+  function serialize(format, targets, { now = Date.now() } = {}) {
+    if (!['csv', 'markdown'].includes(format)) throw new Error('Choose CSV or Markdown for the target list export.');
+    if (!Array.isArray(targets)) throw new TypeError('A target list is required to export.');
+    const rows = targets.map(record);
+    if (format === 'csv') return {
+      text: `\ufeff${[csvHeaders, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n')}\r\n`,
+      mime: 'text/csv;charset=utf-8', extension: 'csv',
+    };
+    const table = [markdownHeaders, markdownHeaders.map(() => '---'), ...rows.map(markdownRow)]
+      .map(row => `| ${row.join(' | ')} |`).join('\n');
+    return {
+      text: `# NWA target list\n\nExported at: ${date(now) || 'Unknown'}\n\nTargets: ${rows.length}\n\n${table}\n`,
+      mime: 'text/markdown;charset=utf-8', extension: 'md',
+    };
+  }
+  return { serialize };
+})();
+
 // Torn PDA's native bridge and per-script storage, with the existing
 // Tampermonkey API kept synchronous. This adapter never stores a Torn API key.
 const TargetListPlatform = (() => {
@@ -287,7 +357,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -354,6 +424,7 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '',
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
+  let exportSnapshot = null, exportView = null;
   const css = document.createElement('style');
   css.textContent = `
     :host{all:initial;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#edf4f4;font-size:14px;line-height:1.5}
@@ -390,6 +461,11 @@ function mountTargetList(platform, storageWarning = '') {
     .stat strong{display:block;color:#e4f5f3;font-size:15px}.toolbar{display:grid;grid-template-columns:1fr 160px;gap:10px;margin:14px 0}
     .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.controls label{display:flex;align-items:center;gap:5px}.controls input{width:74px;padding:5px 8px}.controls button{margin-left:auto}
     .stat-range-summary{font-size:12px;color:#a8b9c2;margin-top:8px;overflow-wrap:anywhere}
+    .exports,.export-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .exports label{display:flex;align-items:center;gap:6px}.exports select{padding:6px 8px}
+    .export-preview{margin-top:12px;padding:12px;background:#101c24;border:1px solid #354956;border-radius:9px}
+    .export-preview textarea{display:block;width:100%;height:180px;margin-top:8px;resize:vertical;font-family:monospace;font-size:12px;white-space:pre}
+    .export-preview .notice{margin-top:8px}.export-preview .export-status{margin-top:8px;color:#baf8e7;font-size:12px}
     .count{margin:15px 0 10px;font-size:12px;color:#a8b9c2}.cards{display:grid;gap:10px}.card{border:1px solid #354956;border-radius:10px;padding:14px;background:#192b36}
     .cardhead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.name{font-weight:750;font-size:15px}.badge{font-size:10px;font-weight:750;padding:4px 7px;border-radius:5px;white-space:nowrap;background:#20473e;color:#a4efd9}
     .badge.warn{background:#4e3e26;color:#f6d290}.badge.muted{background:#2c3944;color:#bbcad4}
@@ -403,7 +479,7 @@ function mountTargetList(platform, storageWarning = '') {
     .success{background:#20473e;color:#baf8e7;padding:10px 13px;border-radius:8px;margin:12px 0;font-size:13px}
     .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:13px;color:#d4e4e9}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
     .queueheader h3{font-size:16px}.queuefooter{margin-top:12px}.suggestioncard .actions button{padding:6px 10px}.suggestioncard .name{overflow-wrap:anywhere}
-    @media(pointer:coarse){input,select,textarea{font-size:16px}}
+    @media(pointer:coarse){input,select,textarea,.export-preview textarea{font-size:16px}}
     @media(max-width:480px){.panel{top:calc(var(--nwa-viewport-top,0px) + 8px);right:60px;width:calc(100vw - 68px);max-height:calc(100vh - 16px);max-height:calc(var(--nwa-viewport-height,100dvh) - 16px)}
       .scroll{padding:14px}.toolbar{grid-template-columns:1fr}.statgrid{grid-template-columns:repeat(2,1fr)}
       .metrics{grid-template-columns:1fr 1fr}.cardhead{flex-wrap:wrap}.badge{white-space:normal}.actions{gap:8px}.header{padding:12px 14px}.suggestionfields{grid-template-columns:1fr}}
@@ -474,6 +550,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function clearSession() {
     cancelFind(); state.findAfterLogin = false;
+    clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
     state.feedTargets = []; state.feedCursor = null;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
@@ -591,6 +668,78 @@ function mountTargetList(platform, storageWarning = '') {
   function authorizedPoolFresh() {
     const age = Date.now() - state.poolLoadedAt;
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
+  }
+  function canExport() {
+    return Boolean(state.token && state.player && Date.parse(state.expiresAt) > Date.now()
+      && authorizedPoolFresh() && !state.loading && !state.busy && !state.removingKey);
+  }
+  function updateExportControls() {
+    if (panelUi?.exportButtons) for (const control of panelUi.exportButtons) control.disabled = !canExport();
+  }
+  function clearExport() {
+    if (exportView) { exportView.textarea.value = ''; exportView.node.remove(); }
+    exportSnapshot = null; exportView = null;
+  }
+  function exportAccess() {
+    if (canExport()) return true;
+    clearExport(); message('Refresh the target list before exporting.'); updateExportControls(); return false;
+  }
+  async function copyExport() {
+    if (!exportAccess() || !exportSnapshot || !exportView) return;
+    const snapshot = exportSnapshot, view = exportView, generation = state.generation;
+    let copied = false;
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+        await navigator.clipboard.writeText(snapshot.text); copied = true;
+      }
+    } catch { /* Older WebViews can still copy selected text. */ }
+    if (generation !== state.generation || snapshot !== exportSnapshot || view !== exportView) return;
+    if (!exportAccess()) return;
+    if (!copied) {
+      view.textarea.focus?.(); view.textarea.select?.();
+      try { copied = document.execCommand?.('copy') === true; } catch { /* Keep the selected text for manual copying. */ }
+    }
+    view.status.textContent = copied ? 'Export copied.' : 'Select and copy the export text on this device.';
+  }
+  function downloadExport() {
+    if (!exportAccess() || !exportSnapshot || !exportView) return;
+    let url = null, anchor = null;
+    try {
+      url = URL.createObjectURL(new Blob([exportSnapshot.text], { type: exportSnapshot.mime }));
+      anchor = element('a'); anchor.href = url; anchor.download = exportSnapshot.filename; anchor.hidden = true;
+      root.append(anchor); anchor.click();
+      exportView.status.textContent = 'Download requested. If no file appears, use Copy export.';
+    } catch {
+      exportView.status.textContent = 'File downloads are unavailable here. Use Copy export or select the text.';
+    } finally {
+      anchor?.remove();
+      if (url) setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* The WebView may already have released it. */ } }, 30000);
+    }
+  }
+  function showExport(format) {
+    if (!exportAccess()) return;
+    const now = Date.now(), shown = panelUi.exportScope.value === 'shown';
+    const targets = shown ? C.select(state.targets, state.player, state, now).map(row => row.target) : state.targets;
+    let serialized;
+    try { serialized = TargetListExport.serialize(format, targets, { now }); }
+    catch { message('The target list could not be exported. Try again.'); return; }
+    exportSnapshot = { ...serialized, filename: `nwa-targetlist-${new Date(now).toISOString().slice(0, 10)}.${serialized.extension}` };
+    if (!exportView) {
+      const node = element('section', null, 'export-preview'); node.setAttribute('aria-label', 'Target list export');
+      const label = element('strong');
+      const textarea = element('textarea'); textarea.readOnly = true; textarea.spellcheck = false;
+      textarea.setAttribute('aria-label', 'Exported target list');
+      const actions = element('div', null, 'export-actions');
+      actions.append(button('Copy export', () => void copyExport()), button('Download export', downloadExport), button('Close export', clearExport));
+      const status = element('div', '', 'export-status'); status.setAttribute('role', 'status');
+      node.append(label, element('div', '', 'muted'), textarea, actions,
+        element('div', 'This is a snapshot. In Torn PDA, use Copy export if file downloads are unavailable.', 'notice'), status);
+      exportView = { node, label, detail: node.children[1], textarea, status };
+      panelUi.exportHost.append(node);
+    }
+    exportView.label.textContent = exportSnapshot.filename;
+    exportView.detail.textContent = `${targets.length} ${shown ? 'shown' : 'total'} targets · ${new Date(now).toISOString()}`;
+    exportView.textarea.value = exportSnapshot.text; exportView.status.textContent = ''; message('');
   }
   let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null;
   let pageNoticeEstimate = null, pageNoticeEstimateDetail = null, pageNoticeDetail = null, pageNoticeDetails = null;
@@ -1053,6 +1202,7 @@ function mountTargetList(platform, storageWarning = '') {
   let orderedRowsKey = null, orderedIds = [], mountedIds = [], emptyCard = null;
   const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
   function resetPanel() {
+    clearExport();
     content.replaceChildren(); cardContainer = null; countNode = null; panelUi = null; renderedKind = null;
     suggestionContainer = null; suggestionSignature = null; cardNodes.clear();
     orderedRowsKey = null; orderedIds = []; mountedIds = []; emptyCard = null;
@@ -1074,6 +1224,7 @@ function mountTargetList(platform, storageWarning = '') {
     for (const [key, node] of panelUi.stats) setText(node, C.compact(player.battleStats[key]));
     panelUi.updateRangeSummary();
     setText(panelUi.refresh, state.loading ? 'Loading…' : 'Refresh list'); panelUi.refresh.disabled = state.loading;
+    updateExportControls();
     // Background changes must not overwrite a number the member is still typing.
     for (const [property, node] of panelUi.ratios) if (root.activeElement !== node) node.value = panelUi.percent(state[property]);
     if (root.activeElement !== panelUi.age) panelUi.age.value = String(state.estimateDays);
@@ -1202,6 +1353,17 @@ function mountTargetList(platform, storageWarning = '') {
     content.append(ageControls);
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
     ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; content.append(ageCaution);
+    const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
+    const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
+    for (const [value, label] of [['all', 'All targets'], ['shown', 'Shown targets']]) {
+      const option = element('option', label); option.value = value; exportScope.append(option);
+    }
+    exportScope.value = 'all'; scopeLabel.append(exportScope); exports.append(scopeLabel);
+    panelUi.exportScope = exportScope; panelUi.exportButtons = [];
+    for (const [format, label] of [['csv', 'Export CSV'], ['markdown', 'Export Markdown']]) {
+      const control = button(label, () => showExport(format)); panelUi.exportButtons.push(control); exports.append(control);
+    }
+    panelUi.exportHost = element('div'); content.append(exports, panelUi.exportHost);
     countNode = element('div', null, 'count'); cardContainer = element('div', null, 'cards'); content.append(countNode, cardContainer);
     const note = element('div', null, 'footnote');
     panelUi.estimateNote = element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
@@ -1287,6 +1449,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function renderCards() {
     if (!state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
+    updateExportControls();
     const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
     const selected = new Map();
     let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0;

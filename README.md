@@ -53,6 +53,7 @@ The backend is already set to [targetlist.grusmedia.no](https://targetlist.grusm
 
 - **Targets:** browse the list, search players/factions/reasons, or filter by estimated stats. **Possible matches** applies your minimum, maximum and estimate-age limit.
 - **Check status:** check a target before opening its attack page.
+- **Export:** open the gear, choose **All targets** or **Shown targets**, then **Export CSV** or **Export Markdown**. Download the file or use **Copy export**; the preview also supports manual text selection in Torn PDA. Exports include estimates, factions, reasons, status timestamps and Torn links.
 - **Profiles and attack pages:** a small NWA badge shares the FairFight line, or the player's name/title line when FFScouter is absent or there is no room. It shows estimated battle stats without adding a row. Tap it for the full reason, estimate source and age. FFScouter is optional. The badge appears after your session and target list have loaded, including for targets outside your stat range.
 - **Suggestions:** suggest a player or faction with a required comment.
 - **Approvals:** faction leaders and co-leaders can approve or reject suggestions.
