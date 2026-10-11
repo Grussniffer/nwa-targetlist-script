@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.2' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -35,6 +35,7 @@ if (!window.top || window.top === window.self) {
 function mountTargetList(platform, storageWarning = '') {
   const C = TargetListCore;
   const FEED_REFRESH_MS = 10_000;
+  const COORDINATION_UNAVAILABLE = 'Target coordination is unavailable. Refresh the list or ask an administrator to update the backend.';
   let base;
   try { base = C.serviceUrl(CONFIG.serviceUrl); }
   catch (error) { console.error('[NWA] Invalid service address:', error.message); return; }
@@ -194,7 +195,7 @@ function mountTargetList(platform, storageWarning = '') {
     cancelFind(); state.findAfterLogin = false;
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
-    state.feedTargets = []; state.feedCursor = null;
+    state.feedTargets = []; state.feedCursor = null; state.reservationsSupported = false;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
     state.backgroundRenderPending = false;
     state.pendingChecks.clear(); state.busy = false; state.loading = false; state.targetGeneration++; state.expiresAt = null;
@@ -674,6 +675,7 @@ function mountTargetList(platform, storageWarning = '') {
           return;
         }
       }
+      if (!state.reservationsSupported) { findNotice(COORDINATION_UNAVAILABLE); return; }
       const matches = C.select(state.targets, state.player, { ...state, mode: 'suggested' });
       state.recentTargets = C.recentTargets(state.recentTargets);
       const candidates = C.candidates(matches, state.recentTargets);
@@ -686,17 +688,9 @@ function mountTargetList(platform, storageWarning = '') {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
         const target = candidates[index];
-        const cached = assessTarget(target);
-        if (!state.reservationsSupported && authorizedPoolFresh() && cached.suggested && cached.ready) {
-          rememberTarget(target.id);
-          findNotice(`Opening ${target.name || 'target'}…`);
-          window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`);
-          return;
-        }
-        findNotice(`Checking ${target.name || 'player'}…`);
+        findNotice(`Reserving ${target.name || 'player'}…`);
         let checked;
-        try { checked = await request(state.reservationsSupported ? 'POST' : 'GET',
-          `/api/targets/${target.id}/${state.reservationsSupported ? 'reservation' : 'status'}`,
+        try { checked = await request('POST', `/api/targets/${target.id}/reservation`,
           undefined, state.token, Math.min(3000, remainingMs)); }
         catch (error) {
           if (!current()) return;
@@ -713,7 +707,7 @@ function mountTargetList(platform, storageWarning = '') {
         }
         if (!current()) return;
         if (checked?.id !== target.id) throw new Error('NWA could not verify this target. Try again.');
-        if (state.reservationsSupported && !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+        if (!state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
           throw new Error('NWA could not reserve this target. Try again.');
         }
         state.targets = state.targets.map(row => row.id === target.id ? { ...row, ...checked } : row);
@@ -745,12 +739,13 @@ function mountTargetList(platform, storageWarning = '') {
   }
   async function checkStatus(id, openAttack = false) {
     if (state.removingKey || state.pendingChecks.has(id)) return;
+    if (openAttack && !state.reservationsSupported) { message(COORDINATION_UNAVAILABLE); renderCards(); return; }
     state.pendingChecks.add(id); message(''); renderCards();
     const generation = state.generation;
     const targetGeneration = state.targetGeneration;
     try {
-      const checked = await request(openAttack && state.reservationsSupported ? 'POST' : 'GET',
-        `/api/targets/${id}/${openAttack && state.reservationsSupported ? 'reservation' : 'status'}`);
+      const checked = await request(openAttack ? 'POST' : 'GET',
+        `/api/targets/${id}/${openAttack ? 'reservation' : 'status'}`);
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
       if (checked?.id !== id) throw new Error('NWA could not verify this target. Try again.');
       state.targets = state.targets.map(target => target.id === id ? { ...target, ...checked } : target);
@@ -758,7 +753,7 @@ function mountTargetList(platform, storageWarning = '') {
         const latest = state.targets.find(target => target.id === id);
         const assessment = latest && assessTarget(latest);
         if (!state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh() || !assessment?.suggested || !assessment.ready
-          || state.reservationsSupported && !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+          || !state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
           throw new Error('This target is no longer ready. Refresh the list and try another.');
         }
         rememberTarget(id);
@@ -766,7 +761,8 @@ function mountTargetList(platform, storageWarning = '') {
       }
     } catch (error) {
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
-      state.targets = state.targets.map(target => target.id === id ? { ...target, checkedAt: null } : target);
+      state.targets = state.targets.map(target => target.id === id ? { ...target, checkedAt: null,
+        ...(error.code === 'TARGET_RESERVED' ? { reserved: true } : {}) } : target);
       handleError(error);
     } finally {
       if (generation === state.generation) { state.pendingChecks.delete(id); renderCards(); }
@@ -1010,7 +1006,7 @@ function mountTargetList(platform, storageWarning = '') {
     const note = element('div', null, 'footnote');
     panelUi.estimateNote = element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
     note.append(panelUi.estimateNote,
-      element('p', 'Refreshing the list checks for updates; FFScouter may still have an older estimate. Recently opened targets are skipped for 10 minutes. NWA assignments last 60 seconds when the backend supports reservations.'),
+      element('p', 'Refreshing the list checks for updates; FFScouter may still have an older estimate. Recently opened targets are skipped for 10 minutes. The finder and list attack buttons require a shared reservation. Assignments last two minutes with the current backend, even when you choose another target.'),
       element('p', 'NWA uses availability checked within 30 seconds. Check status to update a target now. Status can change at any time; Torn makes the final availability check.'));
     panelUi.poolMetadata = element('div'); panelUi.metadata = null; note.append(panelUi.poolMetadata);
     content.append(note); updatePanelControls(); renderCards();
@@ -1153,6 +1149,9 @@ function mountTargetList(platform, storageWarning = '') {
       const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id)); check.disabled = state.pendingChecks.has(target.id) || state.loading;
       actions.append(check);
       const guardAttack = event => {
+        if (!state.reservationsSupported) {
+          event.preventDefault(); message(COORDINATION_UNAVAILABLE); renderCards(); return false;
+        }
         const latest = state.targets.find(t => t.id === target.id);
         const currentAssessment = latest && assessTarget(latest);
         if (!latest || !state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh()
@@ -1166,11 +1165,8 @@ function mountTargetList(platform, storageWarning = '') {
           if (guardAttack(event)) void checkStatus(target.id, true);
         }, 'attack');
         attack.disabled = state.pendingChecks.has(target.id); actions.append(attack);
-      } else if (assessment.suggested && assessment.ready && freshPool && !target.reserved) {
-        const attack = link('Attack ↗', `https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`, 'attack');
-        attack.addEventListener('click', guardAttack);
-        attack.addEventListener('auxclick', guardAttack);
-        actions.append(attack);
+      } else if (assessment.suggested && assessment.ready && freshPool && !target.reserved && !state.reservationsSupported) {
+        actions.append(element('small', 'Target coordination unavailable. Refresh the list.'));
       } else actions.append(element('small', target.reserved ? 'Reserved by another NWA member' : !assessment.suggested ? assessment.label : assessment.live ? target.status?.description || 'Unavailable right now' : 'Check availability to open attack'));
       card.append(actions);
     }

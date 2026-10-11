@@ -134,7 +134,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       reviewedBy: null, reviewedAt: null }];
     window.__mock = { requests: [], pending: [], holds: [], overrides: {}, player, targets, store, suggestions,
       delta: false, feedSnapshots: new Map(), feedSequence: 0, feedResponses: [],
-      reservations: null, reservedTargets: new Set(),
+      reservations: { supported: true, leaseMs: 120000 }, reservedTargets: new Set(),
       canReview: false, serviceOrigin: 'https://targetlist.grusmedia.no' };
     const originalSetInterval = window.setInterval;
     window.__mock.intervals = [];
@@ -180,7 +180,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           window.__mock.reservedTargets.add(id);
           data = { id, faction: { id: 77001, name: 'Mock Target Faction' }, checkedAt: new Date(Date.now()).toISOString(),
             status: { state: 'Okay', description: 'Okay (mock)', until: null },
-            reservationExpiresAt: new Date(Date.now() + 60000).toISOString() };
+            reservationExpiresAt: new Date(Date.now() + 120000).toISOString() };
         }
       } else if (/^\/api\/targets\/\d+\/status$/.test(url.pathname)) {
         const id = Number(url.pathname.split('/')[3]);
@@ -269,7 +269,7 @@ async function refreshMockFeed(page) {
 
 function makePerformanceFeed({ size = 1000, reservation = false } = {}) {
   const mock = window.__mock, template = structuredClone(mock.targets[0]);
-  mock.delta = true; mock.reservations = reservation ? { supported: true, leaseMs: 60000 } : null;
+  mock.delta = true; mock.reservations = { supported: true, leaseMs: 120000 };
   mock.targets.splice(0, mock.targets.length, ...Array.from({ length: size }, (_, index) => ({
     ...structuredClone(template), id: index < 3 ? 101 + index : 10000 + index,
     name: `Performance target ${String(index + 1).padStart(4, '0')}`, notes: `Approved performance reason ${index + 1}.`,
@@ -458,7 +458,7 @@ async function cardSnapshot(page, id) {
   return page.evaluate(id => {
     const card = [...window.__targetlistShadow.querySelectorAll('.card')]
       .find(node => node.querySelector('.name').textContent.includes(`[${id}]`));
-    return card ? { text: card.textContent, attack: card.querySelector('a.attack')?.getAttribute('href') || null } : null;
+    return card ? { text: card.textContent, attack: card.querySelector('button.attack')?.tagName || null } : null;
   }, id);
 }
 async function signOut(page) {
@@ -905,7 +905,7 @@ try {
     await route.fulfill({ status: 200, contentType: 'text/html',
       body: '<!doctype html><title>Mock attack destination</title><h1>Mock destination only: no attack executed</h1>' });
   });
-  await quick.evaluate(() => { window.__mock.holds.push('/api/targets/101/status'); });
+  await quick.evaluate(() => { window.__mock.holds.push('/api/targets/101/reservation'); });
   const pagesBeforeFind = context.pages().length;
   await shadow(quick, '.launcher', 'click');
   await wait(quick, () => window.__mock.pending.length === 1);
@@ -914,20 +914,80 @@ try {
   assert.equal(await quick.evaluate(() => window.__targetlistShadow.querySelector('.launcher').disabled), true);
   statusRequests = await quick.evaluate(() => structuredClone(window.__mock.requests));
   const navigated = quick.waitForURL(attackUrl, { timeout: 5000 });
-  await quick.evaluate(() => window.__mock.release('/api/targets/101/status'));
+  await quick.evaluate(() => window.__mock.release('/api/targets/101/reservation'));
   await navigated;
   assert.equal(context.pages().length, pagesBeforeFind);
   assert.equal(destination.url, attackUrl);
   assert.equal(destination.navigation, true);
-  assert.equal(destination.requests.at(-1).method, 'GET');
-  assert.equal(destination.requests.at(-1).path, '/api/targets/101/status');
+  assert.equal(destination.requests.at(-1).method, 'POST');
+  assert.equal(destination.requests.at(-1).path, '/api/targets/101/reservation');
   assert.equal(await quick.locator('h1').textContent(), 'Mock destination only: no attack executed');
   await quick.close();
-  console.log('PASS NWA waits for a live status check then opens the same-tab attack page, fulfilled entirely by a local mock');
+  console.log('PASS NWA waits for a shared lease then opens the same-tab attack page, fulfilled entirely by a local mock');
+
+  for (const capability of ['missing', 'false']) {
+    const unsupported = await mount(undefined, [source], context, value => {
+      const mock = window.__mock;
+      mock.reservations = value === 'missing' ? null : { supported: false };
+      mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
+      mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
+    }, capability);
+    await login(unsupported);
+    assert.equal(await unsupported.evaluate(() => window.__targetlistShadow.querySelector('.attack')), null);
+    const before = await unsupported.evaluate(() => window.__mock.requests.length);
+    await shadow(unsupported, '.launcher', 'click');
+    await wait(unsupported, () => window.__targetlistShadow.querySelector('.quick-notice').textContent.includes('Target coordination is unavailable.'));
+    assert.equal(await unsupported.evaluate(() => window.__mock.requests.length), before);
+    assert.equal(unsupported.url(), 'about:blank');
+    await unsupported.close();
+  }
+  console.log('PASS missing or false coordination support blocks cached and manual attack paths without a GET status fallback');
+
+  const sharedClaims = new Map(), sharedCalls = [];
+  await context.exposeFunction('__coordinatedLease', ({ owner, id, now }) => {
+    const existing = sharedClaims.get(id);
+    const conflict = existing !== undefined && existing !== owner;
+    sharedCalls.push({ owner, id, conflict });
+    if (conflict) return { status: 409, data: { error: { code: 'TARGET_RESERVED', message: 'Another member is using this target.' } } };
+    sharedClaims.set(id, owner);
+    return { status: 200, data: { id, status: { state: 'Okay' }, checkedAt: new Date(now).toISOString(),
+      reservationExpiresAt: new Date(now + 120000).toISOString() } };
+  });
+  const coordinated = await Promise.all([90011, 90012].map(owner => mount(undefined, [source], context, owner => {
+    const mock = window.__mock;
+    mock.player.id = owner;
+    mock.targets.splice(0, mock.targets.length, ...[101, 104].map((id, index) => ({
+      ...structuredClone(mock.targets[0]), id, name: `Shared mock target ${id}`, estimatedStats: 300000 + index,
+      status: { state: 'Okay' }, checkedAt: new Date(Date.now()).toISOString()
+    })), ...mock.targets.filter(target => target.id === 102 || target.id === 103));
+    const originalRequest = window.GM_xmlhttpRequest;
+    window.GM_xmlhttpRequest = request => {
+      const url = new URL(request.url);
+      if (request.method !== 'POST' || !/^\/api\/targets\/\d+\/reservation$/.test(url.pathname)) return originalRequest(request);
+      mock.requests.push({ method: request.method, path: url.pathname, headers: request.headers });
+      window.__coordinatedLease({ owner, id: Number(url.pathname.split('/')[3]), now: Date.now() })
+        .then(({ status, data }) => request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url }));
+      return { abort() {} };
+    };
+  }, owner)));
+  try {
+    await Promise.all(coordinated.map(page => login(page)));
+    await Promise.all(coordinated.map(page => page.route('https://www.torn.com/page.php?sid=attack&user2ID=*', route => route.fulfill({
+      status: 200, contentType: 'text/html', body: '<!doctype html><h1>Coordinated mock target only</h1>'
+    }))));
+    const navigations = coordinated.map(page => page.waitForURL(/page\.php\?sid=attack&user2ID=(101|104)$/, { timeout: 5000 }));
+    await Promise.all(coordinated.map(page => shadow(page, '.launcher', 'click')));
+    await Promise.all(navigations);
+    assert.deepEqual(new Set(coordinated.map(page => Number(new URL(page.url()).searchParams.get('user2ID')))), new Set([101, 104]));
+    assert.equal(sharedCalls.filter(call => call.id === 101).length, 2, 'both clients initially choose the same ready candidate');
+    assert.equal(sharedCalls.filter(call => call.conflict).length, 1, 'one client loses the shared claim and must choose another');
+    assert.equal(sharedClaims.size, 2);
+  } finally { await Promise.all(coordinated.map(page => page.close())); }
+  console.log('PASS two simultaneous browser clients choosing the same cached target obtain different shared targets after one reservation conflict');
 
   const estimateSettings = await mount(undefined, [source], context, () => {
     const mock = window.__mock;
-    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.reservations = { supported: true, leaseMs: 120000 };
     mock.store.set(`targetlist.preferences.${mock.serviceOrigin}`, { recentTargets: [{ id: 101, at: Date.now() }] });
     mock.targets[0].reason = '<strong>Alliance attack history</strong>';
     mock.targets[0].notes = 'Legacy notes should not be shown';
@@ -967,7 +1027,7 @@ try {
 
   const reservation = await mount(undefined, [source], context, () => {
     const mock = window.__mock;
-    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.reservations = { supported: true, leaseMs: 120000 };
     mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
     mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
     mock.targets[3].estimateUpdatedAt = Math.floor(Date.now() / 1000) - 3600;
@@ -995,7 +1055,7 @@ try {
 
   const manualReservation = await mount(undefined, [source], context, () => {
     const mock = window.__mock;
-    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.reservations = { supported: true, leaseMs: 120000 };
     mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
     mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
     mock.holds.push('/api/targets/101/reservation');
@@ -1055,14 +1115,16 @@ try {
     return structuredClone(window.__mock.requests);
   });
   await warmNavigation;
-  assert.equal(warmRequests.length, 1, 'the warm click adds no feed or individual status request');
+  assert.equal(warmRequests.length, 2, 'the warm click adds one shared lease and no feed or individual status request');
+  assert.equal(warmRequests[1].method, 'POST');
+  assert.equal(warmRequests[1].path, '/api/targets/101/reservation');
   assert.equal(warmRequests[0].path, '/api/targets');
   assert.equal(warmRequests.some(request => request.path.endsWith('/status')), false);
   assert.equal(warmDestination.url, attackUrl);
   assert.equal(warmDestination.navigation, true);
   assert.equal(await warm.locator('h1').textContent(), 'Cached destination only: no attack executed');
   await warm.close();
-  console.log('PASS saved-token startup preload, fresh below-minimum and cached Hospital exclusion, ready-before-unknown selection, and warm NWA click with zero extra requests');
+  console.log('PASS saved-token startup preload, fresh below-minimum and cached Hospital exclusion, ready-before-unknown selection, and warm NWA click with one shared lease and no extra feed request');
 
   for (const expired of ['status', 'authorization']) {
     const stale = await mount(undefined, [source], context, expired => {
@@ -1082,7 +1144,7 @@ try {
         // Status remains fresh while its authorized feed snapshot has reached the deadline.
         window.__mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
       }
-      window.__mock.holds.push(expired === 'status' ? '/api/targets/101/status' : '/api/targets');
+      window.__mock.holds.push(expired === 'status' ? '/api/targets/101/reservation' : '/api/targets');
     }, expired);
     let staleDestination;
     await stale.route(attackUrl, async route => {
@@ -1093,7 +1155,7 @@ try {
     await wait(stale, () => window.__mock.pending.length === 1);
     assert.equal(stale.url(), 'about:blank');
     assert.equal(staleDestination, undefined);
-    const pendingPath = expired === 'status' ? '/api/targets/101/status' : '/api/targets';
+    const pendingPath = expired === 'status' ? '/api/targets/101/reservation' : '/api/targets';
     const requests = await stale.evaluate(() => structuredClone(window.__mock.requests));
     assert.equal(requests.length, 2);
     assert.equal(requests.at(-1).path, pendingPath);
@@ -1199,7 +1261,7 @@ try {
   assert.match(await shadow(main, '.profile', 'text'), /MockChainer \[90001\].*Mock Allowed Faction/s);
   assert.match(await shadow(main, '.statgrid', 'text'), /Strength400K.*Defense250K.*Speed200K.*Dexterity150K/s);
   assert.match((await cardSnapshot(main, 103)).text, /Stats unknown.*Unknown/s);
-  assert.equal((await main.evaluate(() => [...window.__targetlistShadow.querySelectorAll('a.attack')].length)), 0);
+  assert.equal((await main.evaluate(() => [...window.__targetlistShadow.querySelectorAll('button.attack')].length)), 0);
   assert.equal(await main.evaluate(() => [...window.__mock.store.values()][0]?.token), 'mock-session-token');
   assert.equal(await main.evaluate(() => JSON.stringify([...window.__mock.store.values()]).includes('MockLimitedKey01')), false);
   assert.equal(await main.evaluate(() => JSON.parse(window.__mock.requests.find(row => row.method === 'POST' && row.path === '/api/session').data).storeKey), true);
@@ -1217,8 +1279,9 @@ try {
   console.log('PASS possible matches, stale/unknown/above-limit exclusion, search across notes and names');
 
   await cardAction(main, 101);
-  await wait(main, () => Boolean(window.__targetlistShadow.querySelector('a.attack')));
-  assert.equal((await cardSnapshot(main, 101)).attack, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+  await wait(main, () => Boolean(window.__targetlistShadow.querySelector('button.attack')));
+  assert.equal((await cardSnapshot(main, 101)).attack, 'BUTTON');
+  assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelector('button.attack').getAttribute('href')), null);
   await cardAction(main, 102);
   await wait(main, () => !window.__targetlistShadow.textContent.includes('Checking…'));
   assert.match((await cardSnapshot(main, 102)).text, /Hospital/);
@@ -1238,10 +1301,10 @@ try {
   assert(mobileGeometry.documentWidth <= mobileGeometry.width && mobileGeometry.scrollWidth <= mobileGeometry.clientWidth + 1,
     JSON.stringify(mobileGeometry));
   await main.screenshot({ path: path.join(artifacts, 'browser-mobile.png'), fullPage: true });
-  console.log('PASS Okay-only attack link, Hospital blocked, desktop and 390px mobile screenshots, no horizontal overflow');
+  console.log('PASS Okay-only reservation button, Hospital blocked, desktop and 390px mobile screenshots, no horizontal overflow');
 
-  await main.evaluate(() => { window.__mockNow += 30000; window.__targetlistShadow.querySelector('a.attack').click(); });
-  assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelectorAll('a.attack').length), 0);
+  await main.evaluate(() => { window.__mockNow += 30000; window.__targetlistShadow.querySelector('button.attack').click(); });
+  assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelectorAll('button.attack').length), 0);
   assert.match(await shadow(main, '.error', 'text'), /Check this target.*status and stat range before opening an attack/);
   await main.close();
   console.log('PASS stale status cannot open an attack');
@@ -1286,7 +1349,7 @@ try {
     await race.evaluate(heldPath => window.__mock.release(heldPath), heldPath);
     await race.evaluate(() => new Promise(resolve => setTimeout(resolve, 20)));
     assert.equal(await race.evaluate(() => Boolean(window.__targetlistShadow.querySelector('form.login'))), true);
-    assert.equal(await race.evaluate(() => window.__targetlistShadow.querySelectorAll('.card,a.attack').length), 0);
+    assert.equal(await race.evaluate(() => window.__targetlistShadow.querySelectorAll('.card,button.attack').length), 0);
     assert.equal(await race.evaluate(() => window.__mock.store.size), 0);
     await race.close();
   }
@@ -1301,7 +1364,7 @@ try {
     const errors = await mount();
     await login(errors);
     await cardAction(errors, 101);
-    await wait(errors, () => Boolean(window.__targetlistShadow.querySelector('a.attack')));
+    await wait(errors, () => Boolean(window.__targetlistShadow.querySelector('button.attack')));
     await errors.evaluate(failure => { window.__mock.overrides['/api/targets/101/status'] = failure; }, failure);
     await cardAction(errors, 101);
     await wait(errors, () => !window.__targetlistShadow.querySelector('.error').hidden);
@@ -1317,7 +1380,7 @@ try {
   await cardAction(revoked, 101);
   await wait(revoked, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
   assert.equal(await revoked.evaluate(() => window.__mock.store.size), 0);
-  assert.equal(await revoked.evaluate(() => window.__targetlistShadow.querySelectorAll('a.attack').length), 0);
+  assert.equal(await revoked.evaluate(() => window.__targetlistShadow.querySelectorAll('button.attack').length), 0);
   await revoked.close();
   console.log('PASS revoked faction authorization clears local session and target access');
 
@@ -1781,7 +1844,7 @@ try {
       content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
       content.innerHTML = '<h1>Willow [101]</h1><p>Mock Torn PDA player profile.</p>';
       document.body.append(content);
-      window.__mock.reservations = { supported: true, leaseMs: 60000 };
+      window.__mock.reservations = { supported: true, leaseMs: 120000 };
     }, undefined, 'https://www.torn.com/profiles.php?XID=101');
     assert.equal(await pda.evaluate(() => typeof window.GM_xmlhttpRequest), 'undefined');
     assert.equal(await pda.evaluate(() => typeof window.GM_getValue), 'undefined');

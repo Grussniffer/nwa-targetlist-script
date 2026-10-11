@@ -37,7 +37,7 @@ Keep the script enabled on all Torn pages. NWA includes PDA support and remember
 
 Open Torn and click the green **NWA** button on the right edge. Sign in with your **Limited Torn API key** the first time.
 
-NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. It reserves the target for 60 seconds to reduce other NWA members choosing the same player, and skips players you opened in the last 10 minutes. You start the attack yourself. The finder tries up to five matches within eight seconds.
+NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. The finder and list attack buttons first get a shared backend reservation; if another member gets it first, the finder tries another. The current backend holds each assignment for **two minutes**, including earlier targets when you open another one. Your browser also skips players you opened in the last 10 minutes. You start the attack yourself. The finder tries up to five matches within eight seconds. If target coordination is unavailable, NWA asks you to refresh instead of opening an unreserved target. Ordinary Torn links, including those in exports, do not acquire a reservation.
 
 The small **⚙** underneath opens settings, the target list, and suggestions. Set **Min** and **Max** target stats as percentages of your own total; NWA only picks targets within that range. The default is **10–60%**, with the equivalent stat totals shown underneath. Your settings are saved between pages, and your existing maximum is kept when updating. Set **Min** to **0%** to include weaker targets.
 

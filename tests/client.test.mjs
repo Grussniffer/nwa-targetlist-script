@@ -15,6 +15,8 @@ const { serviceBase, version: scriptVersion } = vm.runInNewContext(
 const NOW = Date.parse('2026-10-09T12:00:00Z');
 const KEY = 'AbCdEfGh12345678';
 const SESSION = 'opaque-session-token';
+const coordination = { supported: true, leaseMs: 120000 };
+const coordinationUnavailable = 'Target coordination is unavailable. Refresh the list or ask an administrator to update the backend.';
 const keyStorage = { mode: 'encrypted', expiresAt: new Date(NOW + 7 * 86400000).toISOString() };
 const player = {
   id: 12345, name: 'Allowed Player', faction: { id: 111, name: 'Allowed Faction' },
@@ -130,7 +132,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const login = requests.at(-1);
     response(login, { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage });
     await flush();
-    response(requests.at(-1), { player, targets, warnings: [], generatedAt: new Date(NOW).toISOString(), ...feed });
+    response(requests.at(-1), { player, targets, warnings: [], reservations: coordination, generatedAt: new Date(NOW).toISOString(), ...feed });
     await flush();
     return login;
   }
@@ -143,6 +145,15 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     settings: () => find(element => element.className === 'settings-toggle'),
     text: () => textContent(root), setNow: value => { clock = value; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
+}
+
+async function completeLease(app, id = target.id, now = NOW) {
+  const request = app.requests.at(-1);
+  assert.equal(request.method, 'POST', 'navigation requires a reservation POST');
+  assert.equal(request.url, `${serviceBase}/api/targets/${id}/reservation`);
+  app.response(request, { id, status: { state: 'Okay' }, checkedAt: new Date(now).toISOString(),
+    reservationExpiresAt: new Date(now + 120000).toISOString() });
+  await flush();
 }
 
 test('installing NWA replaces a legacy target-list host and keeps the settings gear usable', () => {
@@ -302,13 +313,13 @@ test('a seven-day saved session restores after 30 minutes and on day six without
     assert.equal(authorization.headers.Authorization, `Bearer ${SESSION}`);
     assert.equal(descendants(app.root).some(element => element.className === 'card'), false,
       'a long-lived session must still authorize the player before showing targets');
-    app.response(authorization, { player, targets: [target], warnings: [] }); await flush();
+    app.response(authorization, { player, targets: [target], warnings: [], reservations: coordination }); await flush();
     assert.match(app.text(), /Target Player \[98765\]/);
     app.button('NWA').emit('click');
     const live = app.requests.at(-1);
-    assert.equal(live.url, `${serviceBase}/api/targets/${target.id}/status`);
+    assert.equal(live.url, `${serviceBase}/api/targets/${target.id}/reservation`);
     assert.deepEqual(app.navigations, [], 'restored credentials do not bypass live status checks');
-    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(restoredAt).toISOString() });
+    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(restoredAt).toISOString(), reservationExpiresAt: new Date((restoredAt) + 120000).toISOString() });
     await flush();
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
     assert.equal(app.requests.some(request => request.method === 'POST' && request.url.endsWith('/api/session')), false);
@@ -346,7 +357,7 @@ test('a concurrent login cannot strand a restored session in the loading state',
   }
   await flush();
   assert.equal(app.requests.length, 1, 'restoration blocks a concurrent login request');
-  app.response(restoring, { player, targets: [target], warnings: [] });
+  app.response(restoring, { player, targets: [target], warnings: [], reservations: coordination });
   await flush();
   assert.match(app.text(), /Target Player \[98765\]/);
   assert.equal(app.button('Refresh list').disabled, false);
@@ -410,7 +421,7 @@ test('a late target selection cannot resume after a failed key-removal attempt',
   const oldStatus = app.requests.at(-1);
   app.button('Sign out and remove key').emit('click');
   app.response(app.requests.at(-1), { error: { code: 'KEY_STORAGE_UNAVAILABLE', message: 'Try key removal again shortly.' } }, 503); await flush();
-  app.response(oldStatus, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  app.response(oldStatus, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, []);
   assert.equal(app.storage.get(app.storageKey).token, SESSION);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
@@ -446,22 +457,29 @@ test('attack clicks revalidate live status expiry even before the next display r
   app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
   await flush();
   const attack = app.find(element => element.className === 'attack');
-  assert.equal(attack.emit('click').defaultPrevented, false);
+  const before = app.requests.length;
   app.setNow(NOW + 30_000);
   assert.equal(attack.emit('click').defaultPrevented, true);
+  assert.equal(app.requests.length, before, 'expired availability cannot start a lease');
+  assert.deepEqual(app.navigations, []);
   assert.match(app.text(), /Check this target’s status and stat range before opening an attack/);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
 });
 
-test('middle clicks also revalidate an expired status check', async () => {
+test('middle clicks on reservation buttons cannot open an attack or start a request', async () => {
   const app = fixture(); await app.signIn();
   app.button('Check status').emit('click');
   app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
   await flush();
   const attack = app.find(element => element.className === 'attack');
+  assert.equal(attack.tagName, 'BUTTON');
+  const before = app.requests.length;
+  attack.emit('auxclick', { button: 1 });
   app.setNow(NOW + 30_000);
-  assert.equal(attack.emit('auxclick', { button: 1 }).defaultPrevented, true);
-  assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+  attack.emit('auxclick', { button: 1 });
+  assert.equal(app.requests.length, before);
+  assert.deepEqual(app.navigations, []);
+  assert.equal(attack.getAttribute('href'), null);
 });
 
 test('the status-expiry timer removes attack links even while a control has focus', async () => {
@@ -514,13 +532,13 @@ test('the NWA launcher opens login without requesting a target when signed out',
 test('signing in from NWA continues straight to a live target check', async () => {
   const app = fixture(); app.button('NWA').emit('click'); await app.signIn();
   assert.equal(app.requests.length, 3);
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.equal(app.navigations.length, 1);
 });
 
-test('NWA immediately opens a suitable backend-checked target without another request', async () => {
+test('NWA uses the cached pool to choose a suitable target but waits for a shared lease', async () => {
   const app = fixture();
   await app.signIn([
     { ...target, id: 10001, estimatedStats: 100_000, faction: player.faction },
@@ -531,9 +549,11 @@ test('NWA immediately opens a suitable backend-checked target without another re
   ]);
   const before = app.requests.length;
   app.button('NWA').emit('click');
-  assert.equal(app.requests.length, before, 'the fresh authorized availability cache needs no network round trip');
+  assert.equal(app.requests.length, before + 1, 'the fresh pool skips a feed refresh but still requests its lease');
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
-  assert.equal(app.requests.length, before, 'opening the attack page does not send an attack request');
+  assert.equal(app.requests.length, before + 1, 'opening the attack page does not send an attack request');
 });
 
 test('NWA skips unavailable, newly friendly, and removed targets before opening the next live match', async () => {
@@ -542,18 +562,18 @@ test('NWA skips unavailable, newly friendly, and removed targets before opening 
   await app.signIn(candidates);
   app.button('NWA').emit('click');
   const outcomes = [
-    [{ id: candidates[0].id, status: { state: 'Hospital' }, checkedAt: new Date(NOW).toISOString() }, 200],
-    [{ id: candidates[1].id, status: { state: 'Traveling' }, checkedAt: new Date(NOW).toISOString() }, 200],
+    [{ id: candidates[0].id, status: { state: 'Hospital' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }, 200],
+    [{ id: candidates[1].id, status: { state: 'Traveling' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }, 200],
     [{ error: { code: 'FRIENDLY_TARGET', message: 'This target is now friendly.' } }, 403],
     [{ error: { code: 'TARGET_NOT_FOUND', message: 'This target is no longer in the pool.' } }, 404],
   ];
   for (let index = 0; index < outcomes.length; index++) {
-    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[index].id}/status`);
+    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[index].id}/reservation`);
     app.response(app.requests.at(-1), ...outcomes[index]); await flush();
     assert.deepEqual(app.navigations, []);
   }
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[4].id}/status`);
-  app.response(app.requests.at(-1), { id: candidates[4].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[4].id}/reservation`);
+  app.response(app.requests.at(-1), { id: candidates[4].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() });
   await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${candidates[4].id}`]);
   assert.equal(app.storage.get(app.storageKey).token, SESSION);
@@ -563,7 +583,7 @@ test('repeated NWA clicks coalesce while a target check is pending', async () =>
   const app = fixture(); await app.signIn(); const before = app.requests.length;
   const launcher = app.button('NWA'); launcher.emit('click'); launcher.emit('click'); launcher.emit('click');
   assert.equal(app.requests.length, before + 1);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() });
   await flush();
   assert.equal(app.navigations.length, 1);
 });
@@ -593,8 +613,8 @@ test('NWA skips isolated lookup and network failures and succeeds with the next 
     await flush();
     assert.equal(app.requests.length, before + 2, outcome);
     const next = app.requests.at(-1);
-    assert.equal(next.url, `${serviceBase}/api/targets/${target.id + 1}/status`);
-    app.response(next, { id: target.id + 1, status: { state: 'Okay' }, checkedAt: new Date(outcome === 'timeout' ? NOW + 3000 : NOW).toISOString() }); await flush();
+    assert.equal(next.url, `${serviceBase}/api/targets/${target.id + 1}/reservation`);
+    app.response(next, { id: target.id + 1, status: { state: 'Okay' }, checkedAt: new Date(outcome === 'timeout' ? NOW + 3000 : NOW).toISOString(), reservationExpiresAt: new Date((outcome === 'timeout' ? NOW + 3000 : NOW) + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id + 1}`]);
     assert.equal(app.storage.get(app.storageKey).token, SESSION);
   }
@@ -621,8 +641,8 @@ test('a stale feed refresh uses part of the same eight-second finder budget', as
   assert.equal(feed.url, `${serviceBase}/api/targets`);
   assert.equal(feed.timeout, 5000);
   app.setNow(NOW + 35000);
-  app.response(feed, { player, targets: [target], warnings: [] }); await flush();
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+  app.response(feed, { player, targets: [target], warnings: [], reservations: coordination }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.equal(app.requests.at(-1).timeout, 3000);
   app.setNow(NOW + 38000); app.requests.at(-1).ontimeout(); await flush();
   assert.deepEqual(app.navigations, []);
@@ -638,12 +658,12 @@ test('joining a slow startup feed has an eight-second finder deadline and late f
   assert.equal(app.button('NWA').disabled, false);
   assert.deepEqual(app.navigations, []);
   assert.match(app.text(), /within 8 seconds/);
-  app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 8000).toISOString() }], warnings: [] }); await flush();
+  app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 8000).toISOString() }], warnings: [], reservations: coordination }); await flush();
   assert.deepEqual(app.navigations, []);
 });
 
 test('reservation-aware NWA waits for a successful lease even when the cached target is ready', async () => {
-  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 60000 } });
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 120000 } });
   const before = app.requests.length; app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 1);
   const lease = app.requests.at(-1);
@@ -651,21 +671,78 @@ test('reservation-aware NWA waits for a successful lease even when the cached ta
   assert.equal(lease.url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.equal(lease.headers.Authorization, `Bearer ${SESSION}`);
   assert.deepEqual(app.navigations, []);
-  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey).recentTargets)), [{ id: target.id, at: NOW }]);
 });
 
+test('the server expiry controls lease validity even when its remaining duration differs from the advertised lease length', async () => {
+  for (const remaining of [1, 5000, 60000]) {
+    const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+    app.button('NWA').emit('click');
+    const lease = app.requests.at(-1);
+    assert.equal(lease.method, 'POST');
+    app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(),
+      reservationExpiresAt: new Date(NOW + remaining).toISOString() }); await flush();
+    assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  }
+});
+
+test('NWA refuses missing, false or malformed coordination support without using cached or GET status fallbacks', async () => {
+  for (const reservations of [undefined, null, { supported: false }, { supported: 'true' }]) {
+    for (const checkedAt of [undefined, new Date(NOW).toISOString()]) {
+      const app = fixture(); await app.signIn([{ ...target, checkedAt }], { reservations });
+      const before = app.requests.length;
+      app.button('NWA').emit('click'); await flush();
+      assert.equal(app.requests.length, before, 'an unsupported backend must not receive status or lease requests');
+      assert.deepEqual(app.navigations, []);
+      assert.match(app.text(), new RegExp(coordinationUnavailable.replaceAll('.', '\\.')));
+      assert.equal(app.storage.get(app.storageKey).token, SESSION, 'coordination capability is independent of login');
+      assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+    }
+  }
+});
+
+test('ordinary status checks remain available on an unsupported backend but never enable an attack', async () => {
+  const app = fixture(); await app.signIn([target], { reservations: undefined });
+  const before = app.requests.length;
+  app.button('Check status').emit('click');
+  const status = app.requests.at(-1);
+  assert.equal(status.method, 'GET');
+  assert.equal(status.url, `${serviceBase}/api/targets/${target.id}/status`);
+  app.response(status, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  assert.equal(app.requests.length, before + 1);
+  assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+  assert.match(app.text(), /Target coordination unavailable/);
+  assert.deepEqual(app.navigations, []);
+});
+
+test('a retained manual Attack button cannot bypass coordination support withdrawn by a refreshed feed', async () => {
+  for (const reservations of [undefined, { supported: false }]) {
+    const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+    const app = fixture(); await app.signIn([ready]);
+    const attack = app.find(element => element.className === 'attack');
+    app.button('Refresh list').emit('click');
+    app.response(app.requests.at(-1), { player, targets: [ready], warnings: [], reservations }); await flush();
+    const before = app.requests.length;
+    attack.emit('click'); attack.emit('auxclick', { button: 1 }); await flush();
+    assert.equal(app.requests.length, before, 'a retained control cannot issue an uncoordinated GET status');
+    assert.deepEqual(app.navigations, []);
+    assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+    assert.match(app.text(), new RegExp(coordinationUnavailable.replaceAll('.', '\\.')));
+  }
+});
+
 test('reservation conflicts and unavailable targets advance without losing the session or revisiting the conflict', async () => {
   const targets = Array.from({ length: 3 }, (_, index) => ({ ...target, id: target.id + index }));
-  const app = fixture(); await app.signIn(targets, { reservations: { supported: true, leaseMs: 60000 } });
+  const app = fixture(); await app.signIn(targets, { reservations: { supported: true, leaseMs: 120000 } });
   app.button('NWA').emit('click');
   for (const [index, code] of ['TARGET_RESERVED', 'TARGET_UNAVAILABLE'].entries()) {
     assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${targets[index].id}/reservation`);
     app.response(app.requests.at(-1), { error: { code, message: 'Try another player.' } }, 409); await flush();
     assert.deepEqual(app.navigations, []);
   }
-  app.response(app.requests.at(-1), { id: targets[2].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  app.response(app.requests.at(-1), { id: targets[2].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
   assert.equal(app.navigations.length, 1);
   assert.equal(app.storage.get(app.storageKey).token, SESSION);
   const before = app.requests.length; app.button('NWA').emit('click'); await flush();
@@ -675,9 +752,9 @@ test('reservation conflicts and unavailable targets advance without losing the s
 
 test('reservation responses must identify the requested target, have a live lease and still show an eligible available player', async () => {
   for (const failure of ['wrong-id', 'missing-lease', 'expired-lease', 'hospital', 'friendly']) {
-    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 120000 } });
     app.button('NWA').emit('click');
-    const response = { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() };
+    const response = { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() };
     if (failure === 'wrong-id') response.id += 1;
     if (failure === 'missing-lease') delete response.reservationExpiresAt;
     if (failure === 'expired-lease') response.reservationExpiresAt = new Date(NOW).toISOString();
@@ -692,12 +769,12 @@ test('reservation responses must identify the requested target, have a live leas
 
 test('an in-flight reservation cannot navigate after logout, expiry or opening settings', async () => {
   for (const action of ['logout', 'expiry', 'settings']) {
-    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 120000 } });
     app.button('NWA').emit('click'); const lease = app.requests.at(-1);
     if (action === 'logout') await app.signOut();
     if (action === 'expiry') app.setNow(NOW + 3600000);
     if (action === 'settings') app.settings().emit('click');
-    app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+    app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [], action);
     assert.equal(app.storage.get(app.preferencesKey)?.recentTargets?.length ?? 0, 0);
   }
@@ -705,7 +782,7 @@ test('an in-flight reservation cannot navigate after logout, expiry or opening s
 
 test('authorization and rate-limit failures stop reservation retries immediately', async () => {
   for (const [status, code] of [[401, 'SESSION_EXPIRED'], [403, 'FACTION_NOT_ALLOWED'], [429, 'RATE_LIMITED']]) {
-    const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }], { reservations: { supported: true, leaseMs: 60000 } });
+    const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }], { reservations: { supported: true, leaseMs: 120000 } });
     const before = app.requests.length; app.button('NWA').emit('click');
     app.response(app.requests.at(-1), { error: { code, message: 'Access temporarily unavailable.' } }, status); await flush();
     assert.equal(app.requests.length, before + 1, code);
@@ -719,7 +796,7 @@ test('recent target history rotates across reloads and never silently recycles a
   const targets = [ready, { ...ready, id: ready.id + 1 }, { ...ready, id: ready.id + 2 }];
   let app = fixture(); await app.signIn(targets);
   for (let index = 0; index < 3; index++) {
-    app.button('NWA').emit('click'); await flush();
+    app.button('NWA').emit('click'); await completeLease(app, targets[index].id);
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${targets[index].id}`]);
     const prefs = app.storage.get(app.preferencesKey);
     app = fixture(null, prefs); await app.signIn(targets);
@@ -739,7 +816,7 @@ test('clear recent targets explicitly restores a depleted finder pool', async ()
   app.button('Clear recent targets').emit('click');
   assert.deepEqual([...app.storage.get(app.preferencesKey).recentTargets], []);
   assert.equal(app.storage.get(app.preferencesKey).lastTargetId, null);
-  app.button('NWA').emit('click'); await flush();
+  app.button('NWA').emit('click'); await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
 });
 
@@ -762,7 +839,7 @@ test('estimate-age controls validate integer days, persist preferences and allow
   assert.equal(app.requests.length, 2, 'changing the estimate window filters in RAM');
   const reloaded = fixture(null, app.storage.get(app.preferencesKey)); await reloaded.signIn([old]);
   assert.equal(reloaded.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days').value, '28');
-  reloaded.button('NWA').emit('click'); await flush();
+  reloaded.button('NWA').emit('click'); await completeLease(reloaded);
   assert.deepEqual(reloaded.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   ageInput().value = '365'; ageInput().emit('change');
   assert.match(app.text(), /Extra caution is needed beyond 28 days/);
@@ -776,11 +853,11 @@ test('invalid stored estimate windows return to seven days', async () => {
 });
 
 test('changing the estimate-age window cancels an in-flight finder before navigation', async () => {
-  const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+  const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 120000 } });
   app.button('NWA').emit('click'); const lease = app.requests.at(-1);
   const age = app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days');
   age.value = '28'; age.emit('change');
-  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, []);
   assert.equal(app.storage.get(app.preferencesKey).estimateDays, 28);
 });
@@ -809,25 +886,25 @@ test('target cards display and search approved reasons rather than legacy notes'
 });
 
 test('manual attack buttons reserve a fresh target before navigating and remember it', async () => {
-  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 60000 } });
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 120000 } });
   const attack = app.find(element => element.className === 'attack');
   assert.equal(attack.tagName, 'BUTTON');
   attack.emit('click'); const lease = app.requests.at(-1);
   assert.equal(lease.method, 'POST');
   assert.equal(lease.url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.deepEqual(app.navigations, []);
-  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   assert.equal(app.storage.get(app.preferencesKey).recentTargets[0].id, target.id);
 });
 
 test('a manual attack lease cannot navigate after a short-lived session expires between click and response', async () => {
   const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 1000).toISOString() });
-  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: { supported: true, leaseMs: 60000 } }); await flush();
+  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: { supported: true, leaseMs: 120000 } }); await flush();
   app.settings().emit('click');
   app.find(element => element.className === 'attack').emit('click'); const lease = app.requests.at(-1);
   app.setNow(NOW + 1001);
-  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 1001).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 1001).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, []);
   assert.equal(app.storage.get(app.preferencesKey)?.recentTargets?.length ?? 0, 0);
 });
@@ -837,8 +914,8 @@ test('NWA bounds unavailable-target checks to five per click', async () => {
   const candidates = Array.from({ length: 6 }, (_, index) => ({ ...target, id: 30001 + index, estimatedStats: 100_000 + index * 10_000 }));
   await app.signIn(candidates); const before = app.requests.length; app.button('NWA').emit('click');
   for (let index = 0; index < 5; index++) {
-    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[index].id}/status`);
-    app.response(app.requests.at(-1), { id: candidates[index].id, status: { state: 'Hospital' }, checkedAt: new Date(NOW).toISOString() });
+    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[index].id}/reservation`);
+    app.response(app.requests.at(-1), { id: candidates[index].id, status: { state: 'Hospital' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() });
     await flush();
   }
   assert.equal(app.requests.length, before + 5);
@@ -847,8 +924,8 @@ test('NWA bounds unavailable-target checks to five per click', async () => {
   assert.equal(app.find(element => element.className === 'quick-notice').hidden, false);
   app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 6, 'the next click advances beyond the recently unavailable first five');
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[5].id}/status`);
-  app.response(app.requests.at(-1), { id: candidates[5].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[5].id}/reservation`);
+  app.response(app.requests.at(-1), { id: candidates[5].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${candidates[5].id}`]);
 });
 
@@ -858,10 +935,10 @@ test('a restored session loads an authorized pool before NWA checks a target', a
   assert.equal(app.requests.length, 1);
   assert.equal(app.requests[0].url, `${serviceBase}/api/targets`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests[0], { player, targets: [target], warnings: [] }); await flush();
+  app.response(app.requests[0], { player, targets: [target], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.length, 2);
-  assert.equal(app.requests[1].url, `${serviceBase}/api/targets/${target.id}/status`);
-  app.response(app.requests[1], { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
+  assert.equal(app.requests[1].url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  app.response(app.requests[1], { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() });
   await flush();
   assert.equal(app.navigations.length, 1);
 });
@@ -873,10 +950,12 @@ test('clicking NWA during startup preload resumes once using the fresh feed with
   app.button('NWA').emit('click'); app.button('NWA').emit('click');
   assert.equal(app.requests.length, 1, 'clicks share the startup feed request');
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [] });
+  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: coordination });
   await flush();
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
-  assert.equal(app.requests.length, 1);
+  assert.equal(app.requests.length, 2);
   assert.equal(app.find(element => element.className === 'panel').hidden, true);
   assert.deepEqual(Object.keys(app.storage.get(app.storageKey)).sort(), ['expiresAt', 'token']);
 });
@@ -888,17 +967,19 @@ test('ready cached targets rank before unchecked lower-stat targets and rotate a
   const app = fixture(null, { maxRatio: 0.6, lastTargetId: ready.id });
   await app.signIn([unchecked, ready, nextReady]);
   const before = app.requests.length; app.button('NWA').emit('click');
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app, nextReady.id);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${nextReady.id}`]);
-  assert.equal(app.requests.length, before);
+  assert.equal(app.requests.length, before + 1);
   assert.equal(app.storage.get(app.preferencesKey).lastTargetId, nextReady.id);
 });
 
 test('an exactly thirty-second-old target check requires a new status request', async () => {
   const app = fixture();
-  await app.signIn([{ ...target, checkedAt: new Date(NOW - 30_000).toISOString() }]);
+  await app.signIn([{ ...target, checkedAt: new Date(NOW - 30_000).toISOString(), reservationExpiresAt: new Date((NOW - 30_000) + 120000).toISOString() }]);
   const before = app.requests.length; app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 1);
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.deepEqual(app.navigations, []);
 });
 
@@ -909,30 +990,32 @@ test('an exactly thirty-second-old authorized feed is refreshed before using eve
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests.at(-1), { player, targets: [{ ...checkedTarget, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [] });
+  app.response(app.requests.at(-1), { player, targets: [{ ...checkedTarget, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [], reservations: coordination });
   await flush();
-  assert.equal(app.requests.length, before + 1);
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app, target.id, NOW + 30000);
+  assert.equal(app.requests.length, before + 2);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
 });
 
 test('known future hospital timers are skipped even after their check has become stale', async () => {
   const hospitalized = { ...target, id: 12001, estimatedStats: 10_000,
-    status: { state: 'Hospital', until: NOW / 1000 + 600 }, checkedAt: new Date(NOW - 60_000).toISOString() };
+    status: { state: 'Hospital', until: NOW / 1000 + 600 }, checkedAt: new Date(NOW - 60_000).toISOString(), reservationExpiresAt: new Date((NOW - 60_000) + 120000).toISOString() };
   const app = fixture(); await app.signIn([hospitalized, target]);
   const before = app.requests.length; app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 1);
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
 });
 
 test('an ended hospital timer still needs a new Okay check before opening an attack', async () => {
   const app = fixture(); await app.signIn([{ ...target, status: { state: 'Hospital', until: NOW / 1000 - 1 },
-    checkedAt: new Date(NOW - 30_000).toISOString() }]);
+    checkedAt: new Date(NOW - 30_000).toISOString(), reservationExpiresAt: new Date((NOW - 30_000) + 120000).toISOString() }]);
   app.button('NWA').emit('click');
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Hospital', until: NOW / 1000 - 1 }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Hospital', until: NOW / 1000 - 1 }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, []);
 });
 
@@ -949,11 +1032,13 @@ test('visible pages refresh the feed every ten seconds without hiding the target
   assert.equal(app.button('NWA').disabled, false);
   app.timers[0]();
   assert.equal(app.requests.length, before + 1, 'an in-flight background sync is shared');
-  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Refreshed Target', checkedAt: new Date(NOW + 10_000).toISOString() }], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Refreshed Target', checkedAt: new Date(NOW + 10_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
   assert.match(app.text(), /Refreshed Target/);
   assert.deepEqual(app.navigations, []);
   const refreshed = app.requests.length; app.button('NWA').emit('click');
-  assert.equal(app.requests.length, refreshed);
+  assert.equal(app.requests.length, refreshed + 1);
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app, target.id, NOW + 10000);
   assert.equal(app.navigations.length, 1);
 });
 
@@ -964,8 +1049,10 @@ test('NWA joins an expired-cache background refresh and resumes with its fresh t
   app.button('NWA').emit('click'); app.button('NWA').emit('click');
   assert.equal(app.requests.length, before);
   assert.deepEqual(app.navigations, []);
-  app.response(background, { player, targets: [{ ...target, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [] }); await flush();
-  assert.equal(app.requests.length, before);
+  app.response(background, { player, targets: [{ ...target, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
+  assert.equal(app.requests.length, before + 1);
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app, target.id, NOW + 30000);
   assert.equal(app.navigations.length, 1);
 });
 
@@ -976,7 +1063,7 @@ test('hidden pages do not preload or poll and refresh once when Torn becomes vis
   assert.equal(app.requests.length, 0);
   app.setVisibility('visible'); app.setVisibility('visible');
   assert.equal(app.requests.length, 1);
-  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW + 60_000).toISOString() }], warnings: [] }); await flush();
+  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW + 60_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
   app.setVisibility('hidden'); app.setNow(NOW + 120_000); app.timers[0]();
   assert.equal(app.requests.length, 1);
   app.setVisibility('visible');
@@ -999,7 +1086,9 @@ test('a failed background authorization attempt keeps browsing data but blocks t
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests.at(-1), { player, targets: [cached], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [cached], warnings: [], reservations: coordination }); await flush();
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app, target.id, NOW + 1000);
   assert.equal(app.navigations.length, 1);
 });
 
@@ -1008,7 +1097,7 @@ test('background faction denial revokes access and a background response cannot 
     const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
     app.setNow(NOW + 30_000); app.timers[0](); const background = app.requests.at(-1);
     if (action === 'denial') app.response(background, { error: { code: 'FACTION_NOT_ALLOWED', message: 'Faction access revoked.' } }, 403);
-    else { await app.signOut(); app.response(background, { player, targets: [target], warnings: [] }); }
+    else { await app.signOut(); app.response(background, { player, targets: [target], warnings: [], reservations: coordination }); }
     await flush();
     assert.equal(app.storage.has(app.storageKey), false);
     assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
@@ -1020,7 +1109,7 @@ test('a due background poll does not interrupt a manual target check selection',
   const app = fixture(); await app.signIn(); app.button('NWA').emit('click'); const live = app.requests.at(-1);
   const before = app.requests.length; app.setNow(NOW + 30_000); app.timers[0]();
   assert.equal(app.requests.length, before);
-  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 30_000).toISOString() }); await flush();
+  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 30_000).toISOString(), reservationExpiresAt: new Date((NOW + 30_000) + 120000).toISOString() }); await flush();
   assert.equal(app.navigations.length, 1);
 });
 
@@ -1029,7 +1118,7 @@ test('an older explicit status response cannot overwrite a newly refreshed targe
   const older = app.requests.at(-1);
   app.button('Refresh list').emit('click');
   app.response(app.requests.at(-1), { player, targets: [{ ...target, status: { state: 'Hospital', until: NOW / 1000 + 600 },
-    checkedAt: new Date(NOW).toISOString() }], warnings: [] }); await flush();
+    checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: coordination }); await flush();
   app.response(older, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
   assert.match(app.text(), /Hospital/);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
@@ -1055,7 +1144,7 @@ test('background feed refreshes preserve focused search and unfinished stat-limi
     assert.equal(app.find(element => element === focused), focused, 'starting a sync keeps the original control');
     const updatedPlayer = { ...player, name: 'Updated Allowed Player' };
     app.response(app.requests.at(-1), { player: updatedPlayer, targets: [{ ...target, name: 'Refreshed Target',
-      checkedAt: new Date(NOW + 10_000).toISOString() }], warnings: [] }); await flush();
+      checkedAt: new Date(NOW + 10_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
     assert.equal(app.root.activeElement, focused);
     assert.equal(app.find(element => element === focused), focused, 'completing a sync keeps the focused control');
     assert.equal(focused.value, control === 'search' ? 'Target' : '4');
@@ -1076,7 +1165,7 @@ test('background feed refreshes retain the focused suggestion textarea and its d
   app.root.activeElement = textarea;
   app.setNow(NOW + 10_000); app.timers[0]();
   assert.equal(app.find(element => element.tagName === 'TEXTAREA'), textarea);
-  app.response(app.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.find(element => element.tagName === 'TEXTAREA'), textarea);
   assert.equal(app.root.activeElement, textarea);
   assert.equal(textarea.value, 'An unfinished reason with the cursor still here');
@@ -1090,7 +1179,7 @@ test('a closed settings panel is not rebuilt by background refresh and shows cur
   app.closePanel();
   app.setNow(NOW + 10_000); app.timers[0]();
   app.response(app.requests.at(-1), { player: { ...player, name: 'Updated Allowed Player' },
-    targets: [{ ...target, name: 'Refreshed Target' }], warnings: [] }); await flush();
+    targets: [{ ...target, name: 'Refreshed Target' }], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.find(element => element.className === 'profile'), oldProfile);
   assert.equal(app.find(element => element.className === 'panel').hidden, true);
   assert.doesNotMatch(app.text(), /Refreshed Target/);
@@ -1105,12 +1194,14 @@ test('a restored session keeps a large pool out of the DOM until settings are op
     name: `Pool Player ${index}`, checkedAt: new Date(NOW).toISOString() }));
   const content = app.find(element => element.className === 'scroll').lastChild;
   assert.equal(content.children.length, 0, 'restoring a session does not construct hidden settings');
-  app.response(app.requests.at(-1), { player, targets, warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets, warnings: [], reservations: coordination }); await flush();
   assert.equal(content.children.length, 0, 'the authorized pool stays in data while settings remain closed');
   assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 0);
   const requestCount = app.requests.length;
   app.button('NWA').emit('click'); await flush();
-  assert.equal(app.requests.length, requestCount, 'the finder can use the checked pool without mounting cards');
+  assert.equal(app.requests.length, requestCount + 1, 'the finder requests a lease without another feed or mounting cards');
+  assert.deepEqual(app.navigations, []);
+  await completeLease(app);
   assert.equal(app.navigations.length, 1);
   app.openPanel();
   assert.equal(descendants(app.root).filter(element => element.className === 'card').length, targets.length);
@@ -1131,7 +1222,7 @@ test('unchanged feeds reuse cards and controls, and a changed row leaves other c
   const cardReplacements = [original.replaceCount, unchanged.replaceCount];
   const initialAppends = cards.appendCount, initialReplacements = content.replaceCount;
   app.setNow(NOW + 10_000); app.timers[0]();
-  app.response(app.requests.at(-1), { player, targets: [{ ...target }, { ...other }], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target }, { ...other }], warnings: [], reservations: coordination }); await flush();
   assert.equal(card(target.id), original); assert.equal(card(other.id), unchanged);
   assert.equal(descendants(original).find(element => element.className === 'name'), originalName);
   assert.equal(descendants(unchanged).find(element => element.className === 'name'), unchangedName);
@@ -1140,7 +1231,7 @@ test('unchanged feeds reuse cards and controls, and a changed row leaves other c
   assert.equal(content.replaceCount, initialReplacements, 'settings controls are reused');
   assert.equal(cards.scrollTop, 180);
   app.setNow(NOW + 20_000); app.timers[0]();
-  app.response(app.requests.at(-1), { player, targets: [{ ...target, reason: 'Updated reason' }, { ...other }], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, reason: 'Updated reason' }, { ...other }], warnings: [], reservations: coordination }); await flush();
   assert.equal(card(target.id), original, 'changed rows retain their outer card');
   assert.equal(original.replaceCount, cardReplacements[0] + 1);
   assert.equal(unchanged.replaceCount, cardReplacements[1]);
@@ -1158,10 +1249,10 @@ test('keyed cards reorder when stat ratios change and remove targets missing fro
   const removed = app.find(element => element.attributes.get('data-target-id') === String(other.id));
   assert.deepEqual(cards.children, [removed, original]);
   app.setNow(NOW + 10_000); app.timers[0]();
-  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }, other], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }, other], warnings: [], reservations: coordination }); await flush();
   assert.deepEqual(cards.children, [original, removed], 'rank changes move existing card nodes');
   app.setNow(NOW + 20_000); app.timers[0]();
-  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }], warnings: [], reservations: coordination }); await flush();
   assert.deepEqual(cards.children, [original]); assert.equal(removed.parentNode, null);
   assert.doesNotMatch(app.text(), /Other Target/);
 });
@@ -1184,7 +1275,7 @@ test('NWA explains when the pool has no fresh target within the stat limit', asy
   const before = app.requests.length; app.button('NWA').emit('click'); await flush();
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-  app.response(app.requests.at(-1), { player, targets: [tooStrong], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [tooStrong], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.length, before + 1, 'no-match recovery refreshes the pool only once per click');
   assert.deepEqual(app.navigations, []);
   assert.equal(app.find(element => element.className === 'quick-notice').hidden, false);
@@ -1197,11 +1288,11 @@ test('NWA recovers an empty or unknown-stat pool after background estimates beco
     const before = app.requests.length; app.button('NWA').emit('click'); app.button('NWA').emit('click');
     assert.equal(app.requests.length, before + 1);
     assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-    app.response(app.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
+    app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
     assert.equal(app.requests.length, before + 2);
-    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
     assert.deepEqual(app.navigations, []);
-    app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+    app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   }
 });
@@ -1218,9 +1309,9 @@ test('NWA retries the pool after login succeeded but the initial target feed fai
   app.button('NWA').emit('click');
   assert.equal(app.requests.length, 3);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-  app.response(app.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.equal(app.navigations.length, 1);
 });
 
@@ -1230,10 +1321,10 @@ test('NWA refreshes a pool older than 30 seconds before selecting a live target'
   app.setNow(NOW + 30_001); const before = app.requests.length; app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-  app.response(app.requests.at(-1), { player, targets: [updated], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [updated], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.length, before + 2);
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${updated.id}/status`);
-  app.response(app.requests.at(-1), { id: updated.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 30_001).toISOString() }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${updated.id}/reservation`);
+  app.response(app.requests.at(-1), { id: updated.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 30_001).toISOString(), reservationExpiresAt: new Date((NOW + 30_001) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${updated.id}`]);
 });
 
@@ -1244,12 +1335,12 @@ test('signout, expiry, or a refreshed pool prevents an old NWA status response f
     else if (interruption === 'expire') { app.setNow(NOW + 3_600_000); app.timers[0](); }
     else app.button('Refresh list').emit('click');
     const after = app.requests.length;
-    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [], interruption);
     assert.equal(app.requests.length, after, 'stale checks cannot continue to another candidate');
     if (interruption !== 'refresh') assert.equal(app.storage.has(app.storageKey), false);
     else {
-      app.response(app.requests.at(-1), { player, targets: [{ ...target, id: 40001 }], warnings: [] }); await flush();
+      app.response(app.requests.at(-1), { player, targets: [{ ...target, id: 40001 }], warnings: [], reservations: coordination }); await flush();
       assert.deepEqual(app.navigations, []);
     }
   }
@@ -1258,7 +1349,7 @@ test('signout, expiry, or a refreshed pool prevents an old NWA status response f
 test('NWA rechecks session expiry at navigation time even before the idle timer runs', async () => {
   const app = fixture(); await app.signIn(); app.button('NWA').emit('click');
   const live = app.requests.at(-1); app.setNow(NOW + 3_600_000);
-  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 3_600_000).toISOString() });
+  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 3_600_000).toISOString(), reservationExpiresAt: new Date((NOW + 3_600_000) + 120000).toISOString() });
   await flush();
   assert.deepEqual(app.navigations, []);
   assert.equal(app.storage.has(app.storageKey), false);
@@ -1333,7 +1424,9 @@ test('both stat limits persist separately from the session and filter instant NW
   assert.equal(reloaded.find(element => element.attributes.get('aria-label') === 'Minimum target stats as percent of your total').value, '30');
   assert.equal(reloaded.find(element => element.attributes.get('aria-label') === 'Maximum target stats as percent of your total').value, '80');
   const before = reloaded.requests.length; reloaded.button('NWA').emit('click');
-  assert.equal(reloaded.requests.length, before, 'saved limits still use the immediate cached path');
+  assert.equal(reloaded.requests.length, before + 1, 'saved limits select locally, then request a lease');
+  assert.deepEqual(reloaded.navigations, []);
+  await completeLease(reloaded);
   assert.deepEqual(reloaded.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   assert.deepEqual(JSON.parse(JSON.stringify(reloaded.storage.get(reloaded.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: target.id, recentTargets: [{ id: target.id, at: NOW }] });
 });
@@ -1351,7 +1444,7 @@ test('the maximum stat limit is used by NWA after reloading', async () => {
   const before = reloaded.requests.length; reloaded.button('NWA').emit('click'); await flush();
   assert.equal(reloaded.requests.length, before + 1);
   assert.equal(reloaded.requests.at(-1).url, `${serviceBase}/api/targets`);
-  reloaded.response(reloaded.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
+  reloaded.response(reloaded.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
   assert.equal(reloaded.requests.length, before + 1, 'a 50% target is excluded by the saved 40% limit after refreshing the pool');
   assert.deepEqual(reloaded.navigations, []);
   assert.match(reloaded.find(element => element.className === 'quick-notice').textContent, /No targets match/);
@@ -1368,11 +1461,11 @@ test('NWA skips targets below the minimum and above the maximum on cached and li
       match,
     ]);
     const before = app.requests.length; app.button('NWA').emit('click');
-    if (cached) assert.equal(app.requests.length, before, 'an in-range cached match is immediate');
-    else {
+    {
       assert.equal(app.requests.length, before + 1, 'out-of-range candidates never consume a live lookup');
-      assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${match.id}/status`);
-      app.response(app.requests.at(-1), { id: match.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+      assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${match.id}/reservation`);
+      assert.deepEqual(app.navigations, []);
+      await completeLease(app, match.id);
     }
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${match.id}`]);
   }
@@ -1383,11 +1476,11 @@ test('NWA accepts targets exactly on either stat-range boundary', async () => {
     for (const cached of [true, false]) {
       const app = fixture(); await app.signIn([{ ...target, estimatedStats, checkedAt: cached ? new Date(NOW).toISOString() : undefined }]);
       const before = app.requests.length; app.button('NWA').emit('click');
-      if (!cached) {
-        assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
-        app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+      {
+        assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
+        await completeLease(app);
       }
-      assert.equal(app.requests.length, before + Number(!cached));
+      assert.equal(app.requests.length, before + 1);
       assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
     }
   }
@@ -1399,7 +1492,7 @@ test('a pool containing only too-weak targets refreshes once and never checks or
   const before = app.requests.length; app.button('NWA').emit('click'); await flush();
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-  app.response(app.requests.at(-1), { player, targets: [weak], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [weak], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.length, before + 1);
   assert.deepEqual(app.navigations, []);
   assert.match(app.find(element => element.className === 'quick-notice').textContent, /No targets match/);
@@ -1463,7 +1556,8 @@ test('valid stat edits commit on change and allow equal limits and the zero-to-f
     assert.equal(app.storage.get(app.preferencesKey).minRatio, minimumValue / 100);
     assert.equal(app.storage.get(app.preferencesKey).maxRatio, maximumValue / 100);
     const before = app.requests.length; app.button('NWA').emit('click');
-    assert.equal(app.requests.length, before);
+    assert.equal(app.requests.length, before + 1);
+    await completeLease(app);
     assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   }
 });
@@ -1474,7 +1568,7 @@ test('changing either stat limit cancels a pending NWA selection before it can n
     const ratio = app.find(element => element.attributes.get('aria-label') === `${name} target stats as percent of your total`);
     ratio.value = value; ratio.emit('change');
     const before = app.requests.length;
-    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+    app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [], name);
     assert.equal(app.requests.length, before, 'a canceled lookup does not continue selecting');
     assert.equal(app.button('NWA').disabled, false);
@@ -1492,7 +1586,8 @@ test('decimal stat limits are retained exactly in the controls, saved preference
   assert.equal(app.storage.get(app.preferencesKey).maxRatio, 0.6075);
   assert.match(app.find(element => element.className === 'stat-range-summary').textContent, /20\.25–60\.75% of yours/);
   const before = app.requests.length; app.button('NWA').emit('click');
-  assert.equal(app.requests.length, before);
+  assert.equal(app.requests.length, before + 1);
+  await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
 });
 
@@ -1504,7 +1599,7 @@ test('changing either stat limit during a pending pool refresh cancels automatic
     const ratio = app.find(element => element.attributes.get('aria-label') === `${name} target stats as percent of your total`);
     ratio.value = value; ratio.emit('change');
     const before = app.requests.length;
-    app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [] }); await flush();
+    app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 30_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
     assert.deepEqual(app.navigations, [], name);
     assert.equal(app.requests.length, before);
     assert.equal(app.button('NWA').disabled, false);
@@ -1518,7 +1613,7 @@ test('a rejected stat edit leaves the valid saved range and pending target selec
   const before = app.writes.length;
   minimum.value = '70'; minimum.emit('change');
   assert.equal(minimum.value, '10'); assert.equal(app.writes.length, before);
-  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() }); await flush();
+  app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   assert.equal(app.storage.get(app.preferencesKey).minRatio, 0.1);
   assert.equal(app.storage.get(app.preferencesKey).maxRatio, 0.6);
@@ -1529,7 +1624,10 @@ test('an existing attack link checks the current minimum again after settings ex
   const attack = app.find(element => element.className === 'attack');
   const minimum = app.find(element => element.attributes.get('aria-label') === 'Minimum target stats as percent of your total');
   minimum.value = '60'; minimum.emit('change');
-  for (const type of ['click', 'auxclick']) assert.equal(attack.emit(type).defaultPrevented, true, type);
+  const before = app.requests.length;
+  assert.equal(attack.emit('click').defaultPrevented, true);
+  attack.emit('auxclick', { button: 1 });
+  assert.equal(app.requests.length, before);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
   assert.deepEqual(app.navigations, []);
 });
@@ -1654,7 +1752,7 @@ test('leader approvals refresh the pool and queue, while rejection updates only 
     app.response(queue, { canReview: true, suggestions: [], nextOffset: null });
     const pool = refreshes.find(request => request.url.endsWith('/api/targets'));
     if (decision === 'approved') {
-      assert.ok(pool); app.response(pool, { player, targets: [target, { ...target, id: 67890, name: 'Newly Approved Player' }], warnings: [] });
+      assert.ok(pool); app.response(pool, { player, targets: [target, { ...target, id: 67890, name: 'Newly Approved Player' }], warnings: [], reservations: coordination });
     } else assert.equal(pool, undefined);
     await flush();
     assert.match(app.text(), decision === 'approved' ? /12 players added to the target pool/ : /Suggestion rejected/);
@@ -1733,8 +1831,8 @@ test('approval starts a fresh target request and ignores an older target refresh
   app.button('Approve').emit('click'); app.response(app.requests.at(-1), { suggestion: suggestion({ status: 'approved' }), addedPlayers: 1 }); await flush();
   const newPool = app.requests.at(-1); assert.ok(newPool.url.endsWith('/api/targets')); assert.notEqual(newPool, oldPool);
   const queue = app.requests.at(-2); app.response(queue, { canReview: true, suggestions: [], nextOffset: null });
-  app.response(newPool, { player, targets: [{ ...target, name: 'Approved Pool' }], warnings: [] });
-  app.response(oldPool, { player, targets: [{ ...target, name: 'Old Pool' }], warnings: [] }); await flush();
+  app.response(newPool, { player, targets: [{ ...target, name: 'Approved Pool' }], warnings: [], reservations: coordination });
+  app.response(oldPool, { player, targets: [{ ...target, name: 'Old Pool' }], warnings: [], reservations: coordination }); await flush();
   app.button('Targets').emit('click'); assert.match(app.text(), /Approved Pool/); assert.equal(app.text().includes('Old Pool'), false);
 });
 
@@ -1795,7 +1893,7 @@ test('stale pool authorization blocks export until a fresh feed arrives', async 
   assert.equal(app.requests.length, before, 'the export action must not issue hidden provider or database requests');
   app.button('Refresh list').emit('click');
   assert.equal(app.button('Export CSV').disabled, true, 'a pending feed has no authorized export snapshot');
-  app.response(app.requests.at(-1), { player, targets: [target], warnings: [] }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
   app.button('Export CSV').emit('click');
   assert.match(app.find(element => element.attributes.get('aria-label') === 'Exported target list').value, /Target Player/);
 });
