@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.1' });
 
 const previousHost = document.getElementById('torn-targetlist-host');
 const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
@@ -267,9 +267,9 @@ function mountTargetList() {
     const age = Date.now() - state.poolLoadedAt;
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
   }
-  let pageNotice = null, pageNoticeReason = null, pageNoticeObserver = null, pageNoticeTimer = null;
+  let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null, pageNoticeObserver = null, pageNoticeTimer = null;
   function removePageNotice() {
-    pageNotice?.remove(); pageNotice = null; pageNoticeReason = null;
+    pageNotice?.remove(); pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
   }
   function updatePageNotice() {
     if (host.isConnected === false) {
@@ -284,23 +284,37 @@ function mountTargetList() {
       const noticeRoot = pageNotice.attachShadow({ mode: 'closed' });
       const style = element('style');
       style.textContent = `
-        :host{all:initial;display:block;min-width:0;margin:10px 0 14px;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#edf4f4}
-        .notice{box-sizing:border-box;max-width:100%;padding:12px 15px;border:1px solid #376850;border-left:4px solid #56c790;border-radius:7px;background:#14291f;overflow-wrap:anywhere}
-        .title{display:block;margin:0 0 3px;color:#94e5b8;font-size:13px;font-weight:750;letter-spacing:.4px}
-        p{margin:0}.reason{margin-top:5px;white-space:pre-wrap;color:#dbe9e0}
-        @media(max-width:480px){.notice{padding:10px 12px}}
+        :host{all:initial;display:block;box-sizing:border-box;width:max-content;max-width:min(340px,100%);min-width:0;margin:4px 0;font:10px/1.2 Arial,Helvetica,sans-serif;color:#d4d4d8}
+        *{box-sizing:border-box}
+        .notice{position:relative;max-width:100%;border:1px solid rgba(113,113,122,.65);border-radius:4px;background:rgba(24,24,27,.72)}
+        summary{display:flex;align-items:center;gap:5px;height:20px;min-width:0;padding:1px 5px;list-style:none;cursor:pointer}
+        summary::-webkit-details-marker{display:none}
+        summary:focus-visible{outline:2px solid #9fbd57;outline-offset:2px;border-radius:3px}
+        .title{flex:0 0 auto;color:#9fbd57;font-size:9px;font-weight:800;white-space:nowrap}
+        .reason{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .chevron{flex:0 0 auto;margin-left:auto;color:#a1a1aa;font-size:10px}
+        details[open] .chevron{transform:rotate(180deg)}
+        .detail{position:absolute;z-index:2147483001;top:calc(100% + 4px);left:0;width:100%;max-height:min(200px,40vh);overflow:auto;padding:8px;border:1px solid #52525b;border-radius:4px;background:#18181b;color:#e4e4e7;font-size:11px;line-height:1.4;overflow-wrap:anywhere;box-shadow:0 4px 12px #0004}
+        p{margin:0}.full-reason{margin-top:4px;white-space:pre-wrap}
       `;
       const notice = element('section', null, 'notice');
       notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', 'NWA target list notice');
-      pageNoticeReason = element('p', null, 'reason');
-      notice.append(element('strong', 'NWA target list', 'title'), element('p', 'This player is on the NWA target list.'), pageNoticeReason);
+      const details = element('details'); pageNoticeSummary = element('summary');
+      pageNoticeReason = element('span', null, 'reason');
+      const chevron = element('span', '⌄', 'chevron'); chevron.setAttribute('aria-hidden', 'true');
+      pageNoticeSummary.append(element('strong', 'NWA target list', 'title'), pageNoticeReason, chevron);
+      const detail = element('div', null, 'detail'); pageNoticeFullReason = element('p', null, 'full-reason');
+      detail.append(element('p', 'This player is on the NWA target list.'), pageNoticeFullReason);
+      details.append(pageNoticeSummary, detail); notice.append(details);
       noticeRoot.append(style, notice);
     }
     const reason = (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || 'No reason provided.';
     const text = `Reason: ${reason}`;
     // Reasons are text, including any markup characters supplied in a suggestion.
-    if (pageNoticeReason.textContent !== text) pageNoticeReason.textContent = text;
+    if (pageNoticeReason.textContent !== text) {
+      pageNoticeReason.textContent = text; pageNoticeFullReason.textContent = text; pageNoticeSummary.title = text;
+    }
     const container = document.querySelector?.('#content-wrapper')
       || document.querySelector?.('#mainContainer .content-wrapper')
       || document.querySelector?.('#mainContainer') || document.querySelector?.('main')

@@ -49,7 +49,7 @@ The backend is already set to [targetlist.grusmedia.no](https://targetlist.grusm
 
 - **Targets:** browse the list, search players/factions/reasons, or filter by estimated stats. **Possible matches** applies your minimum, maximum and estimate-age limit.
 - **Check status:** check a target before opening its attack page.
-- **Profiles and attack pages:** listed players show an NWA notice with their saved reason. This appears after your session and target list have loaded, including for targets outside your stat range.
+- **Profiles and attack pages:** listed players show a small NWA chip with their saved reason. Tap or click it to read the full reason. This appears after your session and target list have loaded, including for targets outside your stat range.
 - **Suggestions:** suggest a player or faction with a required comment.
 - **Approvals:** faction leaders and co-leaders can approve or reject suggestions.
 

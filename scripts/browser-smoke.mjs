@@ -274,6 +274,48 @@ async function assertDock(page) {
   assert(geometry.documentWidth <= geometry.width, JSON.stringify(geometry));
 }
 
+async function noticeGeometry(page) {
+  return page.evaluate(() => {
+    const root = window.__playerNoticeShadow;
+    const host = document.getElementById('nwa-target-page-notice');
+    const rect = node => {
+      const { left, right, top, bottom, width, height } = node.getBoundingClientRect();
+      return { left, right, top, bottom, width, height };
+    };
+    const reason = root.querySelector('.reason');
+    return {
+      host: rect(host), summary: rect(root.querySelector('summary')),
+      open: root.querySelector('details').open, headingTop: document.querySelector('#content-wrapper h1').getBoundingClientRect().top,
+      reason: { text: reason.textContent, width: reason.clientWidth, scrollWidth: reason.scrollWidth,
+        overflow: getComputedStyle(reason).overflow, ellipsis: getComputedStyle(reason).textOverflow,
+        whiteSpace: getComputedStyle(reason).whiteSpace },
+      fullReason: root.querySelector('.full-reason').textContent, detail: rect(root.querySelector('.detail')),
+      viewportWidth: innerWidth, documentWidth: document.documentElement.scrollWidth,
+    };
+  });
+}
+
+function assertCompactNotice(geometry, longReason = false) {
+  assert.equal(geometry.open, false, 'the reason chip starts collapsed');
+  assert(geometry.host.height > 0 && geometry.host.height <= 22.1, JSON.stringify(geometry));
+  assert(geometry.host.width > 0 && geometry.host.width <= 340.1, JSON.stringify(geometry));
+  assert(geometry.host.left >= 0 && geometry.host.right <= geometry.viewportWidth && geometry.documentWidth <= geometry.viewportWidth, JSON.stringify(geometry));
+  if (longReason) {
+    assert(geometry.reason.scrollWidth > geometry.reason.width, 'a long reason is visually truncated in the collapsed row');
+    assert.equal(geometry.reason.whiteSpace, 'nowrap');
+    assert.equal(geometry.reason.overflow, 'hidden');
+    assert.equal(geometry.reason.ellipsis, 'ellipsis');
+  }
+}
+
+async function clickNotice(page, touch = false) {
+  const { summary } = await noticeGeometry(page);
+  const x = summary.left + summary.width / 2;
+  const y = summary.top + summary.height / 2;
+  if (touch) await page.touchscreen.tap(x, y);
+  else await page.mouse.click(x, y);
+}
+
 try {
   const legacyFirst = await mount(undefined, [legacySource]);
   assert.equal(await shadow(legacyFirst, '.launcher', 'text'), '◎ Target list');
@@ -947,12 +989,15 @@ try {
   }
   console.log('PASS sign out during suggestion queue/submission/review cannot restore content or trigger refreshes');
 
-  const profileNotice = await mount(undefined, [source], context, () => {
+  const longNoticeReason = ('Preferred chain target. Repeated attacks against alliance members; inactive for several weeks. '
+    + 'Review the saved faction note and check availability before attacking. '.repeat(10)).trim();
+  const profileNotice = await mount(undefined, [source], context, reason => {
     const content = document.createElement('main'); content.id = 'content-wrapper';
     content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
     content.innerHTML = '<h1>Willow [101]</h1><p>Mock Torn player profile content.</p>';
     document.body.append(content);
-  }, undefined, 'https://www.torn.com/profiles.php?XID=101');
+    window.__mock.targets[0].notes = reason;
+  }, longNoticeReason, 'https://www.torn.com/profiles.php?XID=101');
   assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice')), null);
   await login(profileNotice);
   await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
@@ -961,13 +1006,34 @@ try {
   assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.id), 'nwa-target-page-notice');
   assert.equal(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('section').getAttribute('aria-label')), 'NWA target list notice');
   await shadow(profileNotice, '.header .icon', 'click');
+  const collapsedNotice = await noticeGeometry(profileNotice);
+  assertCompactNotice(collapsedNotice, true);
   await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-desktop.png'), fullPage: true });
-  await profileNotice.setViewportSize({ width: 390, height: 844 });
-  assert.equal(await profileNotice.evaluate(() => {
-    const notice = document.getElementById('nwa-target-page-notice').getBoundingClientRect();
-    return notice.width > 0 && notice.left >= 0 && notice.right <= innerWidth && document.documentElement.scrollWidth <= innerWidth;
-  }), true);
-  await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-mobile.png'), fullPage: true });
+  await clickNotice(profileNotice);
+  await wait(profileNotice, () => window.__playerNoticeShadow.querySelector('details').open);
+  const expandedNotice = await noticeGeometry(profileNotice);
+  assert.equal(expandedNotice.headingTop, collapsedNotice.headingTop, 'the popup does not push player content down');
+  assert.equal(expandedNotice.host.height, collapsedNotice.host.height, 'opening full text keeps the compact row height');
+  assert.equal(expandedNotice.fullReason, `Reason: ${longNoticeReason}`);
+  assert(expandedNotice.detail.height > 0 && expandedNotice.detail.height <= 200.1);
+  await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-expanded-desktop.png'), fullPage: true });
+  await clickNotice(profileNotice);
+  await wait(profileNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
+  for (const width of [390, 320]) {
+    await profileNotice.setViewportSize({ width, height: 844 });
+    const collapsed = await noticeGeometry(profileNotice);
+    assertCompactNotice(collapsed, true);
+    await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('summary').focus());
+    await profileNotice.keyboard.press('Enter');
+    await wait(profileNotice, () => window.__playerNoticeShadow.querySelector('details').open);
+    const expanded = await noticeGeometry(profileNotice);
+    assert.equal(expanded.headingTop, collapsed.headingTop, 'keyboard opening does not move player content');
+    assert.equal(expanded.fullReason, `Reason: ${longNoticeReason}`);
+    assert(expanded.detail.left >= 0 && expanded.detail.right <= width, JSON.stringify(expanded));
+    await profileNotice.keyboard.press('Space');
+    await wait(profileNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
+    await profileNotice.screenshot({ path: path.join(artifacts, width === 390 ? 'browser-profile-notice-mobile.png' : 'browser-profile-notice-mobile-320.png'), fullPage: true });
+  }
   await profileNotice.evaluate(() => {
     const replacement = document.createElement('main'); replacement.id = 'content-wrapper';
     replacement.innerHTML = '<h1>Replacement profile content</h1>';
@@ -994,7 +1060,45 @@ try {
   });
   await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
   await profileNotice.close();
-  console.log('PASS listed profile notice, stat-independent attack notice, empty-reason fallback, SPA route cleanup, replaced container and mobile width');
+  console.log('PASS compact profile chip and ellipsis, mouse and keyboard disclosure without layout movement, desktop/390/320px width, stat-independent attack notice, SPA and container cleanup');
+
+  const noticeTouchContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await noticeTouchContext.route('**/*', route => { networkRequests++; return route.abort(); });
+  try {
+    const touchNotice = await mount({ width: 390, height: 844 }, [source], noticeTouchContext, reason => {
+      const content = document.createElement('main'); content.id = 'content-wrapper';
+      content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
+      content.innerHTML = '<h1>Attack Willow [101]</h1><p>Mock touch attack page content.</p>';
+      document.body.append(content); window.__mock.targets[0].reason = reason;
+    }, longNoticeReason, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+    await login(touchNotice); await shadow(touchNotice, '.header .icon', 'click');
+    for (const width of [390, 320]) {
+      await touchNotice.setViewportSize({ width, height: 844 });
+      const collapsed = await noticeGeometry(touchNotice); assertCompactNotice(collapsed, true);
+      await clickNotice(touchNotice, true);
+      await wait(touchNotice, () => window.__playerNoticeShadow.querySelector('details').open);
+      const expanded = await noticeGeometry(touchNotice);
+      assert.equal(expanded.headingTop, collapsed.headingTop, 'native touch expansion does not move attack content');
+      assert.equal(expanded.fullReason, `Reason: ${longNoticeReason}`);
+      assert(expanded.detail.left >= 0 && expanded.detail.right <= width, JSON.stringify(expanded));
+      if (width === 320) {
+        assert.equal(await touchNotice.evaluate(() => {
+          const popup = window.__playerNoticeShadow.querySelector('.detail').getBoundingClientRect();
+          const launcher = window.__targetlistShadow.querySelector('.launcher').getBoundingClientRect();
+          const left = Math.max(popup.left, launcher.left), right = Math.min(popup.right, launcher.right);
+          const top = Math.max(popup.top, launcher.top), bottom = Math.min(popup.bottom, launcher.bottom);
+          if (right <= left || bottom <= top) throw new Error('Touch fixture must exercise the popup/launcher overlap');
+          return document.elementFromPoint((left + right) / 2, (top + bottom) / 2)?.id;
+        }), 'nwa-target-page-notice', 'expanded reason text stays above the floating NWA launcher');
+      }
+      await touchNotice.screenshot({ path: path.join(artifacts, `browser-attack-notice-expanded-mobile-${width}.png`), fullPage: true });
+      await clickNotice(touchNotice, true);
+      await wait(touchNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
+      assertCompactNotice(await noticeGeometry(touchNotice), true);
+    }
+    await touchNotice.close();
+  } finally { await noticeTouchContext.close(); }
+  console.log('PASS native touch opens and closes complete attack reasons on 390/320px screens while retaining compact geometry and content position');
 
   const attackNotice = await mount(undefined, [source], context, () => {
     const content = document.createElement('main'); content.id = 'content-wrapper';
@@ -1012,6 +1116,7 @@ try {
   await shadow(attackNotice, '.controls button', 'click');
   await wait(attackNotice, () => window.__playerNoticeShadow.querySelector('.reason').textContent.includes('Inactive player suitable for chaining.'));
   await shadow(attackNotice, '.header .icon', 'click');
+  assertCompactNotice(await noticeGeometry(attackNotice));
   await attackNotice.screenshot({ path: path.join(artifacts, 'browser-attack-notice-desktop.png'), fullPage: true });
   await shadow(attackNotice, '.settings-toggle', 'click');
   await signOut(attackNotice);
