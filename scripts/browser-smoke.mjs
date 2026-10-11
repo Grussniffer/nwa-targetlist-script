@@ -1755,6 +1755,35 @@ try {
     await wait(profileNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
     await profileNotice.screenshot({ path: path.join(artifacts, width === 390 ? 'browser-profile-notice-mobile.png' : 'browser-profile-notice-mobile-320.png'), fullPage: true });
   }
+  const crampedHeading = await profileNotice.evaluate(() => {
+    window.__crampedProfileNotice = document.getElementById('nwa-target-page-notice');
+    const content = document.getElementById('content-wrapper'), heading = content.querySelector('h1');
+    // Reserve less than the badge's 90px minimum using explicit geometry, so
+    // this case does not depend on Windows versus Linux system-font widths.
+    content.style.width = '190px'; heading.style.font = '700 22px monospace';
+    const range = document.createRange(); range.selectNodeContents(heading);
+    const text = range.getBoundingClientRect(), anchor = heading.getBoundingClientRect();
+    const parent = content.getBoundingClientRect();
+    return { available: Math.floor(Math.min(innerWidth - 8, Math.max(anchor.right, parent.right)) - text.right - 8),
+      headingTop: anchor.top, contentHeight: parent.height };
+  });
+  assert(crampedHeading.available >= 0 && crampedHeading.available < 90, JSON.stringify(crampedHeading));
+  await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
+  assert.deepEqual(await profileNotice.evaluate(() => {
+    const content = document.getElementById('content-wrapper');
+    return { headingTop: content.querySelector('h1').getBoundingClientRect().top, contentHeight: content.getBoundingClientRect().height };
+  }), { headingTop: crampedHeading.headingTop, contentHeight: crampedHeading.contentHeight },
+  'a cramped heading withholds the badge without adding a row or changing content geometry');
+  await profileNotice.setViewportSize({ width: 1280, height: 960 });
+  await profileNotice.evaluate(() => {
+    const content = document.getElementById('content-wrapper');
+    content.style.width = ''; content.querySelector('h1').style.font = '';
+  });
+  await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
+  assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice') === window.__crampedProfileNotice), true,
+    'widening the heading restores the existing badge');
+  // SPA identity cleanup is independent of narrow-screen placement. Exercise
+  // it at desktop width where every fixture heading has sufficient free room.
   await profileNotice.evaluate(() => {
     window.__noticeBeforeReplacement = document.getElementById('nwa-target-page-notice');
     const replacement = document.createElement('main'); replacement.id = 'content-wrapper';
@@ -1785,7 +1814,7 @@ try {
   });
   await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
   await profileNotice.close();
-  console.log('PASS independent profile badge shows NWA estimate without adding a row; mouse/keyboard popup, desktop/390/320px width, stat-independent attack fallback and SPA cleanup');
+  console.log('PASS independent profile badge shows NWA estimate without adding a row; mouse/keyboard popup, desktop/390/320px width, cramped-heading withholding/restoration, stat-independent attack fallback and SPA cleanup');
 
   const ffNotice = await mount(undefined, [source], context, makeFfscouterFixture, longNoticeReason,
     'https://www.torn.com/page.php?sid=attack&user2ID=101');
