@@ -4,7 +4,7 @@ Find chain targets for **North West Alliance**.
 
 ## Install
 
-[**Install NWA Target Finder**](https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js)
+[**Install NWA Target Finder**](https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js)
 
 ### Tampermonkey
 
@@ -24,10 +24,12 @@ On Chrome, enable **Allow User Scripts** in Tampermonkey's extension settings ([
 2. Open **Manage scripts → +**. Tap **Configure** beside **Remote load/update**, and enter this link in **Remote URL**:
 
    ```text
-   https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
+   https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
    ```
 
 3. Tap **Fetch → Load**, choose **Continue** if permissions appear, and reload Torn inside PDA.
+
+If your existing PDA **Remote URL** contains `codex/initial`, change it to the `main` link above so it receives future updates.
 
 Keep the script enabled on all Torn pages. NWA includes PDA support and remembers your login and settings. Newer PDA versions use the app's script storage, which survives clearing the browser cache; older versions use browser storage. Sign in through NWA's key-use notice as usual.
 

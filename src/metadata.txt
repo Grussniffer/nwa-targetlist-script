@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.5.4
+// @version      0.6.0
 // @description  North West Alliance chain targets.
-// @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
-// @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.meta.js
+// @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
+// @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @grant        GM_xmlhttpRequest

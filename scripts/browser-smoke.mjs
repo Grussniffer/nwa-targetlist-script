@@ -133,8 +133,16 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       suggestedBy: { id: player.id, name: player.name, faction: player.faction }, createdAt: new Date(Date.now()).toISOString(),
       reviewedBy: null, reviewedAt: null }];
     window.__mock = { requests: [], pending: [], holds: [], overrides: {}, player, targets, store, suggestions,
+      delta: false, feedSnapshots: new Map(), feedSequence: 0, feedResponses: [],
       reservations: null, reservedTargets: new Set(),
       canReview: false, serviceOrigin: 'https://targetlist.grusmedia.no' };
+    const originalSetInterval = window.setInterval;
+    window.__mock.intervals = [];
+    window.setInterval = (callback, delay, ...args) => {
+      window.__mock.intervals.push(() => callback(...args));
+      return originalSetInterval(callback, delay, ...args);
+    };
+    window.__mock.runIntervals = () => { for (const callback of window.__mock.intervals) callback(); };
     window.GM_getValue = (key, fallback) => store.has(key) ? store.get(key) : fallback;
     window.GM_setValue = (key, value) => store.set(key, value);
     window.GM_deleteValue = key => store.delete(key);
@@ -149,7 +157,20 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           keyStorage: { mode: 'encrypted', expiresAt: new Date(Date.now() + 7 * 86400000).toISOString() } };
       } else if (url.pathname === '/api/session' && request.method === 'DELETE') { status = 204; data = null; }
       else if (url.pathname === '/api/targets') {
-        data = { player, targets: structuredClone(targets), generatedAt: new Date(Date.now()).toISOString(), warnings: [] };
+        const snapshot = structuredClone(targets);
+        data = { player, generatedAt: new Date(Date.now()).toISOString(), warnings: [] };
+        if (window.__mock.delta) {
+          const previous = window.__mock.feedSnapshots.get(url.searchParams.get('cursor'));
+          const cursor = (++window.__mock.feedSequence).toString(16).padStart(64, '0');
+          data.sync = { version: 1, cursor, reset: !previous };
+          if (previous) {
+            const prior = new Map(previous.map(target => [target.id, JSON.stringify(target)]));
+            const current = new Set(snapshot.map(target => target.id));
+            data.updates = snapshot.filter(target => prior.get(target.id) !== JSON.stringify(target));
+            data.removed = previous.filter(target => !current.has(target.id)).map(target => target.id);
+          } else data.targets = snapshot;
+          window.__mock.feedSnapshots.set(cursor, snapshot);
+        } else data.targets = snapshot;
         if (window.__mock.reservations) data.reservations = window.__mock.reservations;
       } else if (/^\/api\/targets\/\d+\/reservation$/.test(url.pathname) && request.method === 'POST') {
         const id = Number(url.pathname.split('/')[3]);
@@ -190,6 +211,8 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           data = { suggestion: structuredClone(row), addedPlayers: decision === 'approved' ? 1 : 0 };
         }
       } else throw new Error(`Unexpected mock path: ${request.method} ${url.pathname}`);
+      if (url.pathname === '/api/targets') window.__mock.feedResponses.push({ search: url.search, status,
+        bytes: new TextEncoder().encode(JSON.stringify(data)).byteLength, data: structuredClone(data) });
       request.onload({ status,
         responseText: override?.invalidJson ? '{invalid JSON' : JSON.stringify(data),
         finalUrl: override?.finalUrl || request.url });
@@ -234,6 +257,188 @@ async function shadow(page, selector, operation, argument) {
 }
 async function wait(page, expression) {
   await page.waitForFunction(expression, undefined, { timeout: 5000 });
+}
+async function refreshMockFeed(page) {
+  const before = await page.evaluate(() => window.__mock.feedResponses.length);
+  await page.evaluate(() => {
+    window.__mockNow += 1000;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.waitForFunction(before => window.__mock.feedResponses.length === before + 1, before, { timeout: 5000 });
+}
+
+function makePerformanceFeed({ size = 1000, reservation = false } = {}) {
+  const mock = window.__mock, template = structuredClone(mock.targets[0]);
+  mock.delta = true; mock.reservations = reservation ? { supported: true, leaseMs: 60000 } : null;
+  mock.targets.splice(0, mock.targets.length, ...Array.from({ length: size }, (_, index) => ({
+    ...structuredClone(template), id: index < 3 ? 101 + index : 10000 + index,
+    name: `Performance target ${String(index + 1).padStart(4, '0')}`, notes: `Approved performance reason ${index + 1}.`,
+    status: { state: 'Okay', description: 'Okay (mock)', until: null }, checkedAt: new Date(Date.now()).toISOString()
+  })));
+  mock.store.set(`targetlist.session.${mock.serviceOrigin}`, {
+    token: 'mock-session-token', expiresAt: new Date(Date.now() + 3600000).toISOString()
+  });
+  const content = document.createElement('main'); content.id = 'content-wrapper';
+  content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
+  content.innerHTML = '<h1>Peer [101]</h1><p>Mock native profile content.</p>';
+  document.body.append(content);
+  if (reservation) mock.holds.push('/api/targets/101/reservation');
+}
+
+async function checkDeltaRendering(pageContext, scripts, mode) {
+  const viewport = mode === 'PDA' ? { width: 390, height: 844 } : { width: 1280, height: 960 };
+  const page = await mount(viewport, scripts, pageContext, makePerformanceFeed, {}, 'https://www.torn.com/profiles.php?XID=101');
+  await wait(page, () => window.__mock.feedResponses.length === 1 && Boolean(document.getElementById('nwa-target-page-notice')));
+  const closed = await page.evaluate(() => ({ cards: window.__targetlistShadow.querySelectorAll('.card').length,
+    nodes: window.__targetlistShadow.querySelectorAll('*').length, panelClosed: window.__targetlistShadow.querySelector('.panel').hidden }));
+  assert.equal(closed.cards, 0, `${mode}: restoring a large pool does not create hidden cards`);
+  assert.equal(closed.panelClosed, true);
+  await shadow(page, '.settings-toggle', 'click');
+  await wait(page, () => window.__targetlistShadow.querySelectorAll('.card').length === 1000);
+  const openedNodes = await page.evaluate(() => window.__targetlistShadow.querySelectorAll('*').length);
+  await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    const card = id => [...root.querySelectorAll('.card')].find(node => node.querySelector('.name').textContent.includes(`[${id}]`));
+    const search = root.querySelector('input[type=search]'); search.focus();
+    root.querySelector('.scroll').scrollTop = 650;
+    window.__performanceNodes = { card101: card(101), card102: card(102), card103: card(103),
+      children101: [...card(101).querySelectorAll('*')], children102: [...card(102).querySelectorAll('*')],
+      search, minimum: root.querySelector('[aria-label="Minimum target stats as percent of your total"]'),
+      maximum: root.querySelector('[aria-label="Maximum target stats as percent of your total"]'),
+      age: root.querySelector('[aria-label="Maximum estimate age in days"]'),
+      scroll: root.querySelector('.scroll').scrollTop };
+  });
+  await refreshMockFeed(page);
+  assert.deepEqual(await page.evaluate(() => {
+    const root = window.__targetlistShadow, nodes = window.__performanceNodes;
+    return { cards: [nodes.card101, nodes.card102, nodes.card103].every(node => node.isConnected),
+      children: nodes.children101.every((node, index) => nodes.card101.querySelectorAll('*')[index] === node),
+      search: root.querySelector('input[type=search]') === nodes.search,
+      minimum: root.querySelector('[aria-label="Minimum target stats as percent of your total"]') === nodes.minimum,
+      maximum: root.querySelector('[aria-label="Maximum target stats as percent of your total"]') === nodes.maximum,
+      age: root.querySelector('[aria-label="Maximum estimate age in days"]') === nodes.age,
+      focus: root.activeElement === nodes.search, scroll: root.querySelector('.scroll').scrollTop === nodes.scroll };
+  }), { cards: true, children: true, search: true, minimum: true, maximum: true, age: true, focus: true, scroll: true },
+  `${mode}: an unchanged delta preserves exact cards, descendants, settings, scroll and focus`);
+  await page.evaluate(() => Object.assign(window.__mock.targets[0], {
+    status: { state: 'Hospital', description: 'In hospital (delta)', until: Math.floor(Date.now() / 1000) + 600 },
+    checkedAt: new Date(Date.now()).toISOString()
+  }));
+  await refreshMockFeed(page);
+  assert.deepEqual(await page.evaluate(() => {
+    const nodes = window.__performanceNodes;
+    return { article: nodes.card101.isConnected, changed: nodes.card101.textContent.includes('Hospital'),
+      changedChildren: nodes.children101.some((node, index) => nodes.card101.querySelectorAll('*')[index] !== node),
+      unchangedArticle: nodes.card102.isConnected,
+      unchangedChildren: nodes.children102.every((node, index) => nodes.card102.querySelectorAll('*')[index] === node) };
+  }), { article: true, changed: true, changedChildren: true, unchangedArticle: true, unchangedChildren: true },
+  `${mode}: a changed status patches only that target while preserving its keyed article`);
+  assert.equal(await page.evaluate(() => window.__mock.feedResponses.at(-1).data.updates.length), 1);
+  await page.evaluate(() => {
+    const mock = window.__mock;
+    Object.assign(mock.targets[0], { estimatedStats: 360000, reason: 'Updated approved delta reason.' });
+    mock.targets.splice(mock.targets.findIndex(target => target.id === 102), 1);
+    mock.targets.push({ ...structuredClone(mock.targets[1]), id: 99001, name: 'New delta target' });
+  });
+  await refreshMockFeed(page);
+  assert.equal(await cardSnapshot(page, 102), null, `${mode}: removed targets disappear`);
+  assert.ok(await cardSnapshot(page, 99001), `${mode}: delta additions appear`);
+  assert.match((await cardSnapshot(page, 101)).text, /360K.*Updated approved delta reason/s);
+  assert.match(await page.evaluate(() => window.__playerNoticeShadow.querySelector('.estimate').textContent), /360K/);
+  assert.match(await page.evaluate(() => window.__playerNoticeShadow.querySelector('.full-reason').textContent), /Updated approved delta reason/);
+  await page.evaluate(() => window.__mock.feedSnapshots.clear());
+  await refreshMockFeed(page);
+  const metrics = await page.evaluate(() => {
+    const responses = window.__mock.feedResponses;
+    return { full: responses[0].bytes, unchanged: responses[1].bytes, oneStatus: responses[2].bytes,
+      reset: responses.at(-1).data.sync.reset, resetCount: responses.at(-1).data.targets.length,
+      initialRequests: responses.filter(response => response.search === '').length,
+      cursorRequests: responses.slice(1).every(response => new URLSearchParams(response.search).has('cursor')) };
+  });
+  assert.equal(metrics.reset, true, `${mode}: an unknown server cursor returns a full reset`);
+  assert.equal(metrics.resetCount, 1000);
+  assert.equal(metrics.initialRequests, 1, `${mode}: subsequent synchronization does not request unconditional full feeds`);
+  assert.equal(metrics.cursorRequests, true);
+  assert(metrics.unchanged < metrics.full / 100 && metrics.oneStatus < metrics.full / 100,
+    `${mode}: unchanged and single-target deltas are under one percent of the full fixture payload`);
+  assert.equal(await cardSnapshot(page, 102), null);
+  assert.match((await cardSnapshot(page, 101)).text, /Updated approved delta reason/);
+  await shadow(page, '.header .icon', 'click');
+  await shadow(page, '.settings-toggle', 'click');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('input[type=search]') === window.__performanceNodes.search), true,
+    `${mode}: closing and reopening the same view preserves controls`);
+  await page.evaluate(() => {
+    const minimum = window.__targetlistShadow.querySelector('[aria-label="Minimum target stats as percent of your total"]');
+    minimum.focus(); minimum.value = ''; minimum.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const minimum = window.__targetlistShadow.querySelector('[aria-label="Minimum target stats as percent of your total"]');
+    return minimum === window.__performanceNodes.minimum && minimum.value === '' && window.__targetlistShadow.activeElement === minimum;
+  }), true, `${mode}: synchronization preserves an unfinished minimum-stats edit`);
+  await page.evaluate(() => { window.__performanceNodes.minimum.value = '10'; });
+  await openSuggestions(page);
+  await fillSuggestion(page, { type: 'faction', targetId: '45001', comment: 'Keep this unfinished faction reason while target data updates.' });
+  await page.evaluate(() => {
+    const root = window.__targetlistShadow, comment = root.querySelector('textarea'); comment.focus();
+    window.__draftNodes = { comment, type: root.querySelector('[aria-label="Suggestion type"]'), id: root.querySelector('[aria-label="Player or faction ID"]') };
+  });
+  await refreshMockFeed(page);
+  await shadow(page, '.header .icon', 'click');
+  await shadow(page, '.settings-toggle', 'click');
+  assert.deepEqual(await page.evaluate(() => {
+    const root = window.__targetlistShadow, nodes = window.__draftNodes;
+    return { comment: root.querySelector('textarea') === nodes.comment, type: root.querySelector('[aria-label="Suggestion type"]') === nodes.type,
+      id: root.querySelector('[aria-label="Player or faction ID"]') === nodes.id, commentValue: nodes.comment.value, typeValue: nodes.type.value, idValue: nodes.id.value };
+  }), { comment: true, type: true, id: true, commentValue: 'Keep this unfinished faction reason while target data updates.', typeValue: 'faction', idValue: '45001' },
+  `${mode}: target deltas and closing/reopening preserve the unsent suggestion and its exact controls`);
+  await clickButton(page, 'Targets');
+  await page.evaluate(() => { window.__mockNow += 31000; });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => window.__mock.feedResponses.at(-1).data.updates.length), 0,
+    `${mode}: elapsed time alone does not invent a changed target or a new checkedAt`);
+  assert.equal((await cardSnapshot(page, 103)).attack, null,
+    `${mode}: a newly authorized unchanged delta cannot renew the old target status`);
+  assert.match((await cardSnapshot(page, 103)).text, /Status needs checking/);
+  await page.evaluate(() => {
+    window.__mock.holds.push('/api/targets');
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await wait(page, () => window.__mock.pending.length === 1);
+  await page.evaluate(() => { window.__mockNow += 3600001; window.__mock.runIntervals(); });
+  await wait(page, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
+  await page.evaluate(() => window.__mock.release('/api/targets'));
+  await page.waitForTimeout(30);
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0,
+    `${mode}: a late delta cannot restore expired access`);
+  assert.equal(await page.evaluate(() => Boolean(document.getElementById('nwa-target-page-notice'))), false);
+  await page.close();
+  console.log(`PASS ${mode} delta synchronization, lazy 1,000-target settings, keyed status patches, preserved controls/scroll/focus, delisting, unknown-cursor reset and expiry races`);
+  console.log(`PERF ${mode}: closed ${closed.cards} cards/${closed.nodes} nodes; opened 1,000 cards/${openedNodes} nodes; full ${metrics.full} bytes; unchanged delta ${metrics.unchanged} bytes; one-status delta ${metrics.oneStatus} bytes`);
+
+  const finder = await mount(viewport, scripts, pageContext, makePerformanceFeed, { reservation: true });
+  await wait(finder, () => window.__mock.feedResponses.length === 1);
+  await shadow(finder, '.launcher', 'click');
+  await wait(finder, () => window.__mock.pending.length === 1);
+  assert.equal(await finder.evaluate(() => window.__mock.pending[0].url.endsWith('/api/targets/101/reservation')), true);
+  assert.equal(await finder.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0);
+  assert.equal(await finder.evaluate(() => window.__mock.requests.filter(request => request.path === '/api/targets').length), 1);
+  await finder.close();
+  console.log(`PASS ${mode} finder selects from the preloaded 1,000-target pool without building settings cards or fetching another full feed`);
+
+  const denied = await mount(viewport, scripts, pageContext, makePerformanceFeed, {}, 'https://www.torn.com/profiles.php?XID=101');
+  await wait(denied, () => window.__mock.feedResponses.length === 1 && Boolean(document.getElementById('nwa-target-page-notice')));
+  await denied.evaluate(() => { window.__mock.overrides['/api/targets'] = { status: 403,
+    data: { error: { code: 'FACTION_NOT_ALLOWED', message: 'Mock faction authorization revoked.' } } }; });
+  await refreshMockFeed(denied);
+  await wait(denied, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
+  assert.equal(await denied.evaluate(() => new URLSearchParams(window.__mock.feedResponses.at(-1).search).has('cursor')), true,
+    `${mode}: revocation is tested on a cursor request`);
+  assert.equal(await denied.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0);
+  assert.equal(await denied.evaluate(() => Boolean(document.getElementById('nwa-target-page-notice'))), false);
+  assert.equal(await denied.evaluate(() => window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`)), false);
+  await denied.close();
+  console.log(`PASS ${mode} deltas preserve unfinished stat edits and suggestion drafts; unchanged feeds retain status age, and cursor requests cannot bypass revoked faction authorization`);
 }
 async function login(page) {
   await shadow(page, '.settings-toggle', 'click');
@@ -725,6 +930,10 @@ try {
   assert.equal(await warm.evaluate(() => window.__mock.requests[0].data), undefined, 'restoration sends no API key');
   assert.equal(await warm.evaluate(() => window.__mock.requests[0].headers.Authorization), 'Bearer mock-session-token');
   await warm.evaluate(() => window.__mock.release('/api/targets'));
+  await wait(warm, () => window.__mock.feedResponses.length === 1);
+  assert.equal(await warm.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0,
+    'saved-token preloading keeps the closed settings panel free of cards');
+  await shadow(warm, '.settings-toggle', 'click');
   await wait(warm, () => window.__targetlistShadow.querySelectorAll('.card').length === 5);
   assert.equal(warm.url(), 'about:blank', 'preloading never opens an attack by itself');
   assert.equal((await cardSnapshot(warm, 102)).attack, null, 'cached Hospital does not expose an attack link');
@@ -760,7 +969,9 @@ try {
       mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
       mock.targets[0].checkedAt = new Date(Date.now() + (expired === 'authorization' ? 1000 : -30000)).toISOString();
     }, expired);
-    await wait(stale, () => window.__targetlistShadow.querySelectorAll('.card').length === 4);
+    await wait(stale, () => window.__mock.feedResponses.length === 1);
+    assert.equal(await stale.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0,
+      'restoring a session does not eagerly build hidden cards');
     await stale.evaluate(expired => {
       if (expired === 'authorization') {
         window.__mockNow += 30000;
@@ -875,6 +1086,9 @@ try {
 
   const main = await mount();
   await login(main);
+  await refreshMockFeed(main);
+  assert.equal(await main.evaluate(() => window.__mock.requests.filter(request => request.path === '/api/targets').at(-1).search), '',
+    'a legacy backend without sync metadata retains full-feed requests without a cursor');
   await assertDock(main);
   assert.match(await shadow(main, '.header', 'text'), /NWA/);
   assert.match(await shadow(main, '.header', 'text'), /North West Alliance/);
@@ -1615,6 +1829,12 @@ try {
     await recoveredPdaStore.close();
     console.log('PASS transient PDA storage failure keeps the saved token and preferences; a fresh successful document restores without entering the key again');
   } finally { await pdaContext.close(); }
+
+  await checkDeltaRendering(context, [source], 'GM');
+  const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
+  try { await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA'); }
+  finally { await deltaPdaContext.close(); }
 
   assert.equal(networkRequests, 0, 'Browser attempted external network access');
   assert.deepEqual(pageErrors, [], 'Unhandled browser errors');

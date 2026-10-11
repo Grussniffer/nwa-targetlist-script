@@ -32,14 +32,17 @@ class Element {
     this.tagName = tag.toUpperCase(); this.children = []; this.listeners = new Map();
     this.attributes = new Map(); this.style = {}; this.value = ''; this.textContent = '';
     this.activeElement = null; this.parentNode = null;
+    this.appendCount = 0; this.replaceCount = 0;
   }
   append(...children) {
+    this.appendCount++;
     for (const child of children) {
       if (typeof child === 'object') { child.remove(); child.parentNode = this; }
       this.children.push(child);
     }
   }
   replaceChildren(...children) {
+    this.replaceCount++;
     for (const child of this.children) if (typeof child === 'object') child.parentNode = null;
     this.children = []; this.append(...children);
   }
@@ -104,10 +107,13 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   const root = host.shadow;
   function find(predicate) { const result = descendants(root).find(predicate); assert.ok(result, 'expected control exists'); return result; }
   function button(label) { return find(element => element.tagName === 'BUTTON' && element.textContent === label); }
+  function openPanel() { if (find(element => element.className === 'panel').hidden) find(element => element.className === 'settings-toggle').emit('click'); }
+  function closePanel() { if (!find(element => element.className === 'panel').hidden) find(element => element.className === 'settings-toggle').emit('click'); }
   function response(request, data, status = 200) {
     request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url });
   }
   async function signIn(targets = [target], feed = {}) {
+    openPanel();
     const input = find(element => element.tagName === 'INPUT' && element.type === 'password'); input.value = KEY;
     find(element => element.tagName === 'FORM').emit('submit');
     const login = requests.at(-1);
@@ -122,7 +128,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const deletion = requests.at(-1); response(deletion, null, 204); await flush();
     return deletion;
   }
-  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut,
+  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel,
     settings: () => find(element => element.className === 'settings-toggle'),
     text: () => textContent(root), setNow: value => { clock = value; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
@@ -176,7 +182,7 @@ test('an older script cannot replace an already mounted newer NWA version', () =
 });
 
 test('invalid key input stays local and the password field is cleared on submission', async () => {
-  const app = fixture(); const input = app.find(element => element.type === 'password'); input.value = 'bad-key';
+  const app = fixture(); app.openPanel(); const input = app.find(element => element.type === 'password'); input.value = 'bad-key';
   const event = app.find(element => element.tagName === 'FORM').emit('submit');
   await flush();
   assert.equal(event.defaultPrevented, true);
@@ -187,7 +193,7 @@ test('invalid key input stays local and the password field is cleared on submiss
 });
 
 test('the key-use notice appears before the input and discloses encrypted offline storage and removal', () => {
-  const app = fixture();
+  const app = fixture(); app.openPanel();
   const form = app.find(element => element.tagName === 'FORM');
   const notice = app.find(element => element.id === 'nwa-key-use');
   const input = app.find(element => element.type === 'password');
@@ -221,7 +227,7 @@ test('incompatible backend storage confirmation is rejected before saving a toke
   for (const metadata of [undefined, { mode: 'memory', expiresAt: keyStorage.expiresAt },
     { mode: 'encrypted', expiresAt: 'invalid' }, { mode: 'encrypted', expiresAt: new Date(NOW - 1).toISOString() },
     { mode: 'encrypted', expiresAt: new Date(NOW + 8 * 86400000).toISOString() }]) {
-    const app = fixture();
+    const app = fixture(); app.openPanel();
     app.find(element => element.type === 'password').value = KEY;
     app.find(element => element.tagName === 'FORM').emit('submit');
     app.response(app.requests[0], { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage: metadata });
@@ -243,7 +249,7 @@ test('incompatible backend storage confirmation is rejected before saving a toke
 });
 
 test('incompatible backend cleanup failure does not adopt the token or hide the required backend update', async () => {
-  const app = fixture(); app.find(element => element.type === 'password').value = KEY;
+  const app = fixture(); app.openPanel(); app.find(element => element.type === 'password').value = KEY;
   app.find(element => element.tagName === 'FORM').emit('submit');
   app.response(app.requests[0], { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player }); await flush();
   app.requests[1].onerror(); await flush();
@@ -448,7 +454,7 @@ test('middle clicks also revalidate an expired status check', async () => {
 });
 
 test('the status-expiry timer removes attack links even while a control has focus', async () => {
-  const app = fixture(); await app.signIn(); app.settings().emit('click');
+  const app = fixture(); await app.signIn(); app.openPanel();
   app.button('Check status').emit('click');
   app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString() });
   await flush();
@@ -459,7 +465,7 @@ test('the status-expiry timer removes attack links even while a control has focu
 });
 
 test('a forced-fetch timeout unblocks login and ignores a late successful response', async () => {
-  const app = fixture(); const input = app.find(element => element.type === 'password'); input.value = KEY;
+  const app = fixture(); app.openPanel(); const input = app.find(element => element.type === 'password'); input.value = KEY;
   app.find(element => element.tagName === 'FORM').emit('submit');
   const login = app.requests.at(-1);
   assert.equal(app.timeouts.size, 1);
@@ -921,7 +927,7 @@ test('an ended hospital timer still needs a new Okay check before opening an att
 
 test('visible pages refresh the feed every ten seconds without hiding the target list or automatically navigating', async () => {
   const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
-  app.settings().emit('click');
+  app.openPanel();
   const before = app.requests.length;
   app.setNow(NOW + 9_999); app.timers[0]();
   assert.equal(app.requests.length, before);
@@ -964,6 +970,7 @@ test('hidden pages do not preload or poll and refresh once when Torn becomes vis
   assert.equal(app.requests.length, 1);
   app.setVisibility('visible');
   assert.equal(app.requests.length, 2);
+  app.openPanel();
   assert.match(app.text(), /Target Player/);
   assert.deepEqual(app.navigations, []);
 });
@@ -971,7 +978,7 @@ test('hidden pages do not preload or poll and refresh once when Torn becomes vis
 test('a failed background authorization attempt keeps browsing data but blocks the instant path until recovery', async () => {
   const cached = { ...target, checkedAt: new Date(NOW).toISOString() };
   const app = fixture(); await app.signIn([cached]);
-  app.settings().emit('click');
+  app.openPanel();
   app.setVisibility('hidden'); app.setNow(NOW + 1000); app.setVisibility('visible');
   app.response(app.requests.at(-1), { error: { code: 'UPSTREAM_UNAVAILABLE', message: 'Cannot verify access right now.' } }, 503); await flush();
   assert.match(app.text(), /Target Player/);
@@ -1027,7 +1034,7 @@ test('a mismatched explicit status response cannot mark another target available
 
 test('background feed refreshes preserve focused search and unfinished stat-limit controls', async () => {
   for (const control of ['search', 'minimum', 'maximum']) {
-    const app = fixture(); await app.signIn(); app.settings().emit('click');
+    const app = fixture(); await app.signIn(); app.openPanel();
     const focused = app.find(element => control === 'search' ? element.type === 'search'
       : element.attributes.get('aria-label') === `${control === 'minimum' ? 'Minimum' : 'Maximum'} target stats as percent of your total`);
     focused.value = control === 'search' ? 'Target' : '4';
@@ -1051,7 +1058,7 @@ test('background feed refreshes preserve focused search and unfinished stat-limi
 });
 
 test('background feed refreshes retain the focused suggestion textarea and its draft', async () => {
-  const app = fixture(); await app.signIn(); app.settings().emit('click');
+  const app = fixture(); await app.signIn(); app.openPanel();
   await openSuggestions(app, { canReview: false, suggestions: [] });
   const textarea = app.find(element => element.tagName === 'TEXTAREA');
   textarea.value = 'An unfinished reason with the cursor still here'; textarea.emit('input');
@@ -1069,6 +1076,7 @@ test('background feed refreshes retain the focused suggestion textarea and its d
 test('a closed settings panel is not rebuilt by background refresh and shows current data when opened', async () => {
   const app = fixture(); await app.signIn();
   const oldProfile = app.find(element => element.className === 'profile');
+  app.closePanel();
   app.setNow(NOW + 10_000); app.timers[0]();
   app.response(app.requests.at(-1), { player: { ...player, name: 'Updated Allowed Player' },
     targets: [{ ...target, name: 'Refreshed Target' }], warnings: [] }); await flush();
@@ -1080,8 +1088,75 @@ test('a closed settings panel is not rebuilt by background refresh and shows cur
   assert.match(app.text(), /Refreshed Target/);
 });
 
+test('a restored session keeps a large pool out of the DOM until settings are opened', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString() });
+  const targets = Array.from({ length: 250 }, (_, index) => ({ ...target, id: target.id + index,
+    name: `Pool Player ${index}`, checkedAt: new Date(NOW).toISOString() }));
+  const content = app.find(element => element.className === 'scroll').lastChild;
+  assert.equal(content.children.length, 0, 'restoring a session does not construct hidden settings');
+  app.response(app.requests.at(-1), { player, targets, warnings: [] }); await flush();
+  assert.equal(content.children.length, 0, 'the authorized pool stays in data while settings remain closed');
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 0);
+  const requestCount = app.requests.length;
+  app.button('NWA').emit('click'); await flush();
+  assert.equal(app.requests.length, requestCount, 'the finder can use the checked pool without mounting cards');
+  assert.equal(app.navigations.length, 1);
+  app.openPanel();
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, targets.length);
+  assert.match(app.text(), /Pool Player 249/);
+});
+
+test('unchanged feeds reuse cards and controls, and a changed row leaves other cards untouched', async () => {
+  const other = { ...target, id: target.id + 1, name: 'Other Target', estimatedStats: 200_000 };
+  const app = fixture(); await app.signIn([target, other]);
+  const cards = app.find(element => element.className === 'cards');
+  const card = id => app.find(element => element.attributes.get('data-target-id') === String(id));
+  const original = card(target.id), unchanged = card(other.id);
+  const originalName = descendants(original).find(element => element.className === 'name');
+  const unchangedName = descendants(unchanged).find(element => element.className === 'name');
+  const search = app.find(element => element.type === 'search');
+  const content = app.find(element => element.className === 'scroll').lastChild;
+  cards.scrollTop = 180;
+  const cardReplacements = [original.replaceCount, unchanged.replaceCount];
+  const initialAppends = cards.appendCount, initialReplacements = content.replaceCount;
+  app.setNow(NOW + 10_000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target }, { ...other }], warnings: [] }); await flush();
+  assert.equal(card(target.id), original); assert.equal(card(other.id), unchanged);
+  assert.equal(descendants(original).find(element => element.className === 'name'), originalName);
+  assert.equal(descendants(unchanged).find(element => element.className === 'name'), unchangedName);
+  assert.deepEqual([original.replaceCount, unchanged.replaceCount], cardReplacements);
+  assert.equal(cards.appendCount, initialAppends, 'unchanged ordering does not move card nodes');
+  assert.equal(content.replaceCount, initialReplacements, 'settings controls are reused');
+  assert.equal(cards.scrollTop, 180);
+  app.setNow(NOW + 20_000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, reason: 'Updated reason' }, { ...other }], warnings: [] }); await flush();
+  assert.equal(card(target.id), original, 'changed rows retain their outer card');
+  assert.equal(original.replaceCount, cardReplacements[0] + 1);
+  assert.equal(unchanged.replaceCount, cardReplacements[1]);
+  assert.equal(descendants(unchanged).find(element => element.className === 'name'), unchangedName);
+  assert.equal(app.find(element => element.type === 'search'), search);
+  assert.equal(cards.appendCount, initialAppends); assert.equal(cards.scrollTop, 180);
+  assert.match(textContent(original), /Updated reason/);
+});
+
+test('keyed cards reorder when stat ratios change and remove targets missing from the next pool', async () => {
+  const other = { ...target, id: target.id + 1, name: 'Other Target', estimatedStats: 200_000 };
+  const app = fixture(); await app.signIn([target, other]);
+  const cards = app.find(element => element.className === 'cards');
+  const original = app.find(element => element.attributes.get('data-target-id') === String(target.id));
+  const removed = app.find(element => element.attributes.get('data-target-id') === String(other.id));
+  assert.deepEqual(cards.children, [removed, original]);
+  app.setNow(NOW + 10_000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }, other], warnings: [] }); await flush();
+  assert.deepEqual(cards.children, [original, removed], 'rank changes move existing card nodes');
+  app.setNow(NOW + 20_000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, estimatedStats: 100_000 }], warnings: [] }); await flush();
+  assert.deepEqual(cards.children, [original]); assert.equal(removed.parentNode, null);
+  assert.doesNotMatch(app.text(), /Other Target/);
+});
+
 test('background polling and visibility refresh defer while an explicit status check is pending', async () => {
-  const app = fixture(); await app.signIn(); app.settings().emit('click'); app.button('Check status').emit('click');
+  const app = fixture(); await app.signIn(); app.openPanel(); app.button('Check status').emit('click');
   const live = app.requests.at(-1); const before = app.requests.length;
   app.setNow(NOW + 10_000); app.timers[0](); app.setVisibility('hidden'); app.setVisibility('visible');
   assert.equal(app.requests.length, before, 'neither a timer nor a visibility event invalidates the pending check');
@@ -1122,6 +1197,7 @@ test('NWA recovers an empty or unknown-stat pool after background estimates beco
 
 test('NWA retries the pool after login succeeded but the initial target feed failed', async () => {
   const app = fixture();
+  app.openPanel();
   app.find(element => element.type === 'password').value = KEY;
   app.find(element => element.tagName === 'FORM').emit('submit');
   app.response(app.requests.at(-1), { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage }); await flush();

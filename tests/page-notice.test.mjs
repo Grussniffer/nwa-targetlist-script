@@ -142,6 +142,10 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   function notice() { return document.getElementById('nwa-target-page-notice'); }
   function noticeText() { return notice()?.shadow?.textContent || notice()?.textContent || ''; }
   return { document, body, window, storage, requests, timers, feed, response, control, mutation, notice, noticeText,
+    openSettings() {
+      const root = document.getElementById('torn-targetlist-host').shadow;
+      all(root).find(node => node.className === 'settings-toggle').emit('click');
+    },
     changeUrl(value, event = 'popstate') { window.location.href = value; window.emit(event); shortTimeouts(); },
     tick(value = now) { now = value; for (const timer of timers) timer.callback(); shortTimeouts(); },
     mountLate() { content = mountContent(); mutation(); return content; },
@@ -290,6 +294,7 @@ test('a refreshed authorized target feed updates its reason and removes delisted
 
 test('sign-out immediately removes the note and an older feed cannot restore it', async () => {
   const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed(); assert.ok(page.notice());
+  page.openSettings();
   page.tick(NOW + 10000); const previousFeed = page.requests.at(-1);
   page.control('Sign out and remove key').emit('click'); assert.equal(page.notice(), null);
   page.response(page.requests.at(-1), null, 204); await flush();

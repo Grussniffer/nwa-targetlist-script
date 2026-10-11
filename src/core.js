@@ -5,6 +5,7 @@ const TargetListCore = (() => {
   const DEFAULT_ESTIMATE_DAYS = 7;
   const RECENT_TARGET_MS = 10 * 60 * 1000;
   const LIVE_STATUS_MAX_AGE = 30 * 1000;
+  const compactFormatter = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 });
 
   function serviceUrl(value) {
     const url = new URL(value);
@@ -35,7 +36,7 @@ const TargetListCore = (() => {
   function positive(value) { return typeof value === 'number' && Number.isFinite(value) && value > 0; }
   function compact(value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) return 'Unknown';
-    return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(value);
+    return compactFormatter.format(value);
   }
   function ageLabel(timestamp, now = Date.now()) {
     if (!positive(timestamp)) return 'Date unknown';
@@ -105,5 +106,49 @@ const TargetListCore = (() => {
     return pool.sort((a, b) => Number(b.assessment.ready) - Number(a.assessment.ready)).map(row => row.target);
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select };
+  function applyFeed(data, previousTargets = [], cursor = null) {
+    const invalid = () => {
+      const error = new Error('The target list update was incomplete. Refresh the list to try again.');
+      error.code = 'FEED_SYNC_INVALID';
+      throw error;
+    };
+    const validId = id => Number.isSafeInteger(id) && id > 0 && id <= 2147483647;
+    const rows = values => {
+      if (!Array.isArray(values)) invalid();
+      const ids = new Set();
+      for (const row of values) {
+        if (!row || !validId(row.id) || ids.has(row.id)) invalid();
+        ids.add(row.id);
+      }
+      return ids;
+    };
+    if (!data || typeof data !== 'object') invalid();
+    // Older backends keep serving a complete snapshot until they are updated.
+    if (data.sync === undefined) {
+      rows(data.targets);
+      return { targets: data.targets, cursor: null };
+    }
+    const sync = data.sync;
+    if (!sync || sync.version !== 1 || typeof sync.cursor !== 'string' || !sync.cursor || sync.cursor.length > 256
+        || typeof sync.reset !== 'boolean') invalid();
+    if (sync.reset) {
+      rows(data.targets);
+      if (data.updates !== undefined || data.removed !== undefined) invalid();
+      return { targets: data.targets, cursor: sync.cursor };
+    }
+    if (!cursor || data.targets !== undefined || !Array.isArray(data.removed)) invalid();
+    const updatedIds = rows(data.updates);
+    const removedIds = new Set();
+    for (const id of data.removed) {
+      if (!validId(id) || removedIds.has(id) || updatedIds.has(id)) invalid();
+      removedIds.add(id);
+    }
+    if (!updatedIds.size && !removedIds.size) return { targets: previousTargets, cursor: sync.cursor };
+    const next = new Map(previousTargets.map(target => [target.id, target]));
+    for (const id of removedIds) next.delete(id);
+    for (const target of data.updates) next.set(target.id, target);
+    return { targets: [...next.values()], cursor: sync.cursor };
+  }
+
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
 })();
