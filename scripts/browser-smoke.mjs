@@ -37,11 +37,17 @@ let networkRequests = 0;
 await context.route('**/*', route => { networkRequests++; return route.abort(); });
 const pageErrors = [];
 
-async function mount(viewport = { width: 1280, height: 960 }, scripts = [source], pageContext = context, beforeMount = null, beforeMountArgument = undefined) {
+async function mount(viewport = { width: 1280, height: 960 }, scripts = [source], pageContext = context, beforeMount = null, beforeMountArgument = undefined, mockUrl = null) {
   const page = await pageContext.newPage();
   await page.setViewportSize(viewport);
   page.on('pageerror', error => pageErrors.push(error.message));
-  await page.goto('about:blank');
+  if (mockUrl) {
+    // Serve the Torn fixture locally, without sending a request to Torn.
+    await page.route('https://www.torn.com/**', route => route.fulfill({
+      status: 200, contentType: 'text/html', body: '<!doctype html><html><body></body></html>'
+    }));
+  }
+  await page.goto(mockUrl || 'about:blank');
   await page.setContent(`<!doctype html><html lang="en"><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>NWA mock browser check</title>
     <style>body{margin:0;background:#0c141c;color:#c0cdd5;font-family:system-ui,sans-serif}.mock{position:fixed;top:20px;left:20px;max-width:calc(100vw - 40px)}h1{font-size:20px;margin:0 0 8px}p{font-size:13px;max-width:360px;line-height:1.5}</style>
     </head><body><div class="mock"><h1>MOCK API DATA</h1><p>Browser validation preview. Fictional player names, faction, battle stats and statuses. No live Torn or FFScouter requests.</p></div>
@@ -52,6 +58,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
     Element.prototype.attachShadow = function (options) {
       const shadow = originalAttachShadow.call(this, options);
       if (this.id === 'torn-targetlist-host') window.__targetlistShadow = shadow;
+      if (this.id === 'nwa-target-page-notice') window.__playerNoticeShadow = shadow;
       return shadow;
     };
     const originalNow = Date.now;
@@ -839,6 +846,78 @@ try {
   }
   console.log('PASS sign out during suggestion queue/submission/review cannot restore content or trigger refreshes');
 
+  const profileNotice = await mount(undefined, [source], context, () => {
+    const content = document.createElement('main'); content.id = 'content-wrapper';
+    content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
+    content.innerHTML = '<h1>Willow [101]</h1><p>Mock Torn player profile content.</p>';
+    document.body.append(content);
+  }, undefined, 'https://www.torn.com/profiles.php?XID=101');
+  assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice')), null);
+  await login(profileNotice);
+  await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
+  assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.textContent), /This player is on the NWA target list\./);
+  assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /Reason: Preferred chain target/);
+  assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.id), 'nwa-target-page-notice');
+  assert.equal(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('section').getAttribute('aria-label')), 'NWA target list notice');
+  await shadow(profileNotice, '.header .icon', 'click');
+  await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-desktop.png'), fullPage: true });
+  await profileNotice.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await profileNotice.evaluate(() => {
+    const notice = document.getElementById('nwa-target-page-notice').getBoundingClientRect();
+    return notice.width > 0 && notice.left >= 0 && notice.right <= innerWidth && document.documentElement.scrollWidth <= innerWidth;
+  }), true);
+  await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-mobile.png'), fullPage: true });
+  await profileNotice.evaluate(() => {
+    const replacement = document.createElement('main'); replacement.id = 'content-wrapper';
+    replacement.innerHTML = '<h1>Replacement profile content</h1>';
+    document.getElementById('content-wrapper').replaceWith(replacement);
+  });
+  await wait(profileNotice, () => document.getElementById('content-wrapper').firstElementChild?.id === 'nwa-target-page-notice');
+  assert.equal(await profileNotice.evaluate(() => document.querySelectorAll('#nwa-target-page-notice').length), 1);
+  await profileNotice.evaluate(() => {
+    history.pushState({}, '', '/profiles.php?XID=999');
+    document.getElementById('content-wrapper').querySelector('h1').textContent = 'An unlisted player';
+  });
+  await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
+  await profileNotice.evaluate(() => {
+    history.pushState({}, '', '/page.php?sid=attack&user2ID=102');
+    document.getElementById('content-wrapper').querySelector('h1').textContent = 'Attack Granite [102]';
+  });
+  await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
+  assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /No reason provided\./);
+  // A listed target is identified independently of the viewer's stat filters.
+  assert.equal(await profileNotice.evaluate(() => document.querySelectorAll('#nwa-target-page-notice').length), 1);
+  await profileNotice.evaluate(() => {
+    history.pushState({}, '', '/factions.php?XID=101');
+    document.getElementById('content-wrapper').querySelector('h1').textContent = 'Faction page';
+  });
+  await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
+  await profileNotice.close();
+  console.log('PASS listed profile notice, stat-independent attack notice, empty-reason fallback, SPA route cleanup, replaced container and mobile width');
+
+  const attackNotice = await mount(undefined, [source], context, () => {
+    const content = document.createElement('main'); content.id = 'content-wrapper';
+    content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
+    content.innerHTML = '<h1>Attack Willow [101]</h1><p>Mock Torn attack page content.</p>';
+    document.body.append(content);
+    window.__mock.targets[0].notes = '<img src=x onerror="window.__injected=true">\n<script>window.__injected=true</script>';
+  }, undefined, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+  await login(attackNotice);
+  await wait(attackNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
+  assert.match(await attackNotice.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /<img src=x onerror=/);
+  assert.equal(await attackNotice.evaluate(() => window.__playerNoticeShadow.querySelectorAll('img,script').length), 0);
+  assert.equal(await attackNotice.evaluate(() => window.__injected), undefined);
+  await attackNotice.evaluate(() => { window.__mock.targets[0].reason = 'Inactive player suitable for chaining.'; });
+  await shadow(attackNotice, '.controls button', 'click');
+  await wait(attackNotice, () => window.__playerNoticeShadow.querySelector('.reason').textContent.includes('Inactive player suitable for chaining.'));
+  await shadow(attackNotice, '.header .icon', 'click');
+  await attackNotice.screenshot({ path: path.join(artifacts, 'browser-attack-notice-desktop.png'), fullPage: true });
+  await shadow(attackNotice, '.settings-toggle', 'click');
+  await signOut(attackNotice);
+  await wait(attackNotice, () => !document.getElementById('nwa-target-page-notice'));
+  await attackNotice.close();
+  console.log('PASS direct modern attack route, plain-text untrusted reason, and removal after sign out');
+
   assert.equal(networkRequests, 0, 'Browser attempted external network access');
   assert.deepEqual(pageErrors, [], 'Unhandled browser errors');
   console.log('All mocked browser smoke checks passed. No provider requests or live keys used.');
@@ -847,6 +926,7 @@ try {
   console.log(`Mock encrypted-key login screenshot: ${path.join(artifacts, 'browser-login-mobile.png')}`);
   console.log(`Mock stat-range screenshots: ${path.join(artifacts, 'browser-stat-range-desktop.png')}, ${path.join(artifacts, 'browser-stat-range-mobile-390.png')} and ${path.join(artifacts, 'browser-stat-range-mobile-320.png')}`);
   console.log(`Mock suggestion screenshots: ${path.join(artifacts, 'browser-suggestions-desktop.png')} and ${path.join(artifacts, 'browser-suggestions-mobile.png')}`);
+  console.log(`Mock target notice screenshots: ${path.join(artifacts, 'browser-profile-notice-desktop.png')}, ${path.join(artifacts, 'browser-profile-notice-mobile.png')} and ${path.join(artifacts, 'browser-attack-notice-desktop.png')}`);
 } finally {
   await context.close();
   await browser.close();

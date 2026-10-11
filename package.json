@@ -1,6 +1,6 @@
 {
   "name": "nwa-targetlist-script",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "type": "module",
   "description": "North West Alliance chain target finder for Torn",

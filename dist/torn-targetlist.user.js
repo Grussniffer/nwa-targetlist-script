@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.4.3
+// @version      0.4.4
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
@@ -37,6 +37,21 @@ const TargetListCore = (() => {
   }
 
   function validKey(value) { return /^[a-zA-Z0-9]{16}$/.test(value); }
+  function pageTargetId(href) {
+    let url;
+    try { url = new URL(href); } catch { return null; }
+    if (url.protocol !== 'https:' || !['torn.com', 'www.torn.com'].includes(url.hostname)) return null;
+    let parameter;
+    if (url.pathname === '/profiles.php') parameter = 'XID';
+    else if (['/page.php', '/loader.php'].includes(url.pathname)
+        && url.searchParams.getAll('sid').length === 1 && url.searchParams.get('sid') === 'attack') parameter = 'user2ID';
+    else return null;
+    if (url.searchParams.getAll(parameter).length !== 1) return null;
+    const value = url.searchParams.get(parameter);
+    if (!/^[1-9]\d*$/.test(value)) return null;
+    const id = Number(value);
+    return Number.isSafeInteger(id) && id <= 2147483647 ? id : null;
+  }
   function positive(value) { return typeof value === 'number' && Number.isFinite(value) && value > 0; }
   function compact(value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) return 'Unknown';
@@ -89,11 +104,11 @@ const TargetListCore = (() => {
         (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id);
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, compact, ageLabel, assess, select };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, compact, ageLabel, assess, select };
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.4.3' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.4.4' });
 
 const previousHost = document.getElementById('torn-targetlist-host');
 const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
@@ -253,6 +268,7 @@ function mountTargetList() {
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
     GM_deleteValue(storageKey);
+    updatePageNotice();
   }
   function handleError(error) {
     if (error.code === 'REVIEW_NOT_ALLOWED') state.canReview = false;
@@ -331,6 +347,7 @@ function mountTargetList() {
     const generation = ++state.generation;
     cancelFind(); state.findAfterLogin = false; state.busy = true; state.removingKey = true;
     state.authorizedPool = false; state.loading = false; state.backgroundLoading = false; state.targetLoad = null;
+    updatePageNotice();
     state.targetGeneration++; state.pendingChecks.clear(); state.suggestionGeneration++;
     state.suggestionsLoading = false; state.suggestionMutation = null;
     message(''); render();
@@ -349,6 +366,50 @@ function mountTargetList() {
   function authorizedPoolFresh() {
     const age = Date.now() - state.poolLoadedAt;
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
+  }
+  let pageNotice = null, pageNoticeReason = null, pageNoticeObserver = null, pageNoticeTimer = null;
+  function removePageNotice() {
+    pageNotice?.remove(); pageNotice = null; pageNoticeReason = null;
+  }
+  function updatePageNotice() {
+    if (host.isConnected === false) {
+      pageNoticeObserver?.disconnect(); removePageNotice(); return;
+    }
+    const id = C.pageTargetId(window.location?.href);
+    const target = id && state.player && state.token && Date.parse(state.expiresAt) > Date.now() && authorizedPoolFresh()
+      ? state.targets.find(target => target.id === id) : null;
+    if (!target) { removePageNotice(); return; }
+    if (!pageNotice) {
+      pageNotice = element('div'); pageNotice.id = 'nwa-target-page-notice';
+      const noticeRoot = pageNotice.attachShadow({ mode: 'closed' });
+      const style = element('style');
+      style.textContent = `
+        :host{all:initial;display:block;min-width:0;margin:10px 0 14px;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#edf4f4}
+        .notice{box-sizing:border-box;max-width:100%;padding:12px 15px;border:1px solid #376850;border-left:4px solid #56c790;border-radius:7px;background:#14291f;overflow-wrap:anywhere}
+        .title{display:block;margin:0 0 3px;color:#94e5b8;font-size:13px;font-weight:750;letter-spacing:.4px}
+        p{margin:0}.reason{margin-top:5px;white-space:pre-wrap;color:#dbe9e0}
+        @media(max-width:480px){.notice{padding:10px 12px}}
+      `;
+      const notice = element('section', null, 'notice');
+      notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', 'NWA target list notice');
+      pageNoticeReason = element('p', null, 'reason');
+      notice.append(element('strong', 'NWA target list', 'title'), element('p', 'This player is on the NWA target list.'), pageNoticeReason);
+      noticeRoot.append(style, notice);
+    }
+    const reason = (typeof target.reason === 'string' && target.reason.trim())
+      || (typeof target.notes === 'string' && target.notes.trim()) || 'No reason provided.';
+    const text = `Reason: ${reason}`;
+    // Reasons are text, including any markup characters supplied in a suggestion.
+    if (pageNoticeReason.textContent !== text) pageNoticeReason.textContent = text;
+    const container = document.querySelector?.('#content-wrapper')
+      || document.querySelector?.('#mainContainer .content-wrapper')
+      || document.querySelector?.('#mainContainer') || document.querySelector?.('main')
+      || document.querySelector?.('.content-wrapper') || document.body;
+    if (pageNotice.parentNode !== container) container.prepend(pageNotice);
+  }
+  function schedulePageNotice() {
+    if (pageNoticeTimer !== null) return;
+    pageNoticeTimer = setTimeout(() => { pageNoticeTimer = null; updatePageNotice(); }, 100);
   }
   function pageVisible() { return document.visibilityState !== 'hidden'; }
   function editingControl() { return ['INPUT', 'TEXTAREA', 'SELECT'].includes(root.activeElement?.tagName); }
@@ -370,7 +431,7 @@ function mountTargetList() {
     const targetGeneration = ++state.targetGeneration;
     state.loading = !background; state.backgroundLoading = background; state.lastPoolAttemptAt = Date.now(); message('');
     // Background sync publishes a complete new pool without hiding usable cached targets.
-    if (!background) { state.targets = []; state.authorizedPool = false; }
+    if (!background) { state.targets = []; state.authorizedPool = false; updatePageNotice(); }
     if (!background) render();
     const pending = (async () => {
       try {
@@ -378,10 +439,11 @@ function mountTargetList() {
         if (generation !== state.generation || targetGeneration !== state.targetGeneration) return false;
         state.player = data.player; state.targets = data.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
         state.poolLoadedAt = Date.now(); state.authorizedPool = true;
+        updatePageNotice();
         return true;
       } catch (error) {
         if (generation === state.generation && targetGeneration === state.targetGeneration) {
-          state.authorizedPool = false; handleError(error);
+          state.authorizedPool = false; updatePageNotice(); handleError(error);
         }
         return false;
       } finally {
@@ -560,6 +622,7 @@ function mountTargetList() {
   let cardContainer, countNode;
   function render() {
     state.backgroundRenderPending = false;
+    updatePageNotice();
     updateLauncher();
     content.replaceChildren(); cardContainer = null; countNode = null;
     if (!state.player) {
@@ -763,12 +826,20 @@ function mountTargetList() {
     }, 0);
   });
   document.addEventListener?.('visibilitychange', () => {
+    updatePageNotice();
     if (pageVisible() && state.token && Date.parse(state.expiresAt) > Date.now() && !state.busy) {
       void loadTargets(false, false, Boolean(state.player));
     }
   });
+  window.addEventListener?.('popstate', updatePageNotice);
+  window.addEventListener?.('hashchange', updatePageNotice);
+  if (typeof MutationObserver === 'function') {
+    pageNoticeObserver = new MutationObserver(schedulePageNotice);
+    pageNoticeObserver.observe(document.body, { childList: true, subtree: true });
+  }
   // Expire the session and checked attack links even while the panel is idle.
   setInterval(() => {
+    updatePageNotice();
     if (state.token && Date.parse(state.expiresAt) <= Date.now()) { clearSession(); message('Session expired. Sign in again.'); render(); }
     else if (state.open && state.player && !state.pendingChecks.size) {
       let expired = false;

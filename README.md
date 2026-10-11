@@ -47,6 +47,7 @@ The backend is already set to [targetlist.grusmedia.no](https://targetlist.grusm
 
 - **Targets:** browse the list or filter by estimated stats. **Possible matches** applies both your minimum and maximum.
 - **Check status:** check a target before opening its attack page.
+- **Profiles and attack pages:** listed players show an NWA notice with their saved reason. This appears after your session and target list have loaded, including for targets outside your stat range.
 - **Suggestions:** suggest a player or faction with a required comment.
 - **Approvals:** faction leaders and co-leaders can approve or reject suggestions.
 

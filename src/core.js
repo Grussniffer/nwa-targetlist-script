@@ -15,6 +15,21 @@ const TargetListCore = (() => {
   }
 
   function validKey(value) { return /^[a-zA-Z0-9]{16}$/.test(value); }
+  function pageTargetId(href) {
+    let url;
+    try { url = new URL(href); } catch { return null; }
+    if (url.protocol !== 'https:' || !['torn.com', 'www.torn.com'].includes(url.hostname)) return null;
+    let parameter;
+    if (url.pathname === '/profiles.php') parameter = 'XID';
+    else if (['/page.php', '/loader.php'].includes(url.pathname)
+        && url.searchParams.getAll('sid').length === 1 && url.searchParams.get('sid') === 'attack') parameter = 'user2ID';
+    else return null;
+    if (url.searchParams.getAll(parameter).length !== 1) return null;
+    const value = url.searchParams.get(parameter);
+    if (!/^[1-9]\d*$/.test(value)) return null;
+    const id = Number(value);
+    return Number.isSafeInteger(id) && id <= 2147483647 ? id : null;
+  }
   function positive(value) { return typeof value === 'number' && Number.isFinite(value) && value > 0; }
   function compact(value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) return 'Unknown';
@@ -67,5 +82,5 @@ const TargetListCore = (() => {
         (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id);
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, compact, ageLabel, assess, select };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, compact, ageLabel, assess, select };
 })();
