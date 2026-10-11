@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.7.0
+// @version      0.7.1
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -357,7 +357,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.7.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.7.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -1294,8 +1294,8 @@ function mountTargetList(platform, storageWarning = '') {
       const privacy = element('div', null, 'notice');
       privacy.id = 'nwa-key-use'; input.setAttribute('aria-describedby', privacy.id);
       privacy.append(element('div', 'Your Limited key verifies your name and faction and reads your battle stats.'),
-        element('div', 'Your key is saved encrypted in the backend’s Supabase database and expires after up to 7 days, so target hospital and availability checks continue while you are offline.'),
-        element('div', 'Use “Sign out and remove key” to delete the saved key.'),
+        element('div', 'Your key is saved encrypted in the backend Supabase database and expires after up to 7 days, so target hospital and availability checks continue while you are offline.'),
+        element('div', 'Use "Sign out and remove key" to delete the saved key.'),
         link('Get a Limited API key ↗', 'https://www.torn.com/preferences.php#tab=api'));
       panelUi = { input, submit };
       form.append(privacy, label, submit); content.append(intro, form); return;
@@ -1538,9 +1538,9 @@ function mountTargetList(platform, storageWarning = '') {
     cardContainer.setAttribute('aria-busy', String(state.loading));
     for (const [id, cached] of cardNodes) if (!selected.has(id)) { cached.node.remove(); cardNodes.delete(id); }
     if (!rows.length) {
-      const text = state.loading ? 'Loading the faction’s target pool…' : state.targets.length
+      const text = state.loading ? 'Loading the target pool for your faction…' : state.targets.length
         ? 'No targets match these filters. Try All targets or a different stat range.'
-        : 'The target pool is empty. New targets will appear after your faction’s list is updated.';
+        : 'The target pool is empty. New targets will appear after the list for your faction is updated.';
       if (!emptyCard) { emptyCard = element('div', text, 'empty'); cardContainer.append(emptyCard); }
       else setText(emptyCard, text);
       mountedIds = []; return;
@@ -1598,7 +1598,7 @@ function mountTargetList(platform, storageWarning = '') {
         const currentAssessment = latest && assessTarget(latest);
         if (!latest || !state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh()
             || latest.reserved || !currentAssessment.suggested || !currentAssessment.ready) {
-          event.preventDefault(); message('Check this target’s status and stat range before opening an attack.'); renderCards(); return false;
+          event.preventDefault(); message('Check the status and stat range for this target before opening an attack.'); renderCards(); return false;
         }
         return true;
       };

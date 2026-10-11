@@ -87,6 +87,13 @@ function installPdaRuntime() {
 }
 const pdaRuntimeSource = `const PDA_storage = (${installPdaRuntime.toString()})();`;
 
+function adaptPdaSource(script) {
+  // Torn PDA's userscripts_provider.dart adapts user source before injection.
+  // Replaying it matters: a curly apostrophe inside a single-quoted literal
+  // becomes an unescaped quote and prevents the entire script from parsing.
+  return script.replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'");
+}
+
 async function mount(viewport = { width: 1280, height: 960 }, scripts = [source], pageContext = context, beforeMount = null, beforeMountArgument = undefined, mockUrl = null) {
   const page = await pageContext.newPage();
   await page.setViewportSize(viewport);
@@ -233,7 +240,15 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
     };
   });
   if (beforeMount) await page.evaluate(beforeMount, beforeMountArgument);
-  for (const script of scripts) await page.addScriptTag({ content: script });
+  if (scripts.includes(pdaRuntimeSource)) {
+    // PDA injects its API and adapted user source in the same function scope.
+    // Keep PDA_storage lexical to that closure rather than exposing an idealized
+    // global binding; every native PDA scenario uses this injection path.
+    const injected = scripts.map(script => script === pdaRuntimeSource ? script : adaptPdaSource(script));
+    await page.addScriptTag({ content: `(function () {\n${injected.join('\n')}\n})();` });
+  } else {
+    for (const script of scripts) await page.addScriptTag({ content: script });
+  }
   // PDA bootstrap deliberately blocks until the explicit readiness signal.
   if (await page.evaluate(() => Boolean(window.__resolvePdaPlatform))) {
     assert.equal(await page.evaluate(() => window.__mock.pda.calls.length), 0, 'no native requests before platform readiness');
@@ -1481,7 +1496,7 @@ try {
 
   await main.evaluate(() => { window.__mockNow += 30000; window.__targetlistShadow.querySelector('button.attack').click(); });
   assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelectorAll('button.attack').length), 0);
-  assert.match(await shadow(main, '.error', 'text'), /Check this target.*status and stat range before opening an attack/);
+  assert.match(await shadow(main, '.error', 'text'), /Check the status and stat range for this target before opening an attack/);
   await main.close();
   console.log('PASS stale status cannot open an attack');
 
@@ -2054,6 +2069,9 @@ try {
     assert.equal(await pda.evaluate(() => typeof window.GM_xmlhttpRequest), 'undefined');
     assert.equal(await pda.evaluate(() => typeof window.GM_getValue), 'undefined');
     assert.equal(await pda.evaluate(() => typeof window.PDA_storage), 'undefined', 'native storage is a lexical binding, not a window property');
+    assert.equal(await pda.evaluate(() => typeof PDA_storage), 'undefined', 'PDA storage stays private to the native injection closure');
+    assert.equal(await pda.evaluate(() => window.__targetlistShadow.querySelector('.launcher').textContent), 'NWA',
+      'the actual installable bundle mounts after Torn PDA smart-quote adaptation');
     assert.equal(await pda.evaluate(() => matchMedia('(pointer:coarse)').matches), true);
     await tapShadow(pda, '.settings-toggle');
     for (const width of [390, 320]) {
@@ -2146,7 +2164,7 @@ try {
     await pdaNavigated;
     assert.equal(pdaNavigation, pdaAttackUrl);
     await pda.close();
-    console.log('PASS PDA-only native GET/POST, async lexical storage, readiness, 390/320px touch login, keyboard height, stat settings, player/faction reasons, status, reservation and attack navigation');
+    console.log('PASS PDA-adapted installable bundle and private API closure, native GET/POST, async lexical storage, readiness, 390/320px touch login, keyboard height, stat settings, player/faction reasons, status, reservation and attack navigation');
 
     const restoredPda = await mount({ width: 320, height: 844 }, [pdaRuntimeSource, source], pdaContext, entries => {
       for (const [key, value] of entries) window.__mock.store.set(key, value);

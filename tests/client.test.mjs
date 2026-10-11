@@ -470,7 +470,7 @@ test('attack clicks revalidate live status expiry even before the next display r
   assert.equal(attack.emit('click').defaultPrevented, true);
   assert.equal(app.requests.length, before, 'expired availability cannot start a lease');
   assert.deepEqual(app.navigations, []);
-  assert.match(app.text(), /Check this target’s status and stat range before opening an attack/);
+  assert.match(app.text(), /Check the status and stat range for this target before opening an attack/);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
 });
 
