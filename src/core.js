@@ -2,6 +2,8 @@ const TargetListCore = (() => {
   const DEFAULT_MIN_RATIO = 0.1;
   const DEFAULT_MAX_RATIO = 0.6;
   const ESTIMATE_MAX_AGE = 7 * 24 * 60 * 60;
+  const DEFAULT_ESTIMATE_DAYS = 7;
+  const RECENT_TARGET_MS = 10 * 60 * 1000;
   const LIVE_STATUS_MAX_AGE = 30 * 1000;
 
   function serviceUrl(value) {
@@ -44,14 +46,19 @@ const TargetListCore = (() => {
     return `${Math.floor(seconds / 86400)}d ago`;
   }
 
-  function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO) {
+  function reason(target) {
+    return (typeof target.reason === 'string' && target.reason.trim())
+      || (typeof target.notes === 'string' && target.notes.trim()) || '';
+  }
+  function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO, estimateDays = DEFAULT_ESTIMATE_DAYS) {
     const ratio = positive(target.estimatedStats) && positive(player.battleStats.total)
       ? target.estimatedStats / player.battleStats.total : null;
     const validRange = typeof minRatio === 'number' && Number.isFinite(minRatio) && minRatio >= 0 && minRatio <= 5 &&
       typeof maxRatio === 'number' && Number.isFinite(maxRatio) && maxRatio >= 0.01 && maxRatio <= 5 && minRatio <= maxRatio;
     const inRange = validRange && ratio !== null && ratio >= minRatio && ratio <= maxRatio;
     const stamp = target.estimateUpdatedAt;
-    const fresh = positive(stamp) && stamp <= now / 1000 + 300 && now / 1000 - stamp <= ESTIMATE_MAX_AGE;
+    const validAge = Number.isSafeInteger(estimateDays) && estimateDays >= 1 && estimateDays <= 365;
+    const fresh = validAge && positive(stamp) && stamp <= now / 1000 + 300 && now / 1000 - stamp <= estimateDays * 86400;
     const allied = target.id === player.id || (target.faction?.id && target.faction.id === player.faction.id);
     const checked = Date.parse(target.checkedAt);
     const live = Number.isFinite(checked) && checked <= now + 5000 && now - checked < LIVE_STATUS_MAX_AGE;
@@ -63,24 +70,40 @@ const TargetListCore = (() => {
     let tone = 'good';
     if (allied) { label = 'Friendly / self'; tone = 'muted'; }
     else if (ratio === null) { label = 'Stats unknown'; tone = 'muted'; }
-    else if (!fresh) { label = 'Estimate needs refresh'; tone = 'warn'; }
+    else if (!fresh) { label = 'Estimate too old / undated'; tone = 'warn'; }
     else if (!validRange) { label = 'Invalid stat range'; tone = 'warn'; }
     else if (ratio < minRatio) { label = 'Below your minimum'; tone = 'warn'; }
     else if (ratio > maxRatio) { label = 'Above your limit'; tone = 'warn'; }
     const suggested = !allied && fresh && inRange;
-    return { ratio, inRange, fresh, live, ready, timedUnavailable, suggested, label, tone };
+    return { ratio, inRange, fresh, live, ready, timedUnavailable, suggested, allied, label, tone };
   }
 
   function select(targets, player, options, now = Date.now()) {
     const query = (options.query || '').trim().toLowerCase();
-    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio) }))
+    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
       .filter(({ target, assessment }) => {
         if (options.mode === 'suggested' && !assessment.suggested) return false;
-        return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${target.notes || ''}`.toLowerCase().includes(query);
+        return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${reason(target)}`.toLowerCase().includes(query);
       })
       .sort((a, b) => Number(b.assessment.suggested) - Number(a.assessment.suggested) ||
         (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id);
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, compact, ageLabel, assess, select };
+  function recentTargets(values, now = Date.now()) {
+    return (Array.isArray(values) ? values : []).filter(value => value && Number.isSafeInteger(value.id) && value.id > 0
+      && Number.isFinite(value.at) && value.at <= now && now - value.at < RECENT_TARGET_MS).slice(-50);
+  }
+  function candidates(rows, recent = [], now = Date.now(), random = Math.random) {
+    const visited = new Set(recentTargets(recent, now).map(value => value.id));
+    const pool = rows.filter(row => !visited.has(row.target.id) && !row.target.reserved
+      && (!row.assessment.live || row.assessment.ready) && !row.assessment.timedUnavailable);
+    // Shuffle equal-priority targets so alliance members do not share one order.
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    return pool.sort((a, b) => Number(b.assessment.ready) - Number(a.assessment.ready)).map(row => row.target);
+  }
+
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select };
 })();

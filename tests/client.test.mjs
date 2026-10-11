@@ -71,7 +71,7 @@ async function flush() { for (let index = 0; index < 12; index++) await Promise.
 function fixture(saved = null, preferences = null, existingHost = null, initialNow = NOW, visibility = 'visible') {
   let clock = initialNow;
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
-  const body = new Element('body'); const requests = []; const navigations = []; const storage = new Map(); const writes = []; const timers = []; const timeouts = new Map();
+  const body = new Element('body'); const requests = []; const navigations = []; const storage = new Map(); const writes = []; const timers = []; const timeouts = new Map(); const timeoutDelays = new Map();
   const document = new Element('document');
   Object.assign(document, { body, visibilityState: visibility,
     getElementById: id => descendants(body).find(element => element.id === id), createElement: tag => new Element(tag),
@@ -91,9 +91,12 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     GM_setValue: (key, value) => { storage.set(key, value); writes.push(value); },
     GM_deleteValue: key => storage.delete(key),
     setInterval: callback => { timers.push(callback); },
-    setTimeout: callback => { const id = nextTimer++; timeouts.set(id, callback); return id; },
-    clearTimeout: id => timeouts.delete(id),
+    setTimeout: (callback, delay) => { const id = nextTimer++; timeouts.set(id, callback); timeoutDelays.set(id, delay); return id; },
+    clearTimeout: id => { timeouts.delete(id); timeoutDelays.delete(id); },
   });
+  // Keep integration fixtures deterministic; core tests separately verify the
+  // random shuffle and readiness ordering used for real alliance members.
+  vm.runInContext('Math.random = () => 0.999999;', context);
   const runScript = () => vm.runInContext(`(() => {\n${source}\n})();`, context);
   runScript();
   const host = body.children.find(element => element.id === 'torn-targetlist-host');
@@ -103,13 +106,13 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   function response(request, data, status = 200) {
     request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url });
   }
-  async function signIn(targets = [target]) {
+  async function signIn(targets = [target], feed = {}) {
     const input = find(element => element.tagName === 'INPUT' && element.type === 'password'); input.value = KEY;
     find(element => element.tagName === 'FORM').emit('submit');
     const login = requests.at(-1);
     response(login, { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage });
     await flush();
-    response(requests.at(-1), { player, targets, warnings: [], generatedAt: new Date(NOW).toISOString() });
+    response(requests.at(-1), { player, targets, warnings: [], generatedAt: new Date(NOW).toISOString(), ...feed });
     await flush();
     return login;
   }
@@ -118,7 +121,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const deletion = requests.at(-1); response(deletion, null, 204); await flush();
     return deletion;
   }
-  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, find, button, response, signIn, signOut,
+  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut,
     settings: () => find(element => element.className === 'settings-toggle'),
     text: () => textContent(root), setNow: value => { clock = value; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
@@ -547,12 +550,11 @@ test('repeated NWA clicks coalesce while a target check is pending', async () =>
   assert.equal(app.navigations.length, 1);
 });
 
-test('NWA stops on service or network failures without trying another target', async () => {
-  for (const outcome of ['rate-limit', 'upstream', 'network']) {
+test('NWA stops on rate limits and service failures that are not isolated target lookups', async () => {
+  for (const outcome of ['rate-limit', 'upstream']) {
     const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }]);
     const before = app.requests.length; app.button('NWA').emit('click'); const live = app.requests.at(-1);
-    if (outcome === 'network') live.onerror();
-    else app.response(live, { error: { code: outcome === 'rate-limit' ? 'RATE_LIMITED' : 'UPSTREAM_UNAVAILABLE', message: 'Try again later.' } }, outcome === 'rate-limit' ? 429 : 503);
+    app.response(live, { error: { code: outcome === 'rate-limit' ? 'RATE_LIMITED' : 'UPSTREAM_UNAVAILABLE', message: 'Try again later.' } }, outcome === 'rate-limit' ? 429 : 503);
     await flush();
     assert.equal(app.requests.length, before + 1, outcome);
     assert.deepEqual(app.navigations, [], outcome);
@@ -560,6 +562,256 @@ test('NWA stops on service or network failures without trying another target', a
     assert.equal(app.find(element => element.className === 'quick-notice').hidden, false, 'failure is shown beside NWA');
     assert.equal(app.button('NWA').disabled, false);
   }
+});
+
+test('NWA skips isolated lookup and network failures and succeeds with the next target', async () => {
+  for (const outcome of ['torn', 'torn503', 'targets', 'network', 'timeout']) {
+    const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }]);
+    const before = app.requests.length; app.button('NWA').emit('click'); const first = app.requests.at(-1);
+    assert.equal(first.timeout, 3000);
+    if (outcome === 'network') first.onerror();
+    else if (outcome === 'timeout') { app.setNow(NOW + 3000); first.ontimeout(); }
+    else app.response(first, { error: { code: outcome.startsWith('torn') ? 'TORN_UNAVAILABLE' : 'TARGETS_UNAVAILABLE', message: 'Temporary target lookup failure.' } }, outcome === 'torn' ? 502 : 503);
+    await flush();
+    assert.equal(app.requests.length, before + 2, outcome);
+    const next = app.requests.at(-1);
+    assert.equal(next.url, `${serviceBase}/api/targets/${target.id + 1}/status`);
+    app.response(next, { id: target.id + 1, status: { state: 'Okay' }, checkedAt: new Date(outcome === 'timeout' ? NOW + 3000 : NOW).toISOString() }); await flush();
+    assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id + 1}`]);
+    assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  }
+});
+
+test('NWA limits candidate attempts to the remaining eight-second request budget', async () => {
+  const app = fixture(); await app.signIn(Array.from({ length: 5 }, (_, index) => ({ ...target, id: target.id + index })));
+  const before = app.requests.length; app.button('NWA').emit('click');
+  for (const [elapsed, expectedTimeout] of [[3000, 3000], [6000, 3000], [8000, 2000]]) {
+    const request = app.requests.at(-1);
+    assert.equal(request.timeout, expectedTimeout);
+    assert.equal([...app.timeoutDelays.values()].at(-1), expectedTimeout);
+    app.setNow(NOW + elapsed); request.ontimeout(); await flush();
+  }
+  assert.equal(app.requests.length, before + 3);
+  assert.deepEqual(app.navigations, []);
+  assert.equal(app.button('NWA').disabled, false);
+});
+
+test('a stale feed refresh uses part of the same eight-second finder budget', async () => {
+  const app = fixture(); await app.signIn();
+  app.setNow(NOW + 30000); app.button('NWA').emit('click');
+  const feed = app.requests.at(-1);
+  assert.equal(feed.url, `${serviceBase}/api/targets`);
+  assert.equal(feed.timeout, 5000);
+  app.setNow(NOW + 35000);
+  app.response(feed, { player, targets: [target], warnings: [] }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/status`);
+  assert.equal(app.requests.at(-1).timeout, 3000);
+  app.setNow(NOW + 38000); app.requests.at(-1).ontimeout(); await flush();
+  assert.deepEqual(app.navigations, []);
+  assert.equal(app.button('NWA').disabled, false);
+});
+
+test('joining a slow startup feed has an eight-second finder deadline and late feed completion cannot navigate', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() });
+  const feed = app.requests[0]; app.button('NWA').emit('click');
+  const timer = [...app.timeoutDelays].find(([, delay]) => delay === 8000)?.[0];
+  assert.ok(timer, 'shared background feed has a separate bounded finder wait');
+  app.setNow(NOW + 8000); app.timeouts.get(timer)(); await flush();
+  assert.equal(app.button('NWA').disabled, false);
+  assert.deepEqual(app.navigations, []);
+  assert.match(app.text(), /within 8 seconds/);
+  app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 8000).toISOString() }], warnings: [] }); await flush();
+  assert.deepEqual(app.navigations, []);
+});
+
+test('reservation-aware NWA waits for a successful lease even when the cached target is ready', async () => {
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 60000 } });
+  const before = app.requests.length; app.button('NWA').emit('click');
+  assert.equal(app.requests.length, before + 1);
+  const lease = app.requests.at(-1);
+  assert.equal(lease.method, 'POST');
+  assert.equal(lease.url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  assert.equal(lease.headers.Authorization, `Bearer ${SESSION}`);
+  assert.deepEqual(app.navigations, []);
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey).recentTargets)), [{ id: target.id, at: NOW }]);
+});
+
+test('reservation conflicts and unavailable targets advance without losing the session or revisiting the conflict', async () => {
+  const targets = Array.from({ length: 3 }, (_, index) => ({ ...target, id: target.id + index }));
+  const app = fixture(); await app.signIn(targets, { reservations: { supported: true, leaseMs: 60000 } });
+  app.button('NWA').emit('click');
+  for (const [index, code] of ['TARGET_RESERVED', 'TARGET_UNAVAILABLE'].entries()) {
+    assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${targets[index].id}/reservation`);
+    app.response(app.requests.at(-1), { error: { code, message: 'Try another player.' } }, 409); await flush();
+    assert.deepEqual(app.navigations, []);
+  }
+  app.response(app.requests.at(-1), { id: targets[2].id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  assert.equal(app.navigations.length, 1);
+  assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  const before = app.requests.length; app.button('NWA').emit('click'); await flush();
+  assert.equal(app.requests.length, before, 'conflicts remain excluded and the successful target is recent');
+  assert.match(app.text(), /last 10 minutes/);
+});
+
+test('reservation responses must identify the requested target, have a live lease and still show an eligible available player', async () => {
+  for (const failure of ['wrong-id', 'missing-lease', 'expired-lease', 'hospital', 'friendly']) {
+    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+    app.button('NWA').emit('click');
+    const response = { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() };
+    if (failure === 'wrong-id') response.id += 1;
+    if (failure === 'missing-lease') delete response.reservationExpiresAt;
+    if (failure === 'expired-lease') response.reservationExpiresAt = new Date(NOW).toISOString();
+    if (failure === 'hospital') response.status = { state: 'Hospital', until: NOW / 1000 + 60 };
+    if (failure === 'friendly') response.faction = player.faction;
+    app.response(app.requests.at(-1), response); await flush();
+    assert.deepEqual(app.navigations, [], failure);
+    assert.equal(app.storage.get(app.preferencesKey)?.recentTargets?.length ?? 0, 0);
+    assert.equal(app.button('NWA').disabled, false);
+  }
+});
+
+test('an in-flight reservation cannot navigate after logout, expiry or opening settings', async () => {
+  for (const action of ['logout', 'expiry', 'settings']) {
+    const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+    app.button('NWA').emit('click'); const lease = app.requests.at(-1);
+    if (action === 'logout') await app.signOut();
+    if (action === 'expiry') app.setNow(NOW + 3600000);
+    if (action === 'settings') app.settings().emit('click');
+    app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+    assert.deepEqual(app.navigations, [], action);
+    assert.equal(app.storage.get(app.preferencesKey)?.recentTargets?.length ?? 0, 0);
+  }
+});
+
+test('authorization and rate-limit failures stop reservation retries immediately', async () => {
+  for (const [status, code] of [[401, 'SESSION_EXPIRED'], [403, 'FACTION_NOT_ALLOWED'], [429, 'RATE_LIMITED']]) {
+    const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }], { reservations: { supported: true, leaseMs: 60000 } });
+    const before = app.requests.length; app.button('NWA').emit('click');
+    app.response(app.requests.at(-1), { error: { code, message: 'Access temporarily unavailable.' } }, status); await flush();
+    assert.equal(app.requests.length, before + 1, code);
+    assert.deepEqual(app.navigations, [], code);
+    assert.equal(app.storage.has(app.storageKey), status === 429);
+  }
+});
+
+test('recent target history rotates across reloads and never silently recycles a depleted pool', async () => {
+  const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+  const targets = [ready, { ...ready, id: ready.id + 1 }, { ...ready, id: ready.id + 2 }];
+  let app = fixture(); await app.signIn(targets);
+  for (let index = 0; index < 3; index++) {
+    app.button('NWA').emit('click'); await flush();
+    assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${targets[index].id}`]);
+    const prefs = app.storage.get(app.preferencesKey);
+    app = fixture(null, prefs); await app.signIn(targets);
+  }
+  const before = app.requests.length; app.button('NWA').emit('click'); await flush();
+  assert.equal(app.requests.length, before);
+  assert.deepEqual(app.navigations, []);
+  assert.match(app.text(), /last 10 minutes/);
+});
+
+test('clear recent targets explicitly restores a depleted finder pool', async () => {
+  const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+  const app = fixture(null, { recentTargets: [{ id: target.id, at: NOW }], lastTargetId: target.id });
+  await app.signIn([ready]);
+  app.button('NWA').emit('click'); await flush();
+  assert.deepEqual(app.navigations, []);
+  app.button('Clear recent targets').emit('click');
+  assert.deepEqual([...app.storage.get(app.preferencesKey).recentTargets], []);
+  assert.equal(app.storage.get(app.preferencesKey).lastTargetId, null);
+  app.button('NWA').emit('click'); await flush();
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+});
+
+test('estimate-age controls validate integer days, persist preferences and allow an older target after reload', async () => {
+  const old = { ...target, estimateUpdatedAt: NOW / 1000 - 20 * 86400, checkedAt: new Date(NOW).toISOString() };
+  const app = fixture(); await app.signIn([old]);
+  const ageInput = () => app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days');
+  assert.equal(ageInput().value, '7');
+  assert.equal(ageInput().min, '1'); assert.equal(ageInput().max, '365'); assert.equal(ageInput().step, '1');
+  assert.match(app.text(), /Estimate too old \/ undated/);
+  for (const value of ['', '0', '366', '2.5', 'NaN', 'Infinity']) {
+    ageInput().value = value; ageInput().emit('change');
+    assert.equal(ageInput().value, '7', value);
+    assert.equal(app.storage.has(app.preferencesKey), false);
+    assert.match(app.text(), /whole number from 1 to 365/);
+  }
+  ageInput().value = '28'; ageInput().emit('change');
+  assert.equal(app.storage.get(app.preferencesKey).estimateDays, 28);
+  assert.match(app.text(), /Possible match/);
+  assert.equal(app.requests.length, 2, 'changing the estimate window filters in RAM');
+  const reloaded = fixture(null, app.storage.get(app.preferencesKey)); await reloaded.signIn([old]);
+  assert.equal(reloaded.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days').value, '28');
+  reloaded.button('NWA').emit('click'); await flush();
+  assert.deepEqual(reloaded.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  ageInput().value = '365'; ageInput().emit('change');
+  assert.match(app.text(), /Extra caution is needed beyond 28 days/);
+});
+
+test('invalid stored estimate windows return to seven days', async () => {
+  for (const estimateDays of [0, 366, -1, 2.5, '28', null]) {
+    const app = fixture(null, { estimateDays }); await app.signIn();
+    assert.equal(app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days').value, '7');
+  }
+});
+
+test('changing the estimate-age window cancels an in-flight finder before navigation', async () => {
+  const app = fixture(); await app.signIn([target], { reservations: { supported: true, leaseMs: 60000 } });
+  app.button('NWA').emit('click'); const lease = app.requests.at(-1);
+  const age = app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days');
+  age.value = '28'; age.emit('change');
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  assert.deepEqual(app.navigations, []);
+  assert.equal(app.storage.get(app.preferencesKey).estimateDays, 28);
+});
+
+test('pool diagnostics distinguish old estimates, unknown stats and ready matches without counting allies in range', async () => {
+  const app = fixture(); await app.signIn([
+    { ...target, checkedAt: new Date(NOW).toISOString() },
+    { ...target, id: 20001, estimateUpdatedAt: NOW / 1000 - 8 * 86400 },
+    { ...target, id: 20002, estimatedStats: null, estimateUpdatedAt: null },
+    { ...target, id: 20003, estimatedStats: 1000 },
+    { ...target, id: 20004, faction: player.faction },
+  ]);
+  assert.match(app.text(), /2 in stat range · 1 estimates too old or undated · 1 stats unknown · 1 ready now/);
+});
+
+test('target cards display and search approved reasons rather than legacy notes', async () => {
+  const app = fixture(); await app.signIn([{ ...target, reason: '<img> Alliance attacks', notes: 'Legacy notes only' }]);
+  assert.match(app.text(), /Reason: <img> Alliance attacks/);
+  assert.doesNotMatch(app.text(), /Legacy notes only/);
+  assert.equal(descendants(app.root).some(element => element.tagName === 'IMG'), false);
+  const search = app.find(element => element.tagName === 'INPUT' && element.type === 'search');
+  search.value = 'ALLIANCE ATTACKS'; search.emit('input');
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 1);
+  search.value = 'Legacy notes'; search.emit('input');
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 0);
+});
+
+test('manual attack buttons reserve a fresh target before navigating and remember it', async () => {
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }], { reservations: { supported: true, leaseMs: 60000 } });
+  const attack = app.find(element => element.className === 'attack');
+  assert.equal(attack.tagName, 'BUTTON');
+  attack.emit('click'); const lease = app.requests.at(-1);
+  assert.equal(lease.method, 'POST');
+  assert.equal(lease.url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  assert.deepEqual(app.navigations, []);
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  assert.equal(app.storage.get(app.preferencesKey).recentTargets[0].id, target.id);
+});
+
+test('a manual attack lease cannot navigate after a short-lived session expires between click and response', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 1000).toISOString() });
+  app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: { supported: true, leaseMs: 60000 } }); await flush();
+  app.settings().emit('click');
+  app.find(element => element.className === 'attack').emit('click'); const lease = app.requests.at(-1);
+  app.setNow(NOW + 1001);
+  app.response(lease, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 1001).toISOString(), reservationExpiresAt: new Date(NOW + 60000).toISOString() }); await flush();
+  assert.deepEqual(app.navigations, []);
+  assert.equal(app.storage.get(app.preferencesKey)?.recentTargets?.length ?? 0, 0);
 });
 
 test('NWA bounds unavailable-target checks to five per click', async () => {
@@ -978,7 +1230,7 @@ test('both stat limits persist separately from the session and filter instant NW
   const maximum = app.find(element => element.attributes.get('aria-label') === 'Maximum target stats as percent of your total');
   maximum.value = '80'; maximum.emit('change');
   minimum.value = '30'; minimum.emit('change');
-  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, lastTargetId: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: null, recentTargets: [] });
   await app.signOut();
   assert.equal(app.storage.has(app.storageKey), false);
   assert.equal(app.storage.get(app.preferencesKey).minRatio, 0.3);
@@ -995,7 +1247,7 @@ test('both stat limits persist separately from the session and filter instant NW
   const before = reloaded.requests.length; reloaded.button('NWA').emit('click');
   assert.equal(reloaded.requests.length, before, 'saved limits still use the immediate cached path');
   assert.deepEqual(reloaded.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
-  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.storage.get(reloaded.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, lastTargetId: target.id });
+  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.storage.get(reloaded.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: target.id, recentTargets: [{ id: target.id, at: NOW }] });
 });
 
 test('the maximum stat limit is used by NWA after reloading', async () => {

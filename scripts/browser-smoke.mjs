@@ -64,6 +64,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
     const originalNow = Date.now;
     window.__mockNow = originalNow();
     Date.now = () => window.__mockNow;
+    Math.random = () => 0.999999;
     const now = Math.floor(Date.now() / 1000);
     const player = { id: 90001, name: 'MockChainer', faction: { id: 44001, name: 'Mock Allowed Faction' },
       battleStats: { strength: 400000, defense: 250000, speed: 200000, dexterity: 150000, total: 1000000 } };
@@ -82,6 +83,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       suggestedBy: { id: player.id, name: player.name, faction: player.faction }, createdAt: new Date(Date.now()).toISOString(),
       reviewedBy: null, reviewedAt: null }];
     window.__mock = { requests: [], pending: [], holds: [], overrides: {}, player, targets, store, suggestions,
+      reservations: null, reservedTargets: new Set(),
       canReview: false, serviceOrigin: 'https://targetlist.grusmedia.no' };
     window.GM_getValue = (key, fallback) => store.has(key) ? store.get(key) : fallback;
     window.GM_setValue = (key, value) => store.set(key, value);
@@ -98,6 +100,17 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       } else if (url.pathname === '/api/session' && request.method === 'DELETE') { status = 204; data = null; }
       else if (url.pathname === '/api/targets') {
         data = { player, targets: structuredClone(targets), generatedAt: new Date(Date.now()).toISOString(), warnings: [] };
+        if (window.__mock.reservations) data.reservations = window.__mock.reservations;
+      } else if (/^\/api\/targets\/\d+\/reservation$/.test(url.pathname) && request.method === 'POST') {
+        const id = Number(url.pathname.split('/')[3]);
+        if (window.__mock.reservedTargets.has(id)) {
+          status = 409; data = { error: { code: 'TARGET_RESERVED', message: 'Another member is using this target.' } };
+        } else {
+          window.__mock.reservedTargets.add(id);
+          data = { id, faction: { id: 77001, name: 'Mock Target Faction' }, checkedAt: new Date(Date.now()).toISOString(),
+            status: { state: 'Okay', description: 'Okay (mock)', until: null },
+            reservationExpiresAt: new Date(Date.now() + 60000).toISOString() };
+        }
       } else if (/^\/api\/targets\/\d+\/status$/.test(url.pathname)) {
         const id = Number(url.pathname.split('/')[3]);
         data = { id, faction: { id: 77001, name: 'Mock Target Faction' }, checkedAt: new Date(Date.now()).toISOString(),
@@ -134,7 +147,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
     window.GM_xmlhttpRequest = request => {
       const url = new URL(request.url);
       if (url.origin !== window.__mock.serviceOrigin) throw new Error('Test attempted an unexpected provider request.');
-      window.__mock.requests.push({ method: request.method, path: url.pathname, search: url.search, headers: request.headers, data: request.data });
+      window.__mock.requests.push({ method: request.method, path: url.pathname, search: url.search, headers: request.headers, data: request.data, timeout: request.timeout });
       if (window.__mock.holds.includes(url.pathname)) window.__mock.pending.push(request);
       else setTimeout(() => respond(request), 1);
       return { abort() { request.onabort?.(); } };
@@ -408,6 +421,94 @@ try {
   await quick.close();
   console.log('PASS NWA waits for a live status check then opens the same-tab attack page, fulfilled entirely by a local mock');
 
+  const estimateSettings = await mount(undefined, [source], context, () => {
+    const mock = window.__mock;
+    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.store.set(`targetlist.preferences.${mock.serviceOrigin}`, { recentTargets: [{ id: 101, at: Date.now() }] });
+    mock.targets[0].reason = '<strong>Alliance attack history</strong>';
+    mock.targets[0].notes = 'Legacy notes should not be shown';
+  });
+  await login(estimateSettings);
+  const estimateSelector = '[aria-label="Maximum estimate age in days"]';
+  assert.equal(await estimateSettings.evaluate(selector => window.__targetlistShadow.querySelector(selector).value, estimateSelector), '7');
+  assert.match((await cardSnapshot(estimateSettings, 104)).text, /Estimate too old \/ undated/);
+  await shadow(estimateSettings, estimateSelector, 'select', '28');
+  assert.match((await cardSnapshot(estimateSettings, 104)).text, /Possible match/);
+  await shadow(estimateSettings, estimateSelector, 'select', '0');
+  assert.equal(await estimateSettings.evaluate(selector => window.__targetlistShadow.querySelector(selector).value, estimateSelector), '28');
+  await shadow(estimateSettings, estimateSelector, 'select', '365');
+  assert.match(await shadow(estimateSettings, '.scroll', 'text'), /Extra caution is needed beyond 28 days/);
+  await shadow(estimateSettings, estimateSelector, 'select', '28');
+  await shadow(estimateSettings, 'input[type=search]', 'fill', 'ALLIANCE ATTACK HISTORY');
+  assert.equal(await estimateSettings.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 1);
+  assert.match((await cardSnapshot(estimateSettings, 101)).text, /Reason: <strong>Alliance attack history<\/strong>/);
+  assert.doesNotMatch((await cardSnapshot(estimateSettings, 101)).text, /Legacy notes/);
+  assert.equal(await estimateSettings.evaluate(() => window.__targetlistShadow.querySelector('.notes strong')), null);
+  await shadow(estimateSettings, 'input[type=search]', 'fill', '');
+  assert.equal(await estimateSettings.evaluate(() => window.__mock.store.get(`targetlist.preferences.${window.__mock.serviceOrigin}`).recentTargets.length), 1);
+  await clickButton(estimateSettings, 'Clear recent targets');
+  assert.equal(await estimateSettings.evaluate(() => window.__mock.store.get(`targetlist.preferences.${window.__mock.serviceOrigin}`).recentTargets.length), 0);
+  assert.match(await shadow(estimateSettings, '.count', 'text'), /estimates too old or undated.*stats unknown.*ready now/);
+  await estimateSettings.screenshot({ path: path.join(artifacts, 'browser-estimate-settings-desktop.png'), fullPage: true });
+  for (const width of [390, 320]) {
+    await estimateSettings.setViewportSize({ width, height: 844 });
+    assert.equal(await estimateSettings.evaluate(() => {
+      const scroll = window.__targetlistShadow.querySelector('.scroll');
+      return scroll.scrollWidth <= scroll.clientWidth + 1 && document.documentElement.scrollWidth <= innerWidth;
+    }), true, `estimate settings must fit ${width}px mobile width`);
+    await estimateSettings.screenshot({ path: path.join(artifacts, `browser-estimate-settings-mobile-${width}.png`), fullPage: true });
+  }
+  await estimateSettings.close();
+  console.log('PASS configurable estimate age, diagnostics, explicit recent-history clearing, searchable plain-text reasons, desktop and 390/320px mobile settings');
+
+  const reservation = await mount(undefined, [source], context, () => {
+    const mock = window.__mock;
+    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
+    mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
+    mock.targets[3].estimateUpdatedAt = Math.floor(Date.now() / 1000) - 3600;
+    mock.reservedTargets.add(101);
+    mock.holds.push('/api/targets/104/reservation');
+  });
+  await login(reservation); await shadow(reservation, '.settings-toggle', 'click');
+  const leasedAttackUrl = 'https://www.torn.com/page.php?sid=attack&user2ID=104';
+  await reservation.route(leasedAttackUrl, route => route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><h1>Reserved mock target only</h1>' }));
+  await shadow(reservation, '.launcher', 'click');
+  await wait(reservation, () => window.__mock.pending.length === 1);
+  assert.equal(reservation.url(), 'about:blank');
+  const reservationRequests = await reservation.evaluate(() => structuredClone(window.__mock.requests));
+  assert.deepEqual(reservationRequests.slice(-2).map(request => [request.method, request.path]), [
+    ['POST', '/api/targets/101/reservation'], ['POST', '/api/targets/104/reservation']
+  ]);
+  assert.equal(reservationRequests.some(request => request.path.endsWith('/status')), false);
+  assert(reservationRequests.slice(-2).every(request => request.timeout <= 3000));
+  const reservedNavigation = reservation.waitForURL(leasedAttackUrl, { timeout: 5000 });
+  await reservation.evaluate(() => window.__mock.release('/api/targets/104/reservation'));
+  await reservedNavigation;
+  assert.equal(await reservation.locator('h1').textContent(), 'Reserved mock target only');
+  await reservation.close();
+  console.log('PASS reservation conflict retries the next candidate and never navigates before a successful shared lease');
+
+  const manualReservation = await mount(undefined, [source], context, () => {
+    const mock = window.__mock;
+    mock.reservations = { supported: true, leaseMs: 60000 };
+    mock.targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
+    mock.targets[0].checkedAt = new Date(Date.now()).toISOString();
+    mock.holds.push('/api/targets/101/reservation');
+  });
+  await login(manualReservation);
+  await manualReservation.route(attackUrl, route => route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><h1>Manual reserved mock target only</h1>' }));
+  assert.equal(await manualReservation.evaluate(() => window.__targetlistShadow.querySelector('.attack').tagName), 'BUTTON');
+  await shadow(manualReservation, 'button.attack', 'click');
+  await wait(manualReservation, () => window.__mock.pending.length === 1);
+  assert.equal(manualReservation.url(), 'about:blank');
+  assert.equal(await manualReservation.evaluate(() => window.__mock.requests.at(-1).method), 'POST');
+  const manualNavigation = manualReservation.waitForURL(attackUrl, { timeout: 5000 });
+  await manualReservation.evaluate(() => window.__mock.release('/api/targets/101/reservation'));
+  await manualNavigation;
+  await manualReservation.close();
+  console.log('PASS manual Attack button acquires the same reservation before opening its target');
+
   const warm = await mount(undefined, [source], context, () => {
     const mock = window.__mock;
     mock.store.set(`targetlist.session.${mock.serviceOrigin}`, {
@@ -563,7 +664,7 @@ try {
     });
     assert(geometry.left >= 0 && geometry.right <= geometry.width, JSON.stringify(geometry));
     assert(geometry.documentWidth <= geometry.width && geometry.scrollWidth <= geometry.clientWidth + 1, JSON.stringify(geometry));
-    assert.equal(geometry.inputs.length, 2);
+    assert.equal(geometry.inputs.length, 3, 'minimum, maximum and estimate-age inputs remain within the mobile panel');
     for (const input of geometry.inputs) assert(input.left >= geometry.left && input.right <= geometry.right && input.width >= 40, JSON.stringify(geometry));
     await ranges.screenshot({ path: path.join(artifacts, `browser-stat-range-mobile-${width}.png`), fullPage: true });
   }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.4.4
+// @version      0.5.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
@@ -24,6 +24,8 @@ const TargetListCore = (() => {
   const DEFAULT_MIN_RATIO = 0.1;
   const DEFAULT_MAX_RATIO = 0.6;
   const ESTIMATE_MAX_AGE = 7 * 24 * 60 * 60;
+  const DEFAULT_ESTIMATE_DAYS = 7;
+  const RECENT_TARGET_MS = 10 * 60 * 1000;
   const LIVE_STATUS_MAX_AGE = 30 * 1000;
 
   function serviceUrl(value) {
@@ -66,14 +68,19 @@ const TargetListCore = (() => {
     return `${Math.floor(seconds / 86400)}d ago`;
   }
 
-  function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO) {
+  function reason(target) {
+    return (typeof target.reason === 'string' && target.reason.trim())
+      || (typeof target.notes === 'string' && target.notes.trim()) || '';
+  }
+  function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO, estimateDays = DEFAULT_ESTIMATE_DAYS) {
     const ratio = positive(target.estimatedStats) && positive(player.battleStats.total)
       ? target.estimatedStats / player.battleStats.total : null;
     const validRange = typeof minRatio === 'number' && Number.isFinite(minRatio) && minRatio >= 0 && minRatio <= 5 &&
       typeof maxRatio === 'number' && Number.isFinite(maxRatio) && maxRatio >= 0.01 && maxRatio <= 5 && minRatio <= maxRatio;
     const inRange = validRange && ratio !== null && ratio >= minRatio && ratio <= maxRatio;
     const stamp = target.estimateUpdatedAt;
-    const fresh = positive(stamp) && stamp <= now / 1000 + 300 && now / 1000 - stamp <= ESTIMATE_MAX_AGE;
+    const validAge = Number.isSafeInteger(estimateDays) && estimateDays >= 1 && estimateDays <= 365;
+    const fresh = validAge && positive(stamp) && stamp <= now / 1000 + 300 && now / 1000 - stamp <= estimateDays * 86400;
     const allied = target.id === player.id || (target.faction?.id && target.faction.id === player.faction.id);
     const checked = Date.parse(target.checkedAt);
     const live = Number.isFinite(checked) && checked <= now + 5000 && now - checked < LIVE_STATUS_MAX_AGE;
@@ -85,30 +92,46 @@ const TargetListCore = (() => {
     let tone = 'good';
     if (allied) { label = 'Friendly / self'; tone = 'muted'; }
     else if (ratio === null) { label = 'Stats unknown'; tone = 'muted'; }
-    else if (!fresh) { label = 'Estimate needs refresh'; tone = 'warn'; }
+    else if (!fresh) { label = 'Estimate too old / undated'; tone = 'warn'; }
     else if (!validRange) { label = 'Invalid stat range'; tone = 'warn'; }
     else if (ratio < minRatio) { label = 'Below your minimum'; tone = 'warn'; }
     else if (ratio > maxRatio) { label = 'Above your limit'; tone = 'warn'; }
     const suggested = !allied && fresh && inRange;
-    return { ratio, inRange, fresh, live, ready, timedUnavailable, suggested, label, tone };
+    return { ratio, inRange, fresh, live, ready, timedUnavailable, suggested, allied, label, tone };
   }
 
   function select(targets, player, options, now = Date.now()) {
     const query = (options.query || '').trim().toLowerCase();
-    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio) }))
+    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
       .filter(({ target, assessment }) => {
         if (options.mode === 'suggested' && !assessment.suggested) return false;
-        return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${target.notes || ''}`.toLowerCase().includes(query);
+        return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${reason(target)}`.toLowerCase().includes(query);
       })
       .sort((a, b) => Number(b.assessment.suggested) - Number(a.assessment.suggested) ||
         (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id);
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, ESTIMATE_MAX_AGE, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, compact, ageLabel, assess, select };
+  function recentTargets(values, now = Date.now()) {
+    return (Array.isArray(values) ? values : []).filter(value => value && Number.isSafeInteger(value.id) && value.id > 0
+      && Number.isFinite(value.at) && value.at <= now && now - value.at < RECENT_TARGET_MS).slice(-50);
+  }
+  function candidates(rows, recent = [], now = Date.now(), random = Math.random) {
+    const visited = new Set(recentTargets(recent, now).map(value => value.id));
+    const pool = rows.filter(row => !visited.has(row.target.id) && !row.target.reserved
+      && (!row.assessment.live || row.assessment.ready) && !row.assessment.timedUnavailable);
+    // Shuffle equal-priority targets so alliance members do not share one order.
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    return pool.sort((a, b) => Number(b.assessment.ready) - Number(a.assessment.ready)).map(row => row.target);
+  }
+
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select };
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.4.4' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.0' });
 
 const previousHost = document.getElementById('torn-targetlist-host');
 const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
@@ -143,6 +166,9 @@ function mountTargetList() {
     authorizedPool: false, backgroundLoading: false, targetLoad: null, lastPoolAttemptAt: 0, backgroundRenderPending: false,
     busy: false, removingKey: false, open: false, generation: 0, error: '', query: '', mode: 'all',
     minRatio, maxRatio,
+    estimateDays: Number.isSafeInteger(preferences?.estimateDays) && preferences.estimateDays >= 1 && preferences.estimateDays <= 365
+      ? preferences.estimateDays : C.DEFAULT_ESTIMATE_DAYS,
+    recentTargets: C.recentTargets(preferences?.recentTargets), reservationsSupported: false,
     lastTargetId: Number.isSafeInteger(preferences?.lastTargetId) ? preferences.lastTargetId : null,
     finding: false, findGeneration: 0, findAfterLogin: false,
     pendingChecks: new Set(), loading: false, targetGeneration: 0, view: 'targets',
@@ -190,7 +216,7 @@ function mountTargetList() {
     .cardhead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.name{font-weight:750;font-size:15px}.badge{font-size:10px;font-weight:750;padding:4px 7px;border-radius:5px;white-space:nowrap;background:#20473e;color:#a4efd9}
     .badge.warn{background:#4e3e26;color:#f6d290}.badge.muted{background:#2c3944;color:#bbcad4}
     .metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}.metrics strong{display:block;font-size:14px}.metrics small{display:block}
-    .actions{display:flex;align-items:center;gap:12px;margin-top:12px}.actions a.attack{margin-left:auto;background:#76e1c7;color:#102626;padding:7px 12px;border-radius:8px;font-weight:750}
+    .actions{display:flex;align-items:center;gap:12px;margin-top:12px}.actions .attack{margin-left:auto;background:#76e1c7;color:#102626;padding:7px 12px;border-radius:8px;font-weight:750}
     .notes{font-size:12px;color:#b7c7ce;margin-top:8px;overflow-wrap:anywhere}.empty{padding:24px;text-align:center;background:#1c303a;border-radius:10px}
     .footnote{border-top:1px solid #30414c;margin-top:18px;padding-top:14px;font-size:11px;color:#9fb2bd}
     .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.tabs button[aria-pressed=true]{border-color:#76e1c7;background:#244a46;color:#baf8e7}
@@ -252,8 +278,14 @@ function mountTargetList() {
     launcher.setAttribute('aria-busy', String(state.finding));
   }
   function cancelFind() { state.findGeneration++; state.finding = false; findNotice(''); updateLauncher(); }
-  function savePreferences() { GM_setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio, lastTargetId: state.lastTargetId }); }
-  function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio); }
+  function savePreferences() { GM_setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio,
+    estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets) }); }
+  function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays); }
+  function rememberTarget(id) {
+    state.lastTargetId = id;
+    state.recentTargets = C.recentTargets([...state.recentTargets.filter(value => value.id !== id), { id, at: Date.now() }]);
+    savePreferences();
+  }
   function saveSession() {
     GM_setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
   }
@@ -277,17 +309,17 @@ function mountTargetList() {
     }
     message(error.message || 'The request failed. Try again shortly.');
   }
-  function request(method, path, body, token = state.token) {
+  function request(method, path, body, token = state.token, timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const succeed = value => { if (!settled) { settled = true; clearTimeout(deadline); resolve(value); } };
       const fail = error => { if (!settled) { settled = true; clearTimeout(deadline); reject(error); } };
-      const deadline = setTimeout(() => fail(new Error('The target service timed out. Try again shortly.')), 20000);
+      const deadline = setTimeout(() => fail(new Error('The target service timed out. Try again shortly.')), timeoutMs);
       const headers = { Accept: 'application/json' };
       if (body !== undefined) headers['Content-Type'] = 'application/json';
       if (token) headers.Authorization = `Bearer ${token}`;
       try { GM_xmlhttpRequest({
-        method, url: `${base}${path}`, headers, anonymous: true, redirect: 'error', timeout: 20000,
+        method, url: `${base}${path}`, headers, anonymous: true, redirect: 'error', timeout: timeoutMs,
         data: body === undefined ? undefined : JSON.stringify(body),
         onload(response) {
           if (settled) return;
@@ -423,7 +455,7 @@ function mountTargetList() {
     }
     render();
   }
-  function loadTargets(force = false, forFind = false, background = false) {
+  function loadTargets(force = false, forFind = false, background = false, timeoutMs = 20000) {
     if (!state.token || state.removingKey || (background && (state.finding || state.pendingChecks.size))) return Promise.resolve(false);
     if (!forFind && !background) cancelFind();
     if (state.targetLoad && !force) return state.targetLoad.promise;
@@ -435,9 +467,10 @@ function mountTargetList() {
     if (!background) render();
     const pending = (async () => {
       try {
-        const data = await request('GET', '/api/targets');
+        const data = await request('GET', '/api/targets', undefined, state.token, timeoutMs);
         if (generation !== state.generation || targetGeneration !== state.targetGeneration) return false;
         state.player = data.player; state.targets = data.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
+        state.reservationsSupported = data.reservations?.supported === true;
         state.poolLoadedAt = Date.now(); state.authorizedPool = true;
         updatePageNotice();
         return true;
@@ -466,13 +499,22 @@ function mountTargetList() {
     state.finding = true; updateLauncher(); findNotice('Finding a target…');
     const findGeneration = ++state.findGeneration;
     const generation = state.generation;
+    const deadline = Date.now() + 8000;
     let targetGeneration = state.targetGeneration;
     const current = () => state.finding && findGeneration === state.findGeneration && generation === state.generation
       && targetGeneration === state.targetGeneration && state.token && Date.parse(state.expiresAt) > Date.now();
     try {
       if (!state.player || !authorizedPoolFresh()
           || !C.select(state.targets, state.player, { ...state, mode: 'suggested' }).length) {
-        const restored = await loadTargets(false, true);
+        let feedTimer;
+        let restored;
+        try {
+          const feed = loadTargets(false, true, false, 5000);
+          targetGeneration = state.targetGeneration;
+          restored = await Promise.race([feed, new Promise((_, reject) => {
+            feedTimer = setTimeout(() => reject(new Error('NWA could not load targets within 8 seconds. Try again shortly.')), Math.max(1, deadline - Date.now()));
+          })]);
+        } finally { clearTimeout(feedTimer); }
         targetGeneration = state.targetGeneration;
         if (!restored || !current()) {
           if (findGeneration === state.findGeneration && state.error) findNotice(state.error);
@@ -480,45 +522,59 @@ function mountTargetList() {
         }
       }
       const matches = C.select(state.targets, state.player, { ...state, mode: 'suggested' });
-      const candidates = matches.filter(row => (!row.assessment.live || row.assessment.ready) && !row.assessment.timedUnavailable)
-        .sort((a, b) => Number(b.assessment.ready) - Number(a.assessment.ready)
-          || Number(a.target.id === state.lastTargetId) - Number(b.target.id === state.lastTargetId))
-        .map(row => row.target);
+      state.recentTargets = C.recentTargets(state.recentTargets);
+      const candidates = C.candidates(matches, state.recentTargets);
+      // Preserve the previous version's last-target preference on first update.
+      if (!state.recentTargets.length) candidates.sort((a, b) => Number(assessTarget(b).ready) - Number(assessTarget(a).ready)
+        || Number(a.id === state.lastTargetId) - Number(b.id === state.lastTargetId));
       const limit = Math.min(candidates.length, 5);
       for (let index = 0; index < limit; index++) {
         if (!current()) return;
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
         const target = candidates[index];
         const cached = assessTarget(target);
-        if (authorizedPoolFresh() && cached.suggested && cached.ready) {
-          state.lastTargetId = target.id; savePreferences();
+        if (!state.reservationsSupported && authorizedPoolFresh() && cached.suggested && cached.ready) {
+          rememberTarget(target.id);
           findNotice(`Opening ${target.name || 'target'}…`);
           window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`);
           return;
         }
         findNotice(`Checking ${target.name || 'player'}…`);
         let checked;
-        try { checked = await request('GET', `/api/targets/${target.id}/status`); }
+        try { checked = await request(state.reservationsSupported ? 'POST' : 'GET',
+          `/api/targets/${target.id}/${state.reservationsSupported ? 'reservation' : 'status'}`,
+          undefined, state.token, Math.min(3000, remainingMs)); }
         catch (error) {
           if (!current()) return;
           state.targets = state.targets.map(row => row.id === target.id ? { ...row, checkedAt: null } : row);
           if (['FRIENDLY_TARGET', 'TARGET_NOT_FOUND'].includes(error.code)) {
             state.targets = state.targets.filter(row => row.id !== target.id); continue;
           }
+          if (['TARGET_RESERVED', 'TARGET_UNAVAILABLE'].includes(error.code)) {
+            state.targets = state.targets.map(row => row.id === target.id ? { ...row, reserved: true } : row);
+            continue;
+          }
+          if (!error.status || error.status === 502 || ['TORN_UNAVAILABLE', 'TARGETS_UNAVAILABLE'].includes(error.code)) continue;
           throw error;
         }
         if (!current()) return;
         if (checked?.id !== target.id) throw new Error('NWA could not verify this target. Try again.');
+        if (state.reservationsSupported && !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+          throw new Error('NWA could not reserve this target. Try again.');
+        }
         state.targets = state.targets.map(row => row.id === target.id ? { ...row, ...checked } : row);
         const latest = state.targets.find(row => row.id === target.id);
         const assessment = latest && assessTarget(latest);
         if (!assessment?.suggested || !assessment.ready) continue;
-        state.lastTargetId = target.id; savePreferences();
+        rememberTarget(target.id);
         findNotice(`Opening ${latest.name || 'target'}…`);
         window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`);
         return;
       }
       const notice = !state.targets.length ? 'The NWA target pool is empty. Suggest targets in settings.'
-        : !matches.length ? 'No targets match your filters and stat range. Adjust them in settings.'
+        : !matches.length ? `No targets match. ${poolSummary()} Adjust your stats or maximum estimate age in settings.`
+        : !candidates.length && state.recentTargets.length ? 'Matching targets are unavailable, reserved, or opened in the last 10 minutes. You can clear recent targets in settings.'
         : candidates.length > limit ? 'No available target in the first 5 matches. Try NWA again or browse settings.'
         : 'No matching targets are available right now. Try again shortly.';
       findNotice(notice);
@@ -534,16 +590,27 @@ function mountTargetList() {
       }
     }
   }
-  async function checkStatus(id) {
+  async function checkStatus(id, openAttack = false) {
     if (state.removingKey || state.pendingChecks.has(id)) return;
     state.pendingChecks.add(id); message(''); renderCards();
     const generation = state.generation;
     const targetGeneration = state.targetGeneration;
     try {
-      const checked = await request('GET', `/api/targets/${id}/status`);
+      const checked = await request(openAttack && state.reservationsSupported ? 'POST' : 'GET',
+        `/api/targets/${id}/${openAttack && state.reservationsSupported ? 'reservation' : 'status'}`);
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
       if (checked?.id !== id) throw new Error('NWA could not verify this target. Try again.');
       state.targets = state.targets.map(target => target.id === id ? { ...target, ...checked } : target);
+      if (openAttack) {
+        const latest = state.targets.find(target => target.id === id);
+        const assessment = latest && assessTarget(latest);
+        if (!state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh() || !assessment?.suggested || !assessment.ready
+          || state.reservationsSupported && !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+          throw new Error('This target is no longer ready. Refresh the list and try another.');
+        }
+        rememberTarget(id);
+        window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${id}`);
+      }
     } catch (error) {
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
       state.targets = state.targets.map(target => target.id === id ? { ...target, checkedAt: null } : target);
@@ -666,7 +733,7 @@ function mountTargetList() {
     }
     content.append(grid);
     const toolbar = element('div', null, 'toolbar');
-    const query = element('input'); query.type = 'search'; query.placeholder = 'Search player, faction or notes'; query.value = state.query;
+    const query = element('input'); query.type = 'search'; query.placeholder = 'Search player, faction or reason'; query.value = state.query;
     query.setAttribute('aria-label', 'Search targets'); query.addEventListener('input', () => { state.query = query.value; cancelFind(); renderCards(); });
     const mode = element('select'); mode.setAttribute('aria-label', 'Target view');
     for (const [value, label] of [['all', 'All targets'], ['suggested', 'Possible matches']]) {
@@ -701,9 +768,25 @@ function mountTargetList() {
     }
     const refresh = button(state.loading ? 'Loading…' : 'Refresh list', () => void loadTargets()); refresh.disabled = state.loading; controls.append(refresh); content.append(controls);
     updateRangeSummary(); content.append(rangeSummary);
+    const ageControls = element('div', null, 'controls');
+    const ageLabel = element('label', 'Maximum estimate age:');
+    const age = element('input'); age.type = 'number'; age.min = '1'; age.max = '365'; age.step = '1'; age.value = String(state.estimateDays);
+    age.setAttribute('aria-label', 'Maximum estimate age in days');
+    age.addEventListener('change', () => {
+      const next = Number(age.value);
+      if (!age.value.trim() || !Number.isSafeInteger(next) || next < 1 || next > 365) {
+        age.value = String(state.estimateDays); message('Enter a whole number from 1 to 365 days.'); return;
+      }
+      state.estimateDays = next; savePreferences(); cancelFind(); message(''); render();
+    });
+    ageLabel.append(age, element('span', 'days')); ageControls.append(ageLabel,
+      button('Clear recent targets', () => { state.recentTargets = []; state.lastTargetId = null; savePreferences(); cancelFind(); message(''); renderCards(); }));
+    content.append(ageControls);
+    if (state.estimateDays > 28) content.append(element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice'));
     countNode = element('div', null, 'count'); cardContainer = element('div', null, 'cards'); content.append(countNode, cardContainer);
     const note = element('div', null, 'footnote');
-    note.append(element('p', 'Possible matches use estimated total stats, with estimates no older than 7 days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.'),
+    note.append(element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`),
+      element('p', 'Refreshing the list checks for updates; FFScouter may still have an older estimate. Recently opened targets are skipped for 10 minutes. NWA assignments last 60 seconds when the backend supports reservations.'),
       element('p', 'NWA uses availability checked within 30 seconds. Check status to update a target now. Status can change at any time; Torn makes the final availability check.'));
     for (const warning of state.warnings) note.append(element('p', warning));
     if (state.generatedAt) note.append(element('div', `Pool updated: ${new Date(state.generatedAt).toLocaleString()}`));
@@ -766,11 +849,19 @@ function mountTargetList() {
     }
   }
 
+  function poolSummary() {
+    const assessments = state.targets.map(assessTarget);
+    const range = assessments.filter(value => !value.allied && value.inRange).length;
+    const old = assessments.filter(value => value.ratio !== null && !value.fresh).length;
+    const unknown = assessments.filter(value => value.ratio === null).length;
+    const ready = state.targets.filter(target => { const value = assessTarget(target); return value.suggested && value.ready && !target.reserved; }).length;
+    return `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
+  }
   function renderCards() {
     if (!state.player || !cardContainer) return;
     const rows = C.select(state.targets, state.player, state);
     const suggestions = state.targets.filter(t => assessTarget(t).suggested).length;
-    countNode.textContent = state.loading ? 'Loading the faction’s target pool…' : `${rows.length} shown · ${state.targets.length} in pool · ${suggestions} possible matches`;
+    countNode.textContent = state.loading ? 'Loading the faction’s target pool…' : `${rows.length} shown · ${state.targets.length} in pool · ${suggestions} possible matches · ${poolSummary()}`;
     cardContainer.replaceChildren();
     if (!rows.length && !state.loading) {
       const text = state.targets.length ? 'No targets match these filters. Try All targets or a different stat range.' : 'The target pool is empty. New targets will appear after your faction’s list is updated.';
@@ -789,11 +880,14 @@ function mountTargetList() {
         element('small', target.lastAction ? `Last active ${C.ageLabel(target.lastAction)}` : 'Activity unknown'));
       if (target.status?.until > Date.now() / 1000) status.append(element('small', `Until ${new Date(target.status.until * 1000).toLocaleTimeString()}`));
       metrics.append(stats, comparison, status); card.append(metrics);
-      if (target.notes) card.append(element('div', target.notes, 'notes'));
+      if (C.reason(target)) card.append(element('div', `Reason: ${C.reason(target)}`, 'notes'));
       const actions = element('div', null, 'actions');
       const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id)); check.disabled = state.pendingChecks.has(target.id) || state.loading;
       actions.append(check);
-      if (assessment.suggested && assessment.ready && authorizedPoolFresh()) {
+      if (assessment.suggested && assessment.ready && authorizedPoolFresh() && !target.reserved && state.reservationsSupported) {
+        const attack = button(state.pendingChecks.has(target.id) ? 'Reserving…' : 'Attack ↗', () => void checkStatus(target.id, true), 'attack');
+        attack.disabled = state.pendingChecks.has(target.id); actions.append(attack);
+      } else if (assessment.suggested && assessment.ready && authorizedPoolFresh() && !target.reserved) {
         const attack = link('Attack ↗', `https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`, 'attack');
         const guardAttack = event => {
           const latest = state.targets.find(t => t.id === target.id);
@@ -805,7 +899,7 @@ function mountTargetList() {
         attack.addEventListener('click', guardAttack);
         attack.addEventListener('auxclick', guardAttack);
         actions.append(attack);
-      } else actions.append(element('small', !assessment.suggested ? assessment.label : assessment.live ? target.status?.description || 'Unavailable right now' : 'Check availability to open attack'));
+      } else actions.append(element('small', target.reserved ? 'Reserved by another NWA member' : !assessment.suggested ? assessment.label : assessment.live ? target.status?.description || 'Unavailable right now' : 'Check availability to open attack'));
       card.append(actions); cardContainer.append(card);
     }
   }

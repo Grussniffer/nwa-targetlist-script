@@ -132,7 +132,7 @@ test('estimates expire after seven days and reject missing or implausibly future
   const expired = Core.assess(target({ estimateUpdatedAt: boundary - 1 }), player, 0.6, NOW);
   assert.equal(expired.fresh, false);
   assert.equal(expired.suggested, false);
-  assert.equal(expired.label, 'Estimate needs refresh');
+  assert.equal(expired.label, 'Estimate too old / undated');
 
   for (const stamp of [undefined, null, 0, -1, '2026-10-09', NaN, Infinity, NOW / 1000 + 301]) {
     const assessment = Core.assess(target({ estimateUpdatedAt: stamp }), player, 0.6, NOW);
@@ -140,6 +140,59 @@ test('estimates expire after seven days and reject missing or implausibly future
     assert.equal(assessment.suggested, false);
   }
   assert.equal(Core.assess(target({ estimateUpdatedAt: NOW / 1000 + 300 }), player, 0.6, NOW).fresh, true);
+});
+
+test('estimate age is configurable from one to 365 days and includes its exact chosen boundary', () => {
+  assert.equal(Core.DEFAULT_ESTIMATE_DAYS, 7);
+  for (const days of [1, 7, 28, 365]) {
+    const stamp = NOW / 1000 - days * 86400;
+    assert.equal(Core.assess(target({ estimateUpdatedAt: stamp }), player, 0.6, NOW, 0.1, days).suggested, true);
+    assert.equal(Core.assess(target({ estimateUpdatedAt: stamp - 1 }), player, 0.6, NOW, 0.1, days).suggested, false);
+  }
+  const old = target({ estimateUpdatedAt: NOW / 1000 - 20 * 86400 });
+  assert.equal(Core.select([old], player, { mode: 'suggested', estimateDays: 7 }, NOW).length, 0);
+  assert.equal(Core.select([old], player, { mode: 'suggested', estimateDays: 28 }, NOW).length, 1);
+  for (const days of [0, -1, 366, 1.5, '28', null, NaN, Infinity]) {
+    assert.equal(Core.assess(target(), player, 0.6, NOW, 0.1, days).suggested, false, String(days));
+  }
+});
+
+test('approved reasons take precedence over notes and are searchable as plain text', () => {
+  const listed = target({ reason: '  Repeated alliance attacks  ', notes: 'Legacy administrator note' });
+  assert.equal(Core.reason(listed), 'Repeated alliance attacks');
+  assert.equal(Core.select([listed], player, { query: 'ALLIANCE ATTACKS' }, NOW).length, 1);
+  assert.equal(Core.select([listed], player, { query: 'Legacy administrator' }, NOW).length, 0);
+  assert.equal(Core.reason(target({ reason: '  ', notes: '  Manual reason  ' })), 'Manual reason');
+  assert.equal(Core.reason(target({ reason: {}, notes: null })), '');
+});
+
+test('recent targets validate entries, expire at ten minutes and retain at most the latest 50', () => {
+  assert.equal(Core.RECENT_TARGET_MS, 600000);
+  const history = [
+    { id: 1, at: NOW - 600000 }, { id: 2, at: NOW - 599999 }, { id: 3, at: NOW + 1 },
+    { id: '4', at: NOW }, { id: 0, at: NOW }, { id: 5, at: NaN }, null,
+  ];
+  assert.deepEqual(JSON.parse(JSON.stringify(Core.recentTargets(history, NOW))), [{ id: 2, at: NOW - 599999 }]);
+  assert.deepEqual([...Core.recentTargets(null, NOW)], []);
+  const many = Array.from({ length: 60 }, (_, index) => ({ id: index + 1, at: NOW - 60 + index }));
+  assert.deepEqual([...Core.recentTargets(many, NOW).map(value => value.id)], many.slice(-50).map(value => value.id));
+  assert.equal(many.length, 60, 'normalizing history leaves stored input unchanged');
+});
+
+test('finder candidates exclude recent, reserved and unavailable targets while shuffling within readiness priority', () => {
+  const targets = [
+    target({ id: 1 }), target({ id: 2 }), target({ id: 3, checkedAt: null }),
+    target({ id: 4, reserved: true }),
+    target({ id: 5, status: { state: 'Hospital' } }),
+    target({ id: 6, status: { state: 'Hospital', until: NOW / 1000 + 120 }, checkedAt: null }),
+    target({ id: 7 }),
+  ];
+  const rows = Core.select(targets, player, { mode: 'suggested' }, NOW);
+  const history = [{ id: 7, at: NOW }];
+  const chosen = Core.candidates(rows, history, NOW, () => 0);
+  assert.deepEqual([...chosen.map(value => value.id)], [2, 1, 3]);
+  assert.deepEqual(targets.map(value => value.id), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(Core.candidates(rows, [{ id: 1, at: NOW - 600000 }], NOW, () => 0.999999).some(value => value.id === 1), true);
 });
 
 test('Ready requires an Okay status checked less than thirty seconds ago', () => {
