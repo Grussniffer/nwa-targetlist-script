@@ -1,16 +1,38 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.2' });
 
-const previousHost = document.getElementById('torn-targetlist-host');
-const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
-if (!previousHost || !/^\d+\.\d+\.\d+$/.test(mountedVersion)
-    || mountedVersion.localeCompare(CONFIG.version, undefined, { numeric: true }) < 0) {
-  // Earlier Target List editions used the same host ID and could hide NWA entirely.
-  previousHost?.remove();
-  mountTargetList();
+function startTargetList() {
+  const platform = TargetListPlatform.create({
+    gmGet: typeof GM_getValue === 'function' ? GM_getValue : undefined,
+    gmSet: typeof GM_setValue === 'function' ? GM_setValue : undefined,
+    gmDelete: typeof GM_deleteValue === 'function' ? GM_deleteValue : undefined,
+    gmRequest: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : undefined,
+    pdaStorage: typeof PDA_storage !== 'undefined' ? PDA_storage : undefined,
+    pdaGet: typeof PDA_httpGet === 'function' ? PDA_httpGet : window.PDA_httpGet,
+    pdaPost: typeof PDA_httpPost === 'function' ? PDA_httpPost : window.PDA_httpPost,
+    pdaDelete: typeof PDA_httpDelete === 'function' ? PDA_httpDelete : window.PDA_httpDelete,
+    pdaReady: window.__PDA_platformReadyPromise, pdaBridge: () => window.flutter_inappwebview,
+    localStorage: () => window.localStorage
+  });
+  function mount(storageWarning = '') {
+    const previousHost = document.getElementById('torn-targetlist-host');
+    const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
+    if (previousHost && /^\d+\.\d+\.\d+$/.test(mountedVersion)
+        && mountedVersion.localeCompare(CONFIG.version, undefined, { numeric: true }) >= 0) return;
+    previousHost?.remove(); mountTargetList(platform, storageWarning);
+  }
+  const base = TargetListCore.serviceUrl(CONFIG.serviceUrl);
+  const ready = platform.prepare([`targetlist.session.${base}`, `targetlist.preferences.${base}`]);
+  if (ready?.then) ready.then(() => mount()).catch(error => mount(error.message)); else mount();
+}
+// PDA can inject at page start regardless of @run-at. Mount only in the main
+// document, once its body is available, and retain version deduplication.
+if (!window.top || window.top === window.self) {
+  if (document.body) startTargetList();
+  else document.addEventListener('DOMContentLoaded', startTargetList, { once: true });
 }
 
-function mountTargetList() {
+function mountTargetList(platform, storageWarning = '') {
   const C = TargetListCore;
   const FEED_REFRESH_MS = 10_000;
   let base;
@@ -18,7 +40,7 @@ function mountTargetList() {
   catch (error) { console.error('[NWA] Invalid service address:', error.message); return; }
   const storageKey = `targetlist.session.${base}`;
   const preferencesKey = `targetlist.preferences.${base}`;
-  const preferences = GM_getValue(preferencesKey, null);
+  const preferences = platform.getValue(preferencesKey, null);
   const savedMaxRatio = preferences?.maxRatio;
   const maxRatio = Number.isFinite(savedMaxRatio) && savedMaxRatio >= 0.01 && savedMaxRatio <= 5 ? savedMaxRatio : C.DEFAULT_MAX_RATIO;
   const savedMinRatio = preferences?.minRatio;
@@ -66,7 +88,7 @@ function mountTargetList() {
       border:1px solid #3b6046;border-radius:9px;background:#14291c;color:#e5f6e8;font-size:12px;box-shadow:0 4px 18px #0005}
     @keyframes nwa-pulse{50%{background:#13672a}}
     @media(prefers-reduced-motion:reduce){.launcher[aria-busy=true]{animation:none}}
-    .panel{position:absolute;top:12px;right:64px;width:min(640px,calc(100vw - 80px));max-height:calc(100dvh - 24px);
+    .panel{position:absolute;top:calc(var(--nwa-viewport-top,0px) + 12px);right:64px;width:min(640px,calc(100vw - 80px));max-height:calc(100vh - 24px);max-height:calc(var(--nwa-viewport-height,100dvh) - 24px);
       pointer-events:auto;background:#14222d;border:1px solid #354956;
       border-radius:15px;box-shadow:0 18px 70px #0009;display:flex;flex-direction:column;overflow:hidden}
     [hidden]{display:none!important}.header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #30414c}
@@ -93,7 +115,8 @@ function mountTargetList() {
     .success{background:#20473e;color:#baf8e7;padding:10px 13px;border-radius:8px;margin:12px 0;font-size:13px}
     .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:13px;color:#d4e4e9}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
     .queueheader h3{font-size:16px}.queuefooter{margin-top:12px}.suggestioncard .actions button{padding:6px 10px}.suggestioncard .name{overflow-wrap:anywhere}
-    @media(max-width:480px){.panel{top:8px;right:60px;width:calc(100vw - 68px);max-height:calc(100dvh - 16px)}
+    @media(pointer:coarse){input,select,textarea{font-size:16px}}
+    @media(max-width:480px){.panel{top:calc(var(--nwa-viewport-top,0px) + 8px);right:60px;width:calc(100vw - 68px);max-height:calc(100vh - 16px);max-height:calc(var(--nwa-viewport-height,100dvh) - 16px)}
       .scroll{padding:14px}.toolbar{grid-template-columns:1fr}.statgrid{grid-template-columns:repeat(2,1fr)}
       .metrics{grid-template-columns:1fr 1fr}.cardhead{flex-wrap:wrap}.badge{white-space:normal}.actions{gap:8px}.header{padding:12px 14px}.suggestionfields{grid-template-columns:1fr}}
   `;
@@ -146,8 +169,12 @@ function mountTargetList() {
     launcher.setAttribute('aria-busy', String(state.finding));
   }
   function cancelFind() { state.findGeneration++; state.finding = false; findNotice(''); updateLauncher(); }
-  function savePreferences() { GM_setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio,
-    estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets) }); }
+  function persist(operation) {
+    try { operation()?.catch?.(error => { message(error.message); render(); }); }
+    catch (error) { message(error.message); }
+  }
+  function savePreferences() { persist(() => platform.setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio,
+    estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets) })); }
   function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays); }
   function rememberTarget(id) {
     state.lastTargetId = id;
@@ -155,7 +182,7 @@ function mountTargetList() {
     savePreferences();
   }
   function saveSession() {
-    GM_setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
+    return platform.setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
   }
   function clearSession() {
     cancelFind(); state.findAfterLogin = false;
@@ -167,7 +194,7 @@ function mountTargetList() {
     state.view = 'targets'; state.suggestionView = 'pending'; state.suggestions = []; state.nextSuggestionOffset = null;
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
-    GM_deleteValue(storageKey);
+    persist(() => platform.deleteValue(storageKey));
     updatePageNotice();
   }
   function handleError(error) {
@@ -179,14 +206,20 @@ function mountTargetList() {
   }
   function request(method, path, body, token = state.token, timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
-      let settled = false;
+      let settled = false, transport = null;
       const succeed = value => { if (!settled) { settled = true; clearTimeout(deadline); resolve(value); } };
-      const fail = error => { if (!settled) { settled = true; clearTimeout(deadline); reject(error); } };
+      const fail = error => {
+        if (!settled) {
+          settled = true; clearTimeout(deadline);
+          try { transport?.abort?.(); } catch { /* The original failure still settles the request. */ }
+          reject(error);
+        }
+      };
       const deadline = setTimeout(() => fail(new Error('The target service timed out. Try again shortly.')), timeoutMs);
       const headers = { Accept: 'application/json' };
       if (body !== undefined) headers['Content-Type'] = 'application/json';
       if (token) headers.Authorization = `Bearer ${token}`;
-      try { GM_xmlhttpRequest({
+      try { transport = platform.xmlHttpRequest({
         method, url: `${base}${path}`, headers, anonymous: true, redirect: 'error', timeout: timeoutMs,
         data: body === undefined ? undefined : JSON.stringify(body),
         onload(response) {
@@ -229,7 +262,9 @@ function mountTargetList() {
         throw new Error('Update the NWA backend to enable encrypted key storage.');
       }
       state.token = data.token; state.expiresAt = data.expiresAt; state.player = data.player;
-      saveSession(); await loadTargets();
+      const saving = saveSession(); if (saving?.then) await saving;
+      if (generation !== state.generation) return;
+      await loadTargets();
     } catch (error) { if (generation === state.generation) handleError(error); }
     finally {
       if (generation === state.generation) {
@@ -791,10 +826,20 @@ function mountTargetList() {
     if (open) { findNotice(''); render(); }
     if (open && state.token && !state.player && !state.finding) void loadTargets();
   }
-  const saved = GM_getValue(storageKey, null);
+  const saved = platform.getValue(storageKey, null);
   if (saved?.token && Date.parse(saved.expiresAt) > Date.now()) {
     state.token = saved.token; state.expiresAt = saved.expiresAt;
-  } else GM_deleteValue(storageKey);
+  } else if (!storageWarning) persist(() => platform.deleteValue(storageKey));
+  function updateViewport() {
+    const viewport = window.visualViewport;
+    if (viewport && Number.isFinite(viewport.height) && viewport.height > 0 && host.isConnected !== false) {
+      host.style.setProperty('--nwa-viewport-height', `${viewport.height}px`);
+      host.style.setProperty('--nwa-viewport-top', `${Math.max(0, viewport.offsetTop || 0)}px`);
+    }
+  }
+  updateViewport();
+  window.visualViewport?.addEventListener('resize', updateViewport);
+  window.visualViewport?.addEventListener('scroll', updateViewport);
   root.addEventListener('keydown', event => { if (event.key === 'Escape') toggle(false); });
   root.addEventListener('focusout', () => {
     setTimeout(() => {
@@ -832,6 +877,7 @@ function mountTargetList() {
       void loadTargets(false, false, Boolean(state.player));
     }
   }, 5000);
+  if (storageWarning) message(storageWarning);
   render();
   if (state.token && pageVisible()) void loadTargets();
 }

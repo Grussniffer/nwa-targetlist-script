@@ -4,8 +4,9 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const coreSource = await readFile(new URL('../src/core.js', import.meta.url), 'utf8');
+const platformSource = await readFile(new URL('../src/platform.js', import.meta.url), 'utf8');
 const appSource = await readFile(new URL('../src/app.js', import.meta.url), 'utf8');
-const source = `${coreSource}\n${appSource}`;
+const source = `${coreSource}\n${platformSource}\n${appSource}`;
 // Read the configured address without mounting; all requests below are manual mocks.
 const configSource = appSource.match(/^const CONFIG = .*;$/m)[0];
 const { serviceBase, version: scriptVersion } = vm.runInNewContext(

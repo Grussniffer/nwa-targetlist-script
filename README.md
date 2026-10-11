@@ -29,6 +29,8 @@ On Chrome, enable **Allow User Scripts** in Tampermonkey's extension settings ([
 
 3. Tap **Fetch → Load**, choose **Continue** if permissions appear, and reload Torn inside PDA.
 
+Keep the script enabled on all Torn pages. NWA includes PDA support and remembers your login and settings. Newer PDA versions use the app's script storage, which survives clearing the browser cache; older versions use browser storage. Sign in through NWA's key-use notice as usual.
+
 ## Start
 
 Open Torn and click the green **NWA** button on the right edge. Sign in with your **Limited Torn API key** the first time.

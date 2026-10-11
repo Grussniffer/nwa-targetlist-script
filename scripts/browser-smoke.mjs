@@ -37,6 +37,56 @@ let networkRequests = 0;
 await context.route('**/*', route => { networkRequests++; return route.abort(); });
 const pageErrors = [];
 
+// Model Torn PDA's native bridge and asynchronous script-scoped storage rather
+// than quietly providing Tampermonkey APIs in a mobile-sized browser window.
+function installPdaRuntime() {
+  const sendMockRequest = window.GM_xmlhttpRequest;
+  for (const name of ['GM_xmlhttpRequest', 'GM_getValue', 'GM_setValue', 'GM_deleteValue']) delete window[name];
+  const native = window.__mock.pda = { calls: [], storageCalls: [], wrapperCalls: 0, ready: false };
+  window.__PDA_platformReadyPromise = new Promise(resolve => {
+    window.__resolvePdaPlatform = () => { native.ready = true; resolve(); };
+  });
+  window.flutter_inappwebview = {
+    callHandler(name, ...args) {
+      if (!native.ready) return Promise.reject(new Error('Native bridge used before Torn PDA readiness'));
+      native.calls.push({ name, args: structuredClone(args) });
+      const methods = { PDA_httpGet: 'GET', PDA_httpPost: 'POST', PDA_httpDelete: 'DELETE' };
+      if (!methods[name]) return Promise.reject(new Error(`Unexpected native handler: ${name}`));
+      const [url, headers, data] = args;
+      return new Promise((resolve, reject) => sendMockRequest({
+        method: methods[name], url, headers, data, timeout: 20000,
+        onload: resolve, onerror: () => reject(new Error('Mock native transport failure')),
+        onabort: () => reject(new Error('Mock native transport aborted'))
+      }));
+    }
+  };
+  for (const name of ['PDA_httpGet', 'PDA_httpPost', 'PDA_httpDelete']) {
+    window[name] = (...args) => {
+      native.wrapperCalls++;
+      return window.flutter_inappwebview.callHandler(name, ...args);
+    };
+  }
+  const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+  return {
+    async loadAll() {
+      if (!native.ready) throw new Error('Native storage read before Torn PDA readiness');
+      native.storageCalls.push({ method: 'loadAll' });
+      await tick();
+      if (window.__mock.pdaLoadAllFailure) throw new Error('Mock transient native storage failure');
+      return Object.fromEntries(window.__mock.store);
+    },
+    async set(key, value) {
+      native.storageCalls.push({ method: 'set', key, value: structuredClone(value) });
+      await tick(); window.__mock.store.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      native.storageCalls.push({ method: 'delete', key });
+      await tick(); window.__mock.store.delete(key);
+    }
+  };
+}
+const pdaRuntimeSource = `const PDA_storage = (${installPdaRuntime.toString()})();`;
+
 async function mount(viewport = { width: 1280, height: 960 }, scripts = [source], pageContext = context, beforeMount = null, beforeMountArgument = undefined, mockUrl = null) {
   const page = await pageContext.newPage();
   await page.setViewportSize(viewport);
@@ -161,6 +211,13 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
   });
   if (beforeMount) await page.evaluate(beforeMount, beforeMountArgument);
   for (const script of scripts) await page.addScriptTag({ content: script });
+  // PDA bootstrap deliberately blocks until the explicit readiness signal.
+  if (await page.evaluate(() => Boolean(window.__resolvePdaPlatform))) {
+    assert.equal(await page.evaluate(() => window.__mock.pda.calls.length), 0, 'no native requests before platform readiness');
+    assert.equal(await page.evaluate(() => window.__mock.pda.storageCalls.length), 0, 'no native storage calls before platform readiness');
+    await page.evaluate(() => window.__resolvePdaPlatform());
+  }
+  if (scripts.includes(source)) await wait(page, () => Boolean(window.__targetlistShadow?.querySelector('.launcher')));
   return page;
 }
 
@@ -316,7 +373,34 @@ async function clickNotice(page, touch = false) {
   else await page.mouse.click(x, y);
 }
 
+async function tapShadow(page, selector) {
+  const point = await page.evaluate(selector => {
+    const node = window.__targetlistShadow.querySelector(selector);
+    if (!node) throw new Error(`Missing touch control: ${selector}`);
+    const rect = node.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }, selector);
+  await page.touchscreen.tap(point.x, point.y);
+}
+
 try {
+  const early = await mount(undefined, [], context);
+  await early.evaluate(() => {
+    window.__earlyBody = document.body;
+    document.body.remove();
+  });
+  await early.addScriptTag({ content: source });
+  assert.equal(await early.evaluate(() => document.getElementById('torn-targetlist-host')), null);
+  await early.evaluate(() => {
+    document.documentElement.append(window.__earlyBody);
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+  });
+  await wait(early, () => Boolean(window.__targetlistShadow?.querySelector('.launcher')));
+  await early.addScriptTag({ content: source });
+  assert.equal(await early.evaluate(() => document.querySelectorAll('#torn-targetlist-host').length), 1);
+  await early.close();
+  console.log('PASS early injection waits for the Torn document body and repeated execution mounts once');
+
   const legacyFirst = await mount(undefined, [legacySource]);
   assert.equal(await shadow(legacyFirst, '.launcher', 'text'), '◎ Target list');
   await legacyFirst.addScriptTag({ content: source });
@@ -1123,6 +1207,167 @@ try {
   await wait(attackNotice, () => !document.getElementById('nwa-target-page-notice'));
   await attackNotice.close();
   console.log('PASS direct modern attack route, plain-text untrusted reason, and removal after sign out');
+
+  const pdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await pdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
+  try {
+    const pda = await mount({ width: 390, height: 844 }, [pdaRuntimeSource, source], pdaContext, () => {
+      const content = document.createElement('main'); content.id = 'content-wrapper';
+      content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
+      content.innerHTML = '<h1>Willow [101]</h1><p>Mock Torn PDA player profile.</p>';
+      document.body.append(content);
+      window.__mock.reservations = { supported: true, leaseMs: 60000 };
+    }, undefined, 'https://www.torn.com/profiles.php?XID=101');
+    assert.equal(await pda.evaluate(() => typeof window.GM_xmlhttpRequest), 'undefined');
+    assert.equal(await pda.evaluate(() => typeof window.GM_getValue), 'undefined');
+    assert.equal(await pda.evaluate(() => typeof window.PDA_storage), 'undefined', 'native storage is a lexical binding, not a window property');
+    assert.equal(await pda.evaluate(() => matchMedia('(pointer:coarse)').matches), true);
+    await tapShadow(pda, '.settings-toggle');
+    for (const width of [390, 320]) {
+      await pda.setViewportSize({ width, height: 844 });
+      const geometry = await pda.evaluate(() => {
+        const root = window.__targetlistShadow;
+        const panel = root.querySelector('.panel').getBoundingClientRect();
+        const input = root.querySelector('input[type=password]');
+        return { left: panel.left, right: panel.right, bottom: panel.bottom, top: panel.top,
+          fontSize: getComputedStyle(input).fontSize, width: innerWidth,
+          overflow: root.querySelector('.scroll').scrollWidth > root.querySelector('.scroll').clientWidth + 1 };
+      });
+      assert(geometry.left >= 0 && geometry.right <= width && geometry.bottom <= 844, JSON.stringify(geometry));
+      assert.equal(geometry.fontSize, '16px', 'mobile form controls avoid iOS input zoom');
+      assert.equal(geometry.overflow, false);
+      await pda.screenshot({ path: path.join(artifacts, `browser-pda-login-${width}.png`), fullPage: true });
+    }
+    await pda.evaluate(() => {
+      Object.defineProperties(window.visualViewport, {
+        height: { configurable: true, writable: true, value: 360 },
+        offsetTop: { configurable: true, writable: true, value: 24 }
+      });
+      window.visualViewport.dispatchEvent(new Event('resize'));
+    });
+    await pda.waitForTimeout(30);
+    const keyboardGeometry = await pda.evaluate(() => {
+      const root = window.__targetlistShadow, panel = root.querySelector('.panel');
+      const rect = panel.getBoundingClientRect();
+      root.querySelector('button[type=submit]').scrollIntoView({ block: 'nearest' });
+      const submit = root.querySelector('button[type=submit]').getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, height: rect.height, submitTop: submit.top, submitBottom: submit.bottom };
+    });
+    assert(keyboardGeometry.top >= 24 && keyboardGeometry.bottom <= 384 && keyboardGeometry.height <= 360, JSON.stringify(keyboardGeometry));
+    assert(keyboardGeometry.submitTop >= keyboardGeometry.top && keyboardGeometry.submitBottom <= keyboardGeometry.bottom, JSON.stringify(keyboardGeometry));
+    await pda.screenshot({ path: path.join(artifacts, 'browser-pda-keyboard-320.png'), fullPage: true });
+    await pda.evaluate(() => {
+      window.visualViewport.height = 844; window.visualViewport.offsetTop = 0;
+      window.visualViewport.dispatchEvent(new Event('resize'));
+    });
+    await shadow(pda, 'input[type=password]', 'fill', 'MockLimitedKey01');
+    await shadow(pda, 'form.login', 'submit');
+    await wait(pda, () => window.__targetlistShadow.querySelectorAll('.card').length === 4);
+    await wait(pda, () => window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`));
+    await shadow(pda, '[aria-label="Minimum target stats as percent of your total"]', 'select', '15');
+    await shadow(pda, '[aria-label="Maximum target stats as percent of your total"]', 'select', '55');
+    await wait(pda, () => {
+      const stored = window.__mock.store.get(`targetlist.preferences.${window.__mock.serviceOrigin}`);
+      return stored?.minRatio === 0.15 && stored?.maxRatio === 0.55;
+    });
+    await openSuggestions(pda);
+    await fillSuggestion(pda, { comment: '  \n ' });
+    const beforeBlankPda = await pda.evaluate(() => window.__mock.requests.length);
+    await submitSuggestion(pda);
+    assert.equal(await pda.evaluate(() => window.__mock.requests.length), beforeBlankPda);
+    assert.match(await shadow(pda, '.error', 'text'), /Add a reason/);
+    for (const type of ['player', 'faction']) {
+      await fillSuggestion(pda, { type, targetId: type === 'player' ? '22001' : '33001', comment: '  Mock PDA target reason.  ' });
+      await submitSuggestion(pda);
+      await wait(pda, () => Boolean(window.__targetlistShadow.querySelector('.success')) && !window.__targetlistShadow.querySelector('.suggestionform button').disabled);
+      const post = await pda.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions').at(-1));
+      assert.deepEqual(JSON.parse(post.data), { type, targetId: type === 'player' ? 22001 : 33001, comment: 'Mock PDA target reason.' });
+    }
+    await clickButton(pda, 'Targets');
+    await cardAction(pda, 101);
+    await wait(pda, () => window.__targetlistShadow.querySelector('.attack')?.tagName === 'BUTTON');
+    await shadow(pda, '.header .icon', 'click');
+    await wait(pda, () => Boolean(document.getElementById('nwa-target-page-notice')));
+    assertCompactNotice(await noticeGeometry(pda));
+    await clickNotice(pda, true);
+    assert.equal(await pda.evaluate(() => window.__playerNoticeShadow.querySelector('details').open), true);
+    await clickNotice(pda, true);
+    const persistedPda = await pda.evaluate(() => [...window.__mock.store]);
+    const pdaAttackUrl = 'https://www.torn.com/page.php?sid=attack&user2ID=101';
+    let pdaNavigation;
+    await pda.route(pdaAttackUrl, async route => {
+      pdaNavigation = route.request().url();
+      await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><h1>Mock PDA attack destination</h1>' });
+    });
+    await pda.evaluate(() => { window.__mock.holds.push('/api/targets/101/reservation'); });
+    await tapShadow(pda, '.launcher');
+    await wait(pda, () => window.__mock.pending.length === 1);
+    assert.equal(pdaNavigation, undefined, 'PDA waits for its shared reservation before navigating');
+    const nativeCalls = await pda.evaluate(() => structuredClone(window.__mock.pda.calls));
+    assert.equal(nativeCalls.at(-1).name, 'PDA_httpPost');
+    assert.equal(new URL(nativeCalls.at(-1).args[0]).pathname, '/api/targets/101/reservation');
+    assert(nativeCalls.some(call => call.name === 'PDA_httpGet' && new URL(call.args[0]).pathname === '/api/targets/101/status'));
+    assert.equal(await pda.evaluate(() => window.__mock.pda.wrapperCalls), 0, 'native bridge is used instead of the standard PDA wrapper');
+    const pdaNavigated = pda.waitForURL(pdaAttackUrl, { timeout: 5000 });
+    await pda.evaluate(() => window.__mock.release('/api/targets/101/reservation'));
+    await pdaNavigated;
+    assert.equal(pdaNavigation, pdaAttackUrl);
+    await pda.close();
+    console.log('PASS PDA-only native GET/POST, async lexical storage, readiness, 390/320px touch login, keyboard height, stat settings, player/faction reasons, status, reservation and attack navigation');
+
+    const restoredPda = await mount({ width: 320, height: 844 }, [pdaRuntimeSource, source], pdaContext, entries => {
+      for (const [key, value] of entries) window.__mock.store.set(key, value);
+    }, persistedPda);
+    await wait(restoredPda, () => window.__mock.requests.some(request => request.path === '/api/targets'));
+    await tapShadow(restoredPda, '.settings-toggle');
+    await wait(restoredPda, () => window.__targetlistShadow.querySelectorAll('.card').length === 4);
+    assert.equal(await restoredPda.evaluate(() => window.__mock.requests.some(request => request.path === '/api/session' && request.method === 'POST')), false, 'a new PDA document restores its saved token without resubmitting the key');
+    const restoredFeed = await restoredPda.evaluate(() => window.__mock.requests.find(request => request.path === '/api/targets'));
+    assert.equal(restoredFeed.headers.Authorization, 'Bearer mock-session-token');
+    assert.equal(restoredFeed.data, undefined);
+    assert.equal(await restoredPda.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Minimum target stats as percent of your total"]').value), '15');
+    assert.equal(await restoredPda.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Maximum target stats as percent of your total"]').value), '55');
+    assert.equal(JSON.stringify(persistedPda).includes('MockLimitedKey01'), false, 'native PDA storage contains no Torn API key');
+    await signOut(restoredPda);
+    await wait(restoredPda, () => !window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`));
+    const logoutCall = await restoredPda.evaluate(() => window.__mock.pda.calls.find(call => call.name === 'PDA_httpDelete'));
+    assert(logoutCall, 'PDA native DELETE withdraws the saved backend key');
+    assert.equal(new URL(logoutCall.args[0]).pathname, '/api/session');
+    assert.equal(logoutCall.args[1].Authorization, 'Bearer mock-session-token');
+    assert.equal(await restoredPda.evaluate(() => window.__mock.pda.wrapperCalls), 0);
+    assert.equal(await restoredPda.evaluate(() => window.__mock.pda.storageCalls.some(call => call.method === 'delete' && call.key.startsWith('targetlist.session.'))), true);
+    await restoredPda.close();
+    console.log('PASS a fresh PDA document restores its durable token and min/max settings without an API key; native DELETE and async storage deletion complete sign out');
+
+    const unavailablePdaStore = await mount({ width: 320, height: 844 }, [pdaRuntimeSource, source], pdaContext, entries => {
+      for (const [key, value] of entries) window.__mock.store.set(key, value);
+      window.__mock.pdaLoadAllFailure = true;
+    }, persistedPda);
+    await tapShadow(unavailablePdaStore, '.settings-toggle');
+    assert.match(await shadow(unavailablePdaStore, '.error', 'text'), /could not access saved data/);
+    assert.equal(await unavailablePdaStore.evaluate(() => {
+      const root = window.__targetlistShadow;
+      return Boolean(root.querySelector('form.login')) && !root.querySelector('input[type=password]').disabled
+        && !root.querySelector('.settings-toggle').disabled && !root.querySelector('.error').hidden;
+    }), true, 'a transient storage read failure leaves the NWA controls usable with a clear error');
+    await unavailablePdaStore.waitForTimeout(30);
+    assert.equal(await unavailablePdaStore.evaluate(() => window.__mock.pda.storageCalls.some(call => call.method === 'delete')), false, 'unread native data must never be treated as an expired token');
+    assert.equal(await unavailablePdaStore.evaluate(() => window.__mock.pda.calls.some(call => call.name === 'PDA_httpDelete')), false);
+    const retainedPda = await unavailablePdaStore.evaluate(() => [...window.__mock.store]);
+    assert.deepEqual(retainedPda, persistedPda, 'token and preferences survive transient native storage failure');
+    await unavailablePdaStore.close();
+    const recoveredPdaStore = await mount({ width: 320, height: 844 }, [pdaRuntimeSource, source], pdaContext, entries => {
+      for (const [key, value] of entries) window.__mock.store.set(key, value);
+    }, retainedPda);
+    await wait(recoveredPdaStore, () => window.__mock.requests.some(request => request.path === '/api/targets'));
+    await tapShadow(recoveredPdaStore, '.settings-toggle');
+    await wait(recoveredPdaStore, () => window.__targetlistShadow.querySelectorAll('.card').length === 4);
+    assert.equal(await recoveredPdaStore.evaluate(() => window.__mock.requests.some(request => request.path === '/api/session' && request.method === 'POST')), false);
+    assert.equal(await recoveredPdaStore.evaluate(() => window.__mock.requests.find(request => request.path === '/api/targets').headers.Authorization), 'Bearer mock-session-token');
+    assert.equal(await recoveredPdaStore.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Minimum target stats as percent of your total"]').value), '15');
+    await recoveredPdaStore.close();
+    console.log('PASS transient PDA storage failure keeps the saved token and preferences; a fresh successful document restores without entering the key again');
+  } finally { await pdaContext.close(); }
 
   assert.equal(networkRequests, 0, 'Browser attempted external network access');
   assert.deepEqual(pageErrors, [], 'Unhandled browser errors');
