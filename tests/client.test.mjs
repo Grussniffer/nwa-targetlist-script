@@ -77,6 +77,14 @@ function descendants(element) {
 function textContent(element) {
   return [element.textContent, ...element.children.map(child => typeof child === 'object' ? textContent(child) : String(child))].join(' ');
 }
+function visible(element) {
+  for (let node = element; node; node = node.parentNode) {
+    if (node.hidden) return false;
+    const parent = node.parentNode;
+    if (parent?.tagName === 'DETAILS' && !parent.open && node.tagName !== 'SUMMARY') return false;
+  }
+  return true;
+}
 async function flush() { for (let index = 0; index < 12; index++) await Promise.resolve(); }
 
 function fixture(saved = null, preferences = null, existingHost = null, initialNow = NOW, visibility = 'visible', clipboard = {}) {
@@ -588,6 +596,38 @@ test('repeated NWA clicks coalesce while a target check is pending', async () =>
   assert.equal(app.navigations.length, 1);
 });
 
+test('the panel finder shares the dock reservation flow and coalesces clicks from both controls', async () => {
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+  const before = app.requests.length;
+  const find = app.button('Find target');
+  find.emit('click'); find.emit('click'); app.button('NWA').emit('click');
+  assert.equal(app.requests.length, before + 1, 'one shared finder runs across both controls');
+  assert.equal(find.disabled, true);
+  assert.equal(find.attributes.get('aria-busy'), 'true');
+  assert.equal(find.textContent, 'Finding…');
+  assert.deepEqual(app.navigations, [], 'a fresh status does not skip the reservation');
+  const feedback = app.find(element => element.className === 'finder-status');
+  assert.equal(feedback.attributes.get('role'), 'status');
+  assert.equal(visible(feedback), true);
+  assert.match(feedback.textContent, /Reserving Target Player/);
+  assert.equal(app.find(element => element.className === 'quick-notice').hidden, true);
+  await completeLease(app);
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  assert.equal(find.disabled, false);
+  assert.equal(find.attributes.get('aria-busy'), 'false');
+  assert.equal(find.textContent, 'Find target');
+});
+
+test('closed-panel finder progress stays visible beside the NWA dock', async () => {
+  const app = fixture(); await app.signIn(); app.closePanel();
+  app.button('NWA').emit('click');
+  const notice = app.find(element => element.className === 'quick-notice');
+  assert.equal(visible(notice), true);
+  assert.match(notice.textContent, /Reserving Target Player/);
+  assert.equal(app.find(element => element.className === 'finder-status').hidden, true);
+  await completeLease(app);
+});
+
 test('NWA stops on rate limits and service failures that are not isolated target lookups', async () => {
   for (const outcome of ['rate-limit', 'upstream']) {
     const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }]);
@@ -597,7 +637,10 @@ test('NWA stops on rate limits and service failures that are not isolated target
     assert.equal(app.requests.length, before + 1, outcome);
     assert.deepEqual(app.navigations, [], outcome);
     assert.equal(app.storage.get(app.storageKey).token, SESSION, outcome);
-    assert.equal(app.find(element => element.className === 'quick-notice').hidden, false, 'failure is shown beside NWA');
+    const feedback = app.find(element => element.className === 'finder-status');
+    assert.equal(visible(feedback), true, 'failure is shown in the open target panel');
+    assert.equal(feedback.textContent, 'Try again later.');
+    assert.equal(app.find(element => element.className === 'quick-notice').hidden, true, 'the dock does not duplicate open-panel feedback');
     assert.equal(app.button('NWA').disabled, false);
   }
 });
@@ -873,6 +916,128 @@ test('pool diagnostics distinguish old estimates, unknown stats and ready matche
   assert.match(app.text(), /2 in stat range · 1 estimates too old or undated · 1 stats unknown · 1 ready now/);
 });
 
+test('target rows come before collapsed preferences while search, stat limits and finder stay visible', async () => {
+  const app = fixture(); await app.signIn();
+  const preferences = app.find(element => element.tagName === 'DETAILS' && element.className === 'preferences');
+  const list = app.find(element => element.className === 'cards');
+  assert.equal(preferences.open, false);
+  assert.equal(preferences.children[0].tagName, 'SUMMARY');
+  assert.equal(preferences.children[0].textContent, 'Preferences & account');
+  const nodes = descendants(app.root);
+  assert.ok(nodes.indexOf(list) < nodes.indexOf(preferences), 'the list precedes secondary settings');
+  for (const label of ['Search targets', 'Minimum target stats as percent of your total', 'Maximum target stats as percent of your total']) {
+    const input = app.find(element => element.attributes.get('aria-label') === label);
+    assert.equal(visible(input), true, label);
+    assert.ok(nodes.indexOf(input) < nodes.indexOf(list), label);
+  }
+  assert.equal(visible(app.button('Find target')), true);
+  const secondary = [
+    app.find(element => element.className === 'statgrid'),
+    app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days'),
+    app.find(element => element.attributes.get('aria-label') === 'Export scope'),
+    app.button('Export CSV'), app.button('Export Markdown'), app.button('Sign out and remove key'),
+  ];
+  for (const control of secondary) {
+    assert.ok(descendants(preferences).includes(control), 'secondary control belongs to preferences');
+    assert.equal(visible(control), false, 'secondary control starts collapsed');
+  }
+  app.find(element => element.attributes.get('aria-label') === 'Open preferences and account').emit('click');
+  assert.equal(preferences.open, true, 'the header control opens preferences without scrolling through target rows');
+  assert.equal(app.root.activeElement, preferences.children[0], 'keyboard focus moves to the preferences summary');
+  preferences.emit('toggle');
+  for (const control of secondary) assert.equal(visible(control), true);
+  app.button('Suggestions').emit('click');
+  app.button('Targets').emit('click');
+  assert.equal(app.find(element => element.className === 'preferences').open, true, 'expanded preferences survive switching sections');
+});
+
+test('the compact ready count follows visible filters and excludes reserved or ineligible targets', async () => {
+  const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+  const app = fixture(); await app.signIn([
+    { ...ready, name: 'Alpha' }, { ...ready, id: target.id + 1, name: 'Bravo' },
+    { ...ready, id: target.id + 2, name: 'Reserved', reserved: true },
+    { ...ready, id: target.id + 3, name: 'Too strong', estimatedStats: 900_000 },
+  ]);
+  const summary = () => app.find(element => element.className === 'pool-details').children[0].textContent;
+  assert.equal(summary(), '2 ready · 4 shown');
+  const search = app.find(element => element.attributes.get('aria-label') === 'Search targets');
+  search.value = 'Alpha'; search.emit('input'); assert.equal(summary(), '1 ready · 1 shown');
+  search.value = 'Reserved'; search.emit('input'); assert.equal(summary(), '0 ready · 1 shown');
+  search.value = 'No player matches'; search.emit('input'); assert.equal(summary(), '0 ready · 0 shown');
+  assert.match(app.find(element => element.className === 'empty').textContent, /No targets match these filters/);
+});
+
+test('ready counts require coordination capability and a current authorized pool', async () => {
+  for (const supported of [false, true]) {
+    const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW + 5000).toISOString() }],
+      { reservations: { ...coordination, supported } });
+    const summary = () => app.find(element => element.className === 'pool-details').children[0].textContent;
+    assert.equal(summary(), `${supported ? 1 : 0} ready · 1 shown`);
+    if (supported) {
+      // The status remains within 30 seconds; only the authorized pool expires.
+      app.setNow(NOW + 30_000);
+      app.find(element => element.attributes.get('aria-label') === 'Search targets').emit('input');
+      assert.equal(summary(), '0 ready · 1 shown');
+      assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+    }
+  }
+});
+
+test('compact target rows distinguish own leases, other reservations, stale statuses and estimate problems', async () => {
+  const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+  const lease = new Date(NOW + 120_000).toISOString();
+  const app = fixture(); await app.signIn([
+    { ...ready, reservationExpiresAt: lease },
+    { ...ready, id: target.id + 1, reserved: true, reservationExpiresAt: lease },
+    { ...ready, id: target.id + 2, checkedAt: new Date(NOW - 30_000).toISOString() },
+    { ...ready, id: target.id + 3, estimateUpdatedAt: NOW / 1000 - 8 * 86400 },
+    { ...ready, id: target.id + 4, estimatedStats: null, estimateUpdatedAt: null },
+    { ...ready, id: target.id + 5, status: { state: 'Hospital', until: NOW / 1000 + 600 } },
+  ]);
+  const card = offset => app.find(element => element.attributes.get('data-target-id') === String(target.id + offset));
+  assert.match(textContent(card(0)), /Reserved by you.*Held until/s);
+  assert.equal(descendants(card(0)).some(element => element.className === 'attack'), true);
+  assert.match(textContent(card(1)), /Reserved by another (?:NWA )?member.*Held until/s);
+  assert.doesNotMatch(textContent(card(1)), /Reserved by you/);
+  assert.match(textContent(card(2)), /Status needs checking.*Last known: Okay/s);
+  assert.doesNotMatch(textContent(card(2)), /\bReady\b/);
+  assert.match(textContent(card(3)), /Estimate too old \/ undated/);
+  assert.match(textContent(card(4)), /Comparison unknown.*Stats unknown/s);
+  assert.match(textContent(card(5)), /Hospital.*Until/s);
+  for (const offset of [1, 2, 3, 4, 5]) {
+    assert.equal(descendants(card(offset)).some(element => element.className === 'attack'), false, `unavailable target ${offset}`);
+    assert.equal(descendants(card(offset)).some(element => element.textContent === 'Check status'), true);
+  }
+});
+
+test('hospital status and release time stay visible alongside active leases, including stale own checks', async () => {
+  const leaseExpiresAt = NOW + 120_000;
+  const hospitalReleaseAt = NOW + 600_000;
+  const leased = { ...target, reservationExpiresAt: new Date(leaseExpiresAt).toISOString(),
+    status: { state: 'Hospital', until: hospitalReleaseAt / 1000 }, checkedAt: new Date(NOW).toISOString() };
+  const app = fixture(); await app.signIn([
+    leased,
+    { ...leased, id: target.id + 1, reserved: true },
+    { ...leased, id: target.id + 2, checkedAt: new Date(NOW - 30_000).toISOString() },
+  ]);
+  const row = offset => app.find(element => element.attributes.get('data-target-id') === String(target.id + offset));
+  const status = offset => descendants(row(offset)).find(element => element.className === 'availability');
+  assert.equal(status(0).children[0].textContent, 'Hospital', 'a live hospital state takes priority over your lease');
+  assert.match(textContent(status(0)), /Reserved by you/);
+  assert.equal(status(1).children[0].textContent, 'Reserved by another NWA member');
+  assert.match(textContent(status(1)), /Hospital/, 'another member\'s reservation does not hide the hospital state');
+  assert.match(textContent(status(2)), /Reserved by you.*Status needs checking.*Last known: Hospital/s,
+    'an owned lease does not imply a stale status is available');
+  for (const offset of [0, 1, 2]) {
+    const labels = descendants(status(offset)).map(element => element.textContent);
+    assert.ok(labels.includes(`Held until ${new Date(leaseExpiresAt).toLocaleTimeString()}`), 'show the reservation expiry');
+    assert.ok(labels.includes(`Until ${new Date(hospitalReleaseAt).toLocaleTimeString()}`), 'show the distinct hospital release time');
+    assert.equal(descendants(row(offset)).some(element => element.className === 'attack'), false);
+    assert.equal(descendants(row(offset)).some(element => element.textContent === 'Check status'), true);
+    assert.doesNotMatch(textContent(status(offset)), /\bReady\b/);
+  }
+});
+
 test('target cards display and search approved reasons rather than legacy notes', async () => {
   const app = fixture(); await app.signIn([{ ...target, reason: '<img> Alliance attacks', notes: 'Legacy notes only' }]);
   assert.match(app.text(), /Reason: <img> Alliance attacks/);
@@ -921,7 +1086,9 @@ test('NWA bounds unavailable-target checks to five per click', async () => {
   assert.equal(app.requests.length, before + 5);
   assert.deepEqual(app.navigations, []);
   assert.equal(app.button('NWA').disabled, false);
-  assert.equal(app.find(element => element.className === 'quick-notice').hidden, false);
+  const feedback = app.find(element => element.className === 'finder-status');
+  assert.equal(visible(feedback), true);
+  assert.match(feedback.textContent, /No available target in the first 5 matches/);
   app.button('NWA').emit('click');
   assert.equal(app.requests.length, before + 6, 'the next click advances beyond the recently unavailable first five');
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${candidates[5].id}/reservation`);
@@ -1278,7 +1445,9 @@ test('NWA explains when the pool has no fresh target within the stat limit', asy
   app.response(app.requests.at(-1), { player, targets: [tooStrong], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.length, before + 1, 'no-match recovery refreshes the pool only once per click');
   assert.deepEqual(app.navigations, []);
-  assert.equal(app.find(element => element.className === 'quick-notice').hidden, false);
+  const feedback = app.find(element => element.className === 'finder-status');
+  assert.equal(visible(feedback), true);
+  assert.match(feedback.textContent, /No targets match/);
   assert.match(app.text(), /no.*match|no.*target.*limit/i);
 });
 

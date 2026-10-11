@@ -248,6 +248,11 @@ async function shadow(page, selector, operation, argument) {
   return page.evaluate(({ selector, operation, argument }) => {
     const node = window.__targetlistShadow.querySelector(selector);
     if (!node) throw new Error(`Missing UI element: ${selector}`);
+    if (operation !== 'text') {
+      for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        if (ancestor.tagName === 'DETAILS' && !ancestor.open) ancestor.querySelector('summary').click();
+      }
+    }
     if (operation === 'click') node.click();
     if (operation === 'fill') { node.value = argument; node.dispatchEvent(new Event('input', { bubbles: true })); }
     if (operation === 'select') { node.value = argument; node.dispatchEvent(new Event('change', { bubbles: true })); }
@@ -363,7 +368,7 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
     `${mode}: unchanged and single-target deltas are under one percent of the full fixture payload`);
   assert.equal(await cardSnapshot(page, 102), null);
   assert.match((await cardSnapshot(page, 101)).text, /Updated approved delta reason/);
-  await shadow(page, '.header .icon', 'click');
+  await shadow(page, '[aria-label="Close NWA settings"]', 'click');
   await shadow(page, '.settings-toggle', 'click');
   assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('input[type=search]') === window.__performanceNodes.search), true,
     `${mode}: closing and reopening the same view preserves controls`);
@@ -384,7 +389,7 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
     window.__draftNodes = { comment, type: root.querySelector('[aria-label="Suggestion type"]'), id: root.querySelector('[aria-label="Player or faction ID"]') };
   });
   await refreshMockFeed(page);
-  await shadow(page, '.header .icon', 'click');
+  await shadow(page, '[aria-label="Close NWA settings"]', 'click');
   await shadow(page, '.settings-toggle', 'click');
   assert.deepEqual(await page.evaluate(() => {
     const root = window.__targetlistShadow, nodes = window.__draftNodes;
@@ -462,13 +467,16 @@ async function cardSnapshot(page, id) {
   }, id);
 }
 async function signOut(page) {
-  await shadow(page, '.profile button', 'click');
+  await shadow(page, '[data-action="signout"]', 'click');
   await wait(page, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
 }
 async function clickButton(page, text) {
   await page.evaluate(text => {
     const node = [...window.__targetlistShadow.querySelectorAll('button')].find(button => button.textContent === text);
     if (!node) throw new Error(`Missing button: ${text}`);
+    for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'DETAILS' && !ancestor.open) ancestor.querySelector('summary').click();
+    }
     node.click();
   }, text);
 }
@@ -587,6 +595,171 @@ async function checkExports(pageContext, scripts, mode) {
   assert.equal(await page.evaluate(() => Boolean(window.__targetlistShadow.querySelector('[aria-label="Exported target list"]'))), false);
   await page.close();
   console.log(`PASS ${mode} local all/shown CSV and Markdown snapshots, download events/content and MIME types, Unicode/reasons, clipboard fallback, mobile bounds and logout cleanup`);
+}
+
+async function checkProfessionalLayout(pageContext, scripts, mode) {
+  const viewport = mode === 'PDA' ? { width: 390, height: 844 } : { width: 1280, height: 960 };
+  const page = await mount(viewport, scripts, pageContext, () => {
+    const now = Date.now(), targets = window.__mock.targets;
+    targets[0].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
+    targets[0].checkedAt = new Date(now).toISOString();
+    targets[1].status = { state: 'Hospital', description: 'In hospital (mock)', until: Math.floor(now / 1000) + 600 };
+    targets[1].checkedAt = new Date(now).toISOString();
+    targets[3].estimateUpdatedAt = Math.floor(now / 1000) - 3600;
+    targets[3].status = { state: 'Okay', description: 'Okay (cached mock)', until: null };
+    targets[3].checkedAt = new Date(now).toISOString();
+    targets[3].reserved = true;
+    targets[3].reservationExpiresAt = new Date(now + 120000).toISOString();
+  });
+  await login(page);
+  const initial = await page.evaluate(() => {
+    const root = window.__targetlistShadow, preferences = root.querySelector('details.preferences');
+    const search = root.querySelector('input[type=search]'), first = root.querySelector('.card');
+    const panel = root.querySelector('.panel').getBoundingClientRect(), row = first.getBoundingClientRect();
+    window.__professionalFirstCard = first;
+    return { preferences: Boolean(preferences), collapsed: !preferences?.open,
+      summary: preferences?.querySelector('summary').textContent,
+      find: root.querySelector('.find-target')?.textContent,
+      searchPrimary: !preferences?.contains(search),
+      minimumPrimary: !preferences?.contains(root.querySelector('[aria-label="Minimum target stats as percent of your total"]')),
+      maximumPrimary: !preferences?.contains(root.querySelector('[aria-label="Maximum target stats as percent of your total"]')),
+      firstRowOffset: row.top - panel.top, firstRowBottom: row.bottom, panelBottom: panel.bottom };
+  });
+  assert.deepEqual({ preferences: initial.preferences, collapsed: initial.collapsed, summary: initial.summary,
+    find: initial.find, searchPrimary: initial.searchPrimary, minimumPrimary: initial.minimumPrimary, maximumPrimary: initial.maximumPrimary },
+  { preferences: true, collapsed: true, summary: 'Preferences & account', find: 'Find target', searchPrimary: true,
+    minimumPrimary: true, maximumPrimary: true }, `${mode}: primary controls stay above targets and secondary controls start collapsed`);
+  assert(initial.firstRowOffset < (mode === 'PDA' ? 410 : 340),
+    `${mode}: targets appear without a large settings block above them: ${JSON.stringify(initial)}`);
+  assert(initial.firstRowBottom < initial.panelBottom, `${mode}: the first complete target is visible on opening`);
+  assert.match(await page.evaluate(() => window.__targetlistShadow.querySelector('.card .name').textContent), /Willow \[101\]/,
+    `${mode}: ready targets appear before reserved targets`);
+  assert.match((await cardSnapshot(page, 104)).text, /Reserved|reserved/);
+  assert.equal((await cardSnapshot(page, 104)).attack, null, 'reserved targets never expose an attack action');
+
+  await shadow(page, '[aria-label="Open preferences and account"]', 'click');
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow, preferences = root.querySelector('details.preferences');
+    return preferences.open && root.activeElement === preferences.querySelector('summary');
+  }), true, `${mode}: header options open preferences and move focus to their summary`);
+  await page.keyboard.press('Space');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences').open), false);
+
+  await page.evaluate(() => {
+    const summary = window.__targetlistShadow.querySelector('details.preferences > summary');
+    summary.scrollIntoView({ block: 'nearest' }); summary.focus();
+  });
+  await page.keyboard.press('Enter');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences').open), true,
+    `${mode}: preferences open using the keyboard`);
+  const expanded = await page.evaluate(() => {
+    const root = window.__targetlistShadow, preferences = root.querySelector('details.preferences');
+    const age = root.querySelector('[aria-label="Maximum estimate age in days"]');
+    return { ageVisible: age.getClientRects().length > 0,
+      ageSecondary: preferences.contains(age), statsSecondary: preferences.contains(root.querySelector('.statgrid')),
+      exportSecondary: preferences.contains(root.querySelector('[aria-label="Export scope"]')),
+      accountSecondary: preferences.contains(root.querySelector('[data-action="signout"]')),
+      firstCardPreserved: root.querySelector('.card') === window.__professionalFirstCard };
+  });
+  assert.deepEqual(expanded, { ageVisible: true, ageSecondary: true, statsSecondary: true,
+    exportSecondary: true, accountSecondary: true, firstCardPreserved: true },
+  `${mode}: secondary tools reveal without rebuilding targets`);
+  await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences > summary').focus());
+  await page.keyboard.press('Space');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences').open), false,
+    `${mode}: preferences close using the keyboard`);
+
+  const widths = mode === 'PDA' ? [390, 320] : [1280];
+  for (const width of widths) {
+    await page.setViewportSize({ width, height: viewport.height });
+    await page.evaluate(() => {
+      window.__targetlistShadow.activeElement?.blur();
+      window.__targetlistShadow.querySelector('.scroll').scrollTop = 0;
+    });
+    const geometry = await page.evaluate(() => {
+      const root = window.__targetlistShadow, panel = root.querySelector('.panel').getBoundingClientRect();
+      const scroll = root.querySelector('.scroll'), first = root.querySelector('.card').getBoundingClientRect();
+      const find = root.querySelector('.find-target'), close = root.querySelector('[aria-label="Close NWA settings"]');
+      const controls = [...root.querySelectorAll('input[type=search], .controls input')]
+        .filter(node => node.checkVisibility()).map(node => ({ fontSize: getComputedStyle(node).fontSize,
+          left: node.getBoundingClientRect().left, right: node.getBoundingClientRect().right }));
+      return { left: panel.left, right: panel.right, width: innerWidth, panelWidth: panel.width,
+        documentWidth: document.documentElement.scrollWidth, overflow: scroll.scrollWidth > scroll.clientWidth + 1,
+        firstRowTop: first.top, firstRowBottom: first.bottom, panelBottom: panel.bottom,
+        findHeight: find.getBoundingClientRect().height, closeHeight: close.getBoundingClientRect().height,
+        rowActionHeights: [...root.querySelector('.card').querySelectorAll('.actions button')].map(node => node.getBoundingClientRect().height),
+        controls };
+    });
+    assert(geometry.left >= 0 && geometry.right <= width && geometry.documentWidth <= width && !geometry.overflow,
+      `${mode} ${width}px: layout stays inside the viewport: ${JSON.stringify(geometry)}`);
+    assert(geometry.firstRowBottom <= geometry.panelBottom,
+      `${mode} ${width}px: a full target is visible before scrolling: ${JSON.stringify(geometry)}`);
+    if (mode === 'PDA') {
+      assert(geometry.panelWidth >= width - 24, `PDA ${width}px: open panel uses nearly the full screen`);
+      assert(geometry.findHeight >= 44 && geometry.closeHeight >= 44 && geometry.rowActionHeights.every(height => height >= 44),
+        `PDA ${width}px: primary and row actions have comfortable touch targets: ${JSON.stringify(geometry)}`);
+      assert(geometry.controls.every(control => control.fontSize === '16px' && control.left >= geometry.left && control.right <= geometry.right),
+        `PDA ${width}px: editable controls avoid focus zoom and clipping: ${JSON.stringify(geometry)}`);
+    }
+    await page.screenshot({ path: path.join(artifacts, `browser-professional-${mode === 'PDA' ? `pda-${width}` : 'desktop'}.png`), fullPage: true });
+  }
+
+  await page.evaluate(() => {
+    window.__mock.holds.push('/api/targets/101/reservation');
+    window.__targetlistShadow.querySelector('.find-target').scrollIntoView({ block: 'nearest' });
+  });
+  if (mode === 'PDA') await tapShadow(page, '.find-target');
+  else await shadow(page, '.find-target', 'click');
+  await wait(page, () => window.__mock.pending.length === 1);
+  const selection = await page.evaluate(() => ({ method: window.__mock.requests.at(-1).method,
+    path: window.__mock.requests.at(-1).path, panelCards: window.__targetlistShadow.querySelectorAll('.card').length }));
+  assert.equal(selection.method, 'POST');
+  assert.equal(selection.path, '/api/targets/101/reservation', `${mode}: the primary finder uses the shared reservation flow`);
+  await page.close();
+  console.log(`PASS ${mode} compact target-first layout, collapsed keyboard-accessible preferences, preserved card nodes, reserved states, primary finder reservations and professional screenshots`);
+}
+
+async function checkLeaseAvailability(pageContext, scripts, mode) {
+  const viewport = mode === 'PDA' ? { width: 320, height: 844 } : { width: 1280, height: 960 };
+  const page = await mount(viewport, scripts, pageContext, () => {
+    const now = Date.now(), targets = window.__mock.targets;
+    for (const [target, reserved] of [[targets[0], false], [targets[3], true]]) {
+      Object.assign(target, { reserved, reservationExpiresAt: new Date(now + 120000).toISOString(),
+        estimateUpdatedAt: Math.floor(now / 1000) - 3600,
+        status: { state: 'Hospital', description: 'In hospital (leased mock)', until: Math.floor(now / 1000) + 600 },
+        checkedAt: new Date(now).toISOString() });
+    }
+  });
+  await login(page);
+  const leased = await page.evaluate(() => [101, 104].map(id => {
+    const root = window.__targetlistShadow, target = window.__mock.targets.find(target => target.id === id);
+    const card = [...root.querySelectorAll('.card')].find(card => card.dataset.targetId === String(id));
+    return { id, heading: card.querySelector('.availability strong').textContent,
+      details: [...card.querySelectorAll('.availability small')].map(node => node.textContent),
+      held: `Held until ${new Date(target.reservationExpiresAt).toLocaleTimeString()}`,
+      hospitalUntil: `Until ${new Date(target.status.until * 1000).toLocaleTimeString()}`,
+      attack: Boolean(card.querySelector('button.attack')) };
+  }));
+  for (const row of leased) {
+    assert.equal(row.heading, row.id === 101 ? 'Hospital' : 'Reserved by another NWA member',
+      `${mode}: leases do not hide the appropriate availability heading`);
+    assert(row.details.includes(row.id === 101 ? 'Reserved by you' : 'Hospital'),
+      `${mode}: own and other leases show both reservation and hospital state: ${JSON.stringify(row)}`);
+    assert(row.details.includes(row.held) && row.details.includes(row.hospitalUntil),
+      `${mode}: lease expiry and hospital release are shown separately: ${JSON.stringify(row)}`);
+    assert.equal(row.attack, false, `${mode}: leased hospital targets cannot expose an attack action`);
+  }
+  await page.evaluate(() => { window.__mockNow += 31000; });
+  await refreshMockFeed(page);
+  for (const id of [101, 104]) {
+    const stale = await cardSnapshot(page, id);
+    assert.match(stale.text, /Status needs checking/,
+      `${mode}: a still-active lease cannot make stale hospital status look current`);
+    assert.match(stale.text, /Last known: Hospital/);
+    assert.equal(stale.attack, null);
+  }
+  await page.close();
+  console.log(`PASS ${mode} own/other hospital leases retain both release and reservation times, block Attack and explicitly mark stale status`);
 }
 
 async function assertDock(page) {
@@ -762,6 +935,8 @@ async function assertAlongsideFfscouter(page) {
 }
 
 try {
+  await checkProfessionalLayout(context, [source], 'GM');
+  await checkLeaseAvailability(context, [source], 'GM');
   const early = await mount(undefined, [], context);
   await early.evaluate(() => {
     window.__earlyBody = document.body;
@@ -860,7 +1035,7 @@ try {
     if (input.value) throw new Error('Documentation screenshot must contain a blank API key field');
     return { x: left, y: top, width: right - left, height: bottom - top };
   });
-  assert(loginClip.width >= 680 && loginClip.width <= 720, JSON.stringify(loginClip));
+  assert(loginClip.width >= 736 && loginClip.width <= 820, JSON.stringify(loginClip));
   assert.match(await shadow(loginGuide, '#nwa-key-use', 'text'), /saved encrypted.*Supabase.*expires after up to 7 days.*while you are offline/s);
   assert.equal(await shadow(loginGuide, '.login button', 'text'), 'Sign in and save key');
   assert.equal(await loginGuide.evaluate(() => window.__mock.requests.length), 0);
@@ -1191,10 +1366,10 @@ try {
   assert.match((await cardSnapshot(ranges, 104)).text, /Below your minimum/);
   assert.equal((await cardSnapshot(ranges, 104)).attack, null);
   assert.equal((await cardSnapshot(ranges, 102)).attack, null, 'checked targets above the maximum do not expose attack links');
-  await shadow(ranges, 'select', 'select', 'suggested');
+  await shadow(ranges, '[aria-label="Target view"]', 'select', 'suggested');
   assert.equal(await ranges.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 1);
   assert.match(await shadow(ranges, '.cards', 'text'), /Willow/);
-  await shadow(ranges, 'select', 'select', 'all');
+  await shadow(ranges, '[aria-label="Target view"]', 'select', 'all');
   assert.equal(await ranges.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 4, 'all targets retains out-of-range entries');
   const rangeRequests = await ranges.evaluate(() => window.__mock.requests.length);
   await shadow(ranges, maximumSelector, 'select', '80');
@@ -1226,7 +1401,7 @@ try {
       const root = window.__targetlistShadow;
       const panel = root.querySelector('.panel').getBoundingClientRect();
       const scroll = root.querySelector('.scroll');
-      const inputs = [...root.querySelectorAll('.controls input')].map(input => {
+      const inputs = [...root.querySelectorAll('.controls input')].filter(input => input.checkVisibility()).map(input => {
         const rect = input.getBoundingClientRect();
         return { left: rect.left, right: rect.right, width: rect.width };
       });
@@ -1236,7 +1411,7 @@ try {
     });
     assert(geometry.left >= 0 && geometry.right <= geometry.width, JSON.stringify(geometry));
     assert(geometry.documentWidth <= geometry.width && geometry.scrollWidth <= geometry.clientWidth + 1, JSON.stringify(geometry));
-    assert.equal(geometry.inputs.length, 3, 'minimum, maximum and estimate-age inputs remain within the mobile panel');
+    assert.equal(geometry.inputs.length, 2, 'minimum and maximum remain visible while estimate age stays in collapsed preferences');
     for (const input of geometry.inputs) assert(input.left >= geometry.left && input.right <= geometry.right && input.width >= 40, JSON.stringify(geometry));
     await ranges.screenshot({ path: path.join(artifacts, `browser-stat-range-mobile-${width}.png`), fullPage: true });
   }
@@ -1267,10 +1442,10 @@ try {
   assert.equal(await main.evaluate(() => JSON.parse(window.__mock.requests.find(row => row.method === 'POST' && row.path === '/api/session').data).storeKey), true);
   console.log('PASS login, identity, faction, battle stats, local token only, unknown estimates retained');
 
-  await shadow(main, 'select', 'select', 'suggested');
+  await shadow(main, '[aria-label="Target view"]', 'select', 'suggested');
   assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 1);
   assert.match(await shadow(main, '.cards', 'text'), /Willow/);
-  await shadow(main, 'select', 'select', 'all');
+  await shadow(main, '[aria-label="Target view"]', 'select', 'all');
   await shadow(main, 'input[type=search]', 'fill', 'preferred chain');
   assert.equal(await main.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 1);
   await shadow(main, 'input[type=search]', 'fill', 'mystery');
@@ -1297,7 +1472,8 @@ try {
       documentWidth: document.documentElement.scrollWidth, scrollWidth: scroll.scrollWidth, clientWidth: scroll.clientWidth };
   });
   assert(mobileGeometry.left >= 0 && mobileGeometry.right <= mobileGeometry.width, JSON.stringify(mobileGeometry));
-  assert(mobileGeometry.right < mobileGeometry.dockLeft, JSON.stringify(mobileGeometry));
+  assert(mobileGeometry.right - mobileGeometry.left >= mobileGeometry.width - 24,
+    `the mobile panel uses nearly the full viewport: ${JSON.stringify(mobileGeometry)}`);
   assert(mobileGeometry.documentWidth <= mobileGeometry.width && mobileGeometry.scrollWidth <= mobileGeometry.clientWidth + 1,
     JSON.stringify(mobileGeometry));
   await main.screenshot({ path: path.join(artifacts, 'browser-mobile.png'), fullPage: true });
@@ -1310,15 +1486,15 @@ try {
   console.log('PASS stale status cannot open an attack');
 
   const deletion = await mount(); await login(deletion);
-  assert.equal(await shadow(deletion, '.profile button', 'text'), 'Sign out and remove key');
+  assert.equal(await shadow(deletion, '[data-action="signout"]', 'text'), 'Sign out and remove key');
   await deletion.evaluate(() => {
     window.__mock.holds.push('/api/session');
     window.__mock.overrides['/api/session'] = { status: 503,
       data: { error: { code: 'KEY_STORAGE_UNAVAILABLE', message: 'Mock saved-key storage is unavailable' } } };
   });
-  await shadow(deletion, '.profile button', 'click');
+  await shadow(deletion, '[data-action="signout"]', 'click');
   await wait(deletion, () => window.__mock.pending.length === 1);
-  assert.equal(await shadow(deletion, '.profile button', 'text'), 'Removing key…');
+  assert.equal(await shadow(deletion, '[data-action="signout"]', 'text'), 'Removing key…');
   const deleting = await deletion.evaluate(() => ({ requests: window.__mock.requests.length,
     token: [...window.__mock.store.values()][0]?.token,
     disabled: window.__targetlistShadow.querySelector('.launcher').disabled }));
@@ -1329,7 +1505,7 @@ try {
   await deletion.evaluate(() => window.__mock.release('/api/session'));
   await wait(deletion, () => window.__targetlistShadow.querySelector('.error').textContent.includes('Key removal was not confirmed'));
   assert.match(await shadow(deletion, '.error', 'text'), /kept so you can retry/);
-  assert.equal(await shadow(deletion, '.profile button', 'text'), 'Sign out and remove key');
+  assert.equal(await shadow(deletion, '[data-action="signout"]', 'text'), 'Sign out and remove key');
   assert.equal(await deletion.evaluate(() => [...window.__mock.store.values()][0]?.token), 'mock-session-token');
   assert.equal(await deletion.evaluate(() => JSON.stringify([...window.__mock.store.values()]).includes('MockLimitedKey01')), false);
   await deletion.evaluate(() => { delete window.__mock.overrides['/api/session']; });
@@ -1343,7 +1519,7 @@ try {
     await login(race);
     await race.evaluate(heldPath => { window.__mock.holds.push(heldPath); }, heldPath);
     if (heldPath.endsWith('/status')) await cardAction(race, 101);
-    else await shadow(race, '.controls button', 'click');
+    else await clickButton(race, 'Refresh list');
     await wait(race, () => window.__mock.pending.length === 1);
     await signOut(race);
     await race.evaluate(heldPath => window.__mock.release(heldPath), heldPath);
@@ -1542,7 +1718,7 @@ try {
   assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.tagName), 'H1');
   assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice').parentElement === document.body), true);
   assert.equal(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('section').getAttribute('aria-label')), 'NWA target list notice');
-  await shadow(profileNotice, '.header .icon', 'click');
+  await shadow(profileNotice, '[aria-label="Close NWA settings"]', 'click');
   const collapsedNotice = await noticeGeometry(profileNotice);
   assertCompactNotice(collapsedNotice, true);
   const profileFlowBefore = await profileNotice.evaluate(() => window.__noticeFlowBefore);
@@ -1613,7 +1789,7 @@ try {
 
   const ffNotice = await mount(undefined, [source], context, makeFfscouterFixture, longNoticeReason,
     'https://www.torn.com/page.php?sid=attack&user2ID=101');
-  await login(ffNotice); await shadow(ffNotice, '.header .icon', 'click');
+  await login(ffNotice); await shadow(ffNotice, '[aria-label="Close NWA settings"]', 'click');
   await wait(ffNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-placement') === 'ffscouter');
   const ffCollapsed = await assertAlongsideFfscouter(ffNotice);
   const ffBefore = await ffNotice.evaluate(() => window.__noticeFlowBefore);
@@ -1663,7 +1839,7 @@ try {
   try {
     const ffTouch = await mount({ width: 390, height: 844 }, [source], ffTouchContext, makeFfscouterFixture, longNoticeReason,
       'https://www.torn.com/page.php?sid=attack&user2ID=101');
-    await login(ffTouch); await shadow(ffTouch, '.header .icon', 'click');
+    await login(ffTouch); await shadow(ffTouch, '[aria-label="Close NWA settings"]', 'click');
     for (const width of [390, 320]) {
       await ffTouch.setViewportSize({ width, height: 844 });
       await ffTouch.waitForTimeout(150);
@@ -1688,7 +1864,7 @@ try {
 
     const longFfDesktop = await mount(undefined, [source], context, makeFfscouterFixture,
       { reason: longNoticeReason, longLine: true }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
-    await login(longFfDesktop); await shadow(longFfDesktop, '.header .icon', 'click');
+    await login(longFfDesktop); await shadow(longFfDesktop, '[aria-label="Close NWA settings"]', 'click');
     const longDesktopGeometry = await assertAlongsideFfscouter(longFfDesktop);
     const longDesktopBefore = await longFfDesktop.evaluate(() => window.__noticeFlowBefore);
     assert.equal(longDesktopGeometry.headingTop, longDesktopBefore.headingTop);
@@ -1699,7 +1875,7 @@ try {
     for (const width of [390, 320]) {
       const longFfTouch = await mount({ width, height: 844 }, [source], ffTouchContext, makeFfscouterFixture,
         { reason: longNoticeReason, longLine: true }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
-      await login(longFfTouch); await shadow(longFfTouch, '.header .icon', 'click');
+      await login(longFfTouch); await shadow(longFfTouch, '[aria-label="Close NWA settings"]', 'click');
       const geometry = await noticeGeometry(longFfTouch); assertCompactNotice(geometry, true);
       assert.equal(geometry.placement, 'attack', 'a full FFScouter line uses an existing native attack line');
       const before = await longFfTouch.evaluate(() => window.__noticeFlowBefore);
@@ -1732,7 +1908,7 @@ try {
 
     const bottomFfTouch = await mount({ width: 320, height: 300 }, [source], ffTouchContext, makeFfscouterFixture,
       { reason: longNoticeReason, marginTop: 220 }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
-    await login(bottomFfTouch); await shadow(bottomFfTouch, '.header .icon', 'click');
+    await login(bottomFfTouch); await shadow(bottomFfTouch, '[aria-label="Close NWA settings"]', 'click');
     const bottomCollapsed = await assertAlongsideFfscouter(bottomFfTouch);
     await clickNotice(bottomFfTouch, true);
     await wait(bottomFfTouch, () => window.__playerNoticeShadow.querySelector('details').open);
@@ -1761,7 +1937,7 @@ try {
       content.style.width = `${Math.ceil(icon.right - content.getBoundingClientRect().left + 8 + 90)}px`;
       Object.assign(window.__mock.targets[0], { estimatedStats: null, estimateUpdatedAt: null, estimateSource: null });
     });
-    await login(unknownNarrow); await shadow(unknownNarrow, '.header .icon', 'click');
+    await login(unknownNarrow); await shadow(unknownNarrow, '[aria-label="Close NWA settings"]', 'click');
     const unknownGeometry = await noticeGeometry(unknownNarrow); assertCompactNotice(unknownGeometry, true);
     assert.equal(unknownGeometry.placement, 'ffscouter');
     assert(unknownGeometry.host.width >= 90 && unknownGeometry.host.width <= 92, JSON.stringify(unknownGeometry));
@@ -1788,7 +1964,7 @@ try {
         + '<p>Mock touch attack page content.</p>';
       document.body.append(content); window.__mock.targets[0].reason = reason;
     }, longNoticeReason, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
-    await login(touchNotice); await shadow(touchNotice, '.header .icon', 'click');
+    await login(touchNotice); await shadow(touchNotice, '[aria-label="Close NWA settings"]', 'click');
     for (const width of [390, 320]) {
       await touchNotice.setViewportSize({ width, height: 844 });
       await touchNotice.waitForTimeout(150);
@@ -1825,9 +2001,9 @@ try {
   assert.equal(await attackNotice.evaluate(() => window.__playerNoticeShadow.querySelectorAll('img,script').length), 0);
   assert.equal(await attackNotice.evaluate(() => window.__injected), undefined);
   await attackNotice.evaluate(() => { window.__mock.targets[0].reason = 'Inactive player suitable for chaining.'; });
-  await shadow(attackNotice, '.controls button', 'click');
+  await clickButton(attackNotice, 'Refresh list');
   await wait(attackNotice, () => window.__playerNoticeShadow.querySelector('.reason').textContent.includes('Inactive player suitable for chaining.'));
-  await shadow(attackNotice, '.header .icon', 'click');
+  await shadow(attackNotice, '[aria-label="Close NWA settings"]', 'click');
   assertCompactNotice(await noticeGeometry(attackNotice));
   await attackNotice.screenshot({ path: path.join(artifacts, 'browser-attack-notice-desktop.png'), fullPage: true });
   await shadow(attackNotice, '.settings-toggle', 'click');
@@ -1914,7 +2090,7 @@ try {
     await clickButton(pda, 'Targets');
     await cardAction(pda, 101);
     await wait(pda, () => window.__targetlistShadow.querySelector('.attack')?.tagName === 'BUTTON');
-    await shadow(pda, '.header .icon', 'click');
+    await shadow(pda, '[aria-label="Close NWA settings"]', 'click');
     await wait(pda, () => Boolean(document.getElementById('nwa-target-page-notice')));
     assertCompactNotice(await noticeGeometry(pda));
     await clickNotice(pda, true);
@@ -2002,6 +2178,8 @@ try {
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
   try {
+    await checkProfessionalLayout(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkLeaseAvailability(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
   }

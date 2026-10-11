@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.6.2' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.7.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -70,13 +70,15 @@ function mountTargetList(platform, storageWarning = '') {
   let exportSnapshot = null, exportView = null;
   const css = document.createElement('style');
   css.textContent = `
-    :host{all:initial;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#edf4f4;font-size:14px;line-height:1.5}
+    :host{all:initial;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e5e9e6;font-size:13px;line-height:1.45;
+      --surface:#1b1d20;--raised:#23262a;--field:#17191c;--line:#353b37;--text:#e5e9e6;--muted:#a1aaa5;--accent:#8ad2ab}
     *{box-sizing:border-box} button,input,select,textarea{font:inherit}button,a,input,select,textarea{outline-offset:3px}
-    button{cursor:pointer;border:1px solid #3d505b;border-radius:9px;padding:8px 12px;background:#22343f;color:#eef6f6}
-    button:hover:not(:disabled){background:#304954}button:disabled{cursor:wait;opacity:.55}
-    a{color:#7fe0ce;text-decoration:none}a:hover{text-decoration:underline}p{margin:0 0 12px}h2,h3{margin:0}
-    input,select,textarea{color:#edf4f4;background:#101c24;border:1px solid #3d505b;border-radius:8px;padding:10px;min-width:0}
-    input:focus,select:focus,textarea:focus{border-color:#69d7c0}label{display:block}small,.muted{color:#a8b9c2;font-size:12px}
+    button{cursor:pointer;border:1px solid var(--line);border-radius:7px;padding:7px 10px;background:var(--raised);color:var(--text)}
+    button:hover:not(:disabled){background:#303731}button:disabled{cursor:default;opacity:.55}
+    :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+    a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}p{margin:0 0 12px}h2,h3{margin:0}
+    input,select,textarea{color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:7px;padding:8px 10px;min-width:0}
+    input:focus,select:focus,textarea:focus{border-color:var(--accent)}label{display:block}small,.muted{color:var(--muted);font-size:11px}
     .dock{position:absolute;right:0;top:17vh;display:flex;flex-direction:column;align-items:flex-end;gap:0;pointer-events:auto}
     .launcher{display:grid;place-items:center;width:40px;height:30px;padding:0;border:0;border-radius:8px 0 0 8px;
       background:#008000;color:#fff;font:400 14px Arial,Helvetica,sans-serif;line-height:1;box-shadow:none}
@@ -90,42 +92,54 @@ function mountTargetList(platform, storageWarning = '') {
       border:1px solid #3b6046;border-radius:9px;background:#14291c;color:#e5f6e8;font-size:12px;box-shadow:0 4px 18px #0005}
     @keyframes nwa-pulse{50%{background:#13672a}}
     @media(prefers-reduced-motion:reduce){.launcher[aria-busy=true]{animation:none}}
-    .panel{position:absolute;top:calc(var(--nwa-viewport-top,0px) + 12px);right:64px;width:min(640px,calc(100vw - 80px));max-height:calc(100vh - 24px);max-height:calc(var(--nwa-viewport-height,100dvh) - 24px);
-      pointer-events:auto;background:#14222d;border:1px solid #354956;
-      border-radius:15px;box-shadow:0 18px 70px #0009;display:flex;flex-direction:column;overflow:hidden}
-    [hidden]{display:none!important}.header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #30414c}
-    .eyebrow{font-size:10px;letter-spacing:1.8px;font-weight:750;color:#76e1c7;text-transform:uppercase}
-    h2{font-size:20px;line-height:1.4}.icon{padding:3px 10px;background:transparent;font-size:20px}
-    .scroll{overflow:auto;min-height:0;padding:20px}.login{display:grid;gap:13px}.login input{width:100%;margin-top:5px}
-    .primary{background:#76e1c7;color:#102626;font-weight:750;border:0}.primary:hover:not(:disabled){background:#95efd9}
-    .notice{font-size:12px;line-height:1.6;color:#b4c3ca}.error{background:#492b31;color:#ffd6d8;padding:10px 13px;border-radius:8px;margin-bottom:14px}
-    .profile{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.profile strong{font-size:17px}
-    .statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.stat{background:#1c303a;padding:9px;border-radius:8px}
-    .stat strong{display:block;color:#e4f5f3;font-size:15px}.toolbar{display:grid;grid-template-columns:1fr 160px;gap:10px;margin:14px 0}
-    .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.controls label{display:flex;align-items:center;gap:5px}.controls input{width:74px;padding:5px 8px}.controls button{margin-left:auto}
-    .stat-range-summary{font-size:12px;color:#a8b9c2;margin-top:8px;overflow-wrap:anywhere}
+    .panel{position:absolute;top:calc(var(--nwa-viewport-top,0px) + 12px);right:56px;width:min(736px,calc(100vw - 72px));max-height:calc(100vh - 24px);max-height:calc(var(--nwa-viewport-height,100dvh) - 24px);
+      pointer-events:auto;background:var(--surface);border:1px solid var(--line);
+      border-radius:12px;box-shadow:0 16px 60px #0007;display:flex;flex-direction:column;overflow:hidden}
+    [hidden]{display:none!important}.header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line);flex-shrink:0}
+    .brand{display:flex;align-items:center;gap:10px}.brand-mark{display:grid;place-items:center;width:40px;height:36px;border-radius:8px;background:#293e31;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.6px}
+    .eyebrow{font-size:11px;color:var(--muted)}
+    h2{font-size:16px;line-height:1.4;font-weight:700}.icon{width:32px;height:32px;padding:0;background:transparent;font-size:22px}
+    .header-actions{display:flex;gap:6px;align-items:center}.more-options{font-size:18px}
+    .scroll{overflow:auto;min-height:0;padding:14px 16px;overscroll-behavior:contain;scrollbar-gutter:stable}.login{display:grid;gap:13px}.login input{width:100%;margin-top:5px}
+    .primary,.actions .attack{background:#85cfa6;color:#162b1e;font-weight:700;border-color:transparent}.primary:hover:not(:disabled),.actions .attack:hover:not(:disabled){background:#9cdeb9}
+    .notice{font-size:12px;line-height:1.6;color:var(--muted)}.error{background:#402a2e;color:#ffd6d8;padding:10px 12px;border:1px solid #6a3c43;border-radius:7px;margin-bottom:12px;overflow-wrap:anywhere}
+    .finder-status{padding:8px 10px;margin-bottom:12px;border-left:2px solid var(--accent);background:#26342b;color:#c4e8d1;font-size:12px;overflow-wrap:anywhere}
+    .profile{display:flex;justify-content:space-between;align-items:center;gap:10px;min-width:0}.profile strong{font-size:12px}.profile>div{min-width:0;overflow-wrap:anywhere}.profile .player-total{text-align:right;max-width:45%;font-size:11px;color:var(--muted)}
+    .statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.stat{background:var(--field);padding:8px;border-radius:6px}
+    .stat strong{display:block;color:var(--text);font-size:13px}.toolbar{display:grid;grid-template-columns:minmax(0,1fr) 120px;gap:8px;margin:12px 0 10px}
+    .controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.controls label{display:flex;align-items:center;gap:5px}.controls input{width:68px;padding:5px 7px}.controls button{margin-left:auto}
+    .filters{font-size:12px}.filter-label{color:var(--muted)}.filters select{margin-left:auto;padding:6px;max-width:160px;font-size:12px}
+    .stat-range-summary{font-size:11px;color:var(--muted);margin-top:8px;overflow-wrap:anywhere}
     .exports,.export-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
     .exports label{display:flex;align-items:center;gap:6px}.exports select{padding:6px 8px}
-    .export-preview{margin-top:12px;padding:12px;background:#101c24;border:1px solid #354956;border-radius:9px}
+    .export-preview{margin-top:12px;padding:12px;background:var(--field);border:1px solid var(--line);border-radius:7px}
     .export-preview textarea{display:block;width:100%;height:180px;margin-top:8px;resize:vertical;font-family:monospace;font-size:12px;white-space:pre}
-    .export-preview .notice{margin-top:8px}.export-preview .export-status{margin-top:8px;color:#baf8e7;font-size:12px}
-    .count{margin:15px 0 10px;font-size:12px;color:#a8b9c2}.cards{display:grid;gap:10px}.card{border:1px solid #354956;border-radius:10px;padding:14px;background:#192b36}
-    .cardhead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.name{font-weight:750;font-size:15px}.badge{font-size:10px;font-weight:750;padding:4px 7px;border-radius:5px;white-space:nowrap;background:#20473e;color:#a4efd9}
-    .badge.warn{background:#4e3e26;color:#f6d290}.badge.muted{background:#2c3944;color:#bbcad4}
-    .metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}.metrics strong{display:block;font-size:14px}.metrics small{display:block}
-    .actions{display:flex;align-items:center;gap:12px;margin-top:12px}.actions .attack{margin-left:auto;background:#76e1c7;color:#102626;padding:7px 12px;border-radius:8px;font-weight:750}
-    .notes{font-size:12px;color:#b7c7ce;margin-top:8px;overflow-wrap:anywhere}.empty{padding:24px;text-align:center;background:#1c303a;border-radius:10px}
-    .footnote{border-top:1px solid #30414c;margin-top:18px;padding-top:14px;font-size:11px;color:#9fb2bd}
-    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.tabs button[aria-pressed=true]{border-color:#76e1c7;background:#244a46;color:#baf8e7}
+    .export-preview .notice{margin-top:8px}.export-preview .export-status{margin-top:8px;color:var(--accent);font-size:12px}
+    .count{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin:12px 0 4px;font-size:11px;color:var(--muted)}.count>button{padding:4px 7px;font-size:11px;background:transparent}
+    summary{cursor:pointer;outline-offset:3px}.pool-details{min-width:0;flex:1}.pool-details summary{padding:5px 0;color:var(--text);font-weight:600}.count-detail{padding:6px 0 10px;line-height:1.7;font-weight:400;color:var(--muted)}
+    .cards{display:grid;gap:0}.card{border-bottom:1px solid var(--line);padding:13px 0;min-width:0}
+    .cards:not(.suggestionqueue)>.card{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,.9fr) minmax(0,1fr) 90px;gap:6px 12px;align-items:start}
+    .cardhead{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;min-width:0}.name{font-weight:650;font-size:13px;color:var(--text);overflow-wrap:anywhere}.cardhead .muted{margin-top:3px;overflow-wrap:anywhere}
+    .badge{display:inline-block;font-size:10px;font-weight:650;padding:2px 6px;border-radius:4px;white-space:normal;background:#293e31;color:#a6dcbb}
+    .badge.warn{background:#433b28;color:#efd49a}.badge.muted{background:#303437;color:#bec6c0}
+    .metrics{display:contents}.metrics strong{display:block;font-size:13px;font-weight:650;font-variant-numeric:tabular-nums}.metrics small{display:block;margin-top:2px;font-size:10px;overflow-wrap:anywhere}.availability{min-width:0}.availability strong{font-size:12px;margin-bottom:3px}
+    .actions{display:flex;align-items:center;gap:8px;margin-top:10px;min-width:0}.cards:not(.suggestionqueue)>.card>.actions{grid-column:4;grid-row:1/3;flex-direction:column;align-items:stretch;margin:0;gap:5px}
+    .actions button{font-size:11px;padding:5px 7px}.actions .attack{border-radius:6px}.actions small{font-size:10px;overflow-wrap:anywhere}.actions .check-status{background:transparent;border-color:transparent;color:var(--muted);order:2;padding:3px 0}
+    .notes{grid-column:1/4;font-size:11px;color:var(--muted);overflow-wrap:anywhere;line-height:1.5}.empty{padding:24px 14px;text-align:center;background:var(--field);border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12px;margin:10px 0}
+    .preferences{border-top:1px solid var(--line);margin-top:14px;padding-top:4px}.preferences>summary{padding:10px 0;font-size:12px;color:var(--muted)}.preferences-body{padding:4px 0 2px}.preferences h3{font-size:12px;font-weight:650;margin:10px 0 6px}.account{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:12px;margin-top:14px}.account button{font-size:11px}.account .muted{font-size:10px}
+    .footnote{margin-top:14px;font-size:11px;color:var(--muted)}.pool-footer{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:10px;color:var(--muted)}.pool-warnings{color:#efd49a;font-size:11px;overflow-wrap:anywhere}.pool-warnings p{margin:8px 0}
+    .tabs{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0;border-bottom:1px solid var(--line)}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:7px 0;background:transparent;color:var(--muted);font-size:12px}.tabs button[aria-pressed=true]{border-bottom-color:var(--accent);color:var(--text)}
     .suggestionform{display:grid;gap:12px;margin:14px 0 20px}.suggestionfields{display:grid;grid-template-columns:140px 1fr;gap:10px}
     .suggestionform input,.suggestionform select,.suggestionform textarea{display:block;width:100%;margin-top:5px}.suggestionform textarea{resize:vertical;min-height:84px}
-    .success{background:#20473e;color:#baf8e7;padding:10px 13px;border-radius:8px;margin:12px 0;font-size:13px}
-    .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:13px;color:#d4e4e9}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
+    .success{background:#293e31;color:#c4e8d1;padding:10px 12px;border-radius:7px;margin:12px 0;font-size:12px}
+    .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:12px;color:var(--text)}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
     .queueheader h3{font-size:16px}.queuefooter{margin-top:12px}.suggestioncard .actions button{padding:6px 10px}.suggestioncard .name{overflow-wrap:anywhere}
-    @media(pointer:coarse){input,select,textarea,.export-preview textarea{font-size:16px}}
-    @media(max-width:480px){.panel{top:calc(var(--nwa-viewport-top,0px) + 8px);right:60px;width:calc(100vw - 68px);max-height:calc(100vh - 16px);max-height:calc(var(--nwa-viewport-height,100dvh) - 16px)}
-      .scroll{padding:14px}.toolbar{grid-template-columns:1fr}.statgrid{grid-template-columns:repeat(2,1fr)}
-      .metrics{grid-template-columns:1fr 1fr}.cardhead{flex-wrap:wrap}.badge{white-space:normal}.actions{gap:8px}.header{padding:12px 14px}.suggestionfields{grid-template-columns:1fr}}
+    @media(pointer:coarse){input,select,textarea,.export-preview textarea,.filters select{font-size:16px} .panel button,.panel summary{min-height:44px}.controls input{min-height:44px}}
+    @media(max-width:600px){.panel{top:calc(var(--nwa-viewport-top,0px) + 8px);left:8px;right:8px;width:auto;max-height:calc(100vh - 16px);max-height:calc(var(--nwa-viewport-height,100dvh) - 16px)}
+      .panel:not([hidden])~.dock{visibility:hidden}.scroll{padding:12px;scrollbar-gutter:auto}.header{padding:10px 12px}.profile .player-total{max-width:40%}.statgrid{grid-template-columns:repeat(2,1fr)}
+      .toolbar{grid-template-columns:minmax(0,1fr) 110px}.filters{gap:6px}.filters input{width:58px}.filter-label{display:none}.filters select{max-width:100%;margin-left:0;flex:1;min-width:120px}.stat-range-summary{line-height:1.5}
+      .cards:not(.suggestionqueue)>.card{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px 12px;padding:14px 0}.cardhead{grid-column:1}.estimate{text-align:right}.availability{grid-column:1;grid-row:2}.cards:not(.suggestionqueue)>.card>.actions{grid-column:2;grid-row:2;flex-direction:row;flex-wrap:wrap;justify-content:flex-end;align-items:center}.actions .attack{order:2}.actions .check-status{order:1;padding:5px 6px}.notes{grid-column:1/-1;grid-row:3}.actions small{width:100%;text-align:right}.pool-footer{flex-wrap:wrap}.suggestionfields{grid-template-columns:1fr}.account{flex-wrap:wrap}}
+    @media(max-width:360px){.filters select{flex-basis:100%}.profile .player-total{max-width:38%}.cards:not(.suggestionqueue)>.card>.actions{gap:2px}.actions button{padding:5px}.name{font-size:12px}}
   `;
   root.append(css);
   function element(tag, text, className) {
@@ -145,12 +159,23 @@ function mountTargetList(platform, storageWarning = '') {
   const panel = element('section', null, 'panel'); panel.hidden = true;
   panel.id = 'nwa-panel'; panel.setAttribute('aria-label', 'North West Alliance target finder');
   const header = element('div', null, 'header');
-  const title = element('div'); title.append(element('div', `NWA Target Finder · v${CONFIG.version}`, 'eyebrow'), element('h2', 'North West Alliance'));
-  header.append(title, button('×', () => toggle(false), 'icon'));
-  header.lastChild.setAttribute('aria-label', 'Close NWA settings');
+  const title = element('div', null, 'brand');
+  const brandText = element('div'); brandText.append(element('h2', 'Target finder'), element('div', 'North West Alliance', 'eyebrow'));
+  title.append(element('span', 'NWA', 'brand-mark'), brandText);
+  const headerActions = element('div', null, 'header-actions');
+  const moreOptions = button('⋯', () => {
+    if (!panelUi?.preferences) return;
+    preferencesOpen = true; panelUi.preferences.open = true;
+    panelUi.preferences.scrollIntoView?.({ block: 'nearest' });
+    panelUi.preferencesSummary.focus?.();
+  }, 'icon more-options');
+  moreOptions.setAttribute('aria-label', 'Open preferences and account'); moreOptions.title = 'Preferences, exports & account'; moreOptions.hidden = true;
+  const closePanel = button('×', () => toggle(false), 'icon'); closePanel.setAttribute('aria-label', 'Close NWA settings');
+  headerActions.append(moreOptions, closePanel); header.append(title, headerActions);
   const scroll = element('div', null, 'scroll');
   const errorBox = element('div', null, 'error'); errorBox.setAttribute('role', 'alert'); errorBox.hidden = true;
-  const content = element('div'); scroll.append(errorBox, content); panel.append(header, scroll);
+  const finderStatus = element('div', null, 'finder-status'); finderStatus.setAttribute('role', 'status'); finderStatus.hidden = true;
+  const content = element('div'); scroll.append(errorBox, finderStatus, content); panel.append(header, scroll);
   const dock = element('div', null, 'dock');
   const launcher = button('NWA', () => void findTarget(), 'launcher');
   launcher.setAttribute('aria-label', 'NWA — find a target'); launcher.title = 'North West Alliance — find a target';
@@ -170,10 +195,18 @@ function mountTargetList(platform, storageWarning = '') {
   dock.append(launcher, settings, quickNotice); root.append(panel, dock);
 
   function message(text) { state.error = text; errorBox.textContent = text; errorBox.hidden = !text; }
-  function findNotice(text) { quickNotice.textContent = text; quickNotice.hidden = !text; }
+  function findNotice(text) {
+    quickNotice.textContent = text; quickNotice.hidden = !text || state.open;
+    finderStatus.textContent = text; finderStatus.hidden = !text || !state.open;
+  }
   function updateLauncher() {
     launcher.disabled = state.finding || state.busy;
     launcher.setAttribute('aria-busy', String(state.finding));
+    if (panelUi?.find) {
+      panelUi.find.disabled = state.finding || state.busy || state.removingKey;
+      panelUi.find.setAttribute('aria-busy', String(state.finding));
+      setText(panelUi.find, state.finding ? 'Finding…' : 'Find target');
+    }
   }
   function cancelFind() { state.findGeneration++; state.finding = false; findNotice(''); updateLauncher(); }
   function persist(operation) {
@@ -836,6 +869,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
 
   let cardContainer, countNode, panelUi = null, renderedKind = null, suggestionContainer = null, suggestionSignature = null;
+  let preferencesOpen = false, diagnosticsOpen = false;
   const cardNodes = new Map();
   let orderedRowsKey = null, orderedIds = [], mountedIds = [], emptyCard = null;
   const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
@@ -857,9 +891,10 @@ function mountTargetList(platform, storageWarning = '') {
     setText(panelUi.faction, `${player.faction.name} · Faction ${player.faction.id}`);
     setText(panelUi.signOut, state.removingKey ? 'Removing key…' : 'Sign out and remove key');
     panelUi.signOut.disabled = state.removingKey;
-    if (state.view !== 'targets') return;
-    setText(panelUi.total, `Your battle stats: ${C.compact(player.battleStats.total)} total`);
+    setText(panelUi.total, `${C.compact(player.battleStats.total)} total stats`);
+    panelUi.total.setAttribute('aria-label', `Your battle stats: ${C.compact(player.battleStats.total)} total`);
     for (const [key, node] of panelUi.stats) setText(node, C.compact(player.battleStats[key]));
+    if (state.view !== 'targets') return;
     panelUi.updateRangeSummary();
     setText(panelUi.refresh, state.loading ? 'Loading…' : 'Refresh list'); panelUi.refresh.disabled = state.loading;
     updateExportControls();
@@ -872,12 +907,13 @@ function mountTargetList(platform, storageWarning = '') {
     if (metadata !== panelUi.metadata) {
       panelUi.metadata = metadata; panelUi.poolMetadata.replaceChildren();
       for (const warning of state.warnings) panelUi.poolMetadata.append(element('p', warning));
-      if (state.generatedAt) panelUi.poolMetadata.append(element('div', `Pool updated: ${new Date(state.generatedAt).toLocaleString()}`));
     }
+    setText(panelUi.poolUpdated, state.generatedAt ? `Pool updated: ${C.ageLabel(Date.parse(state.generatedAt) / 1000)}` : 'Pool update time unknown');
   }
   function render() {
     updatePageNotice();
     updateLauncher();
+    moreOptions.hidden = !state.player;
     if (!state.player && renderedKind?.startsWith('member:')) resetPanel();
     if (!state.open) { state.backgroundRenderPending = true; return; }
     state.backgroundRenderPending = false;
@@ -912,9 +948,12 @@ function mountTargetList(platform, storageWarning = '') {
     const factionName = element('div', `${player.faction.name} · Faction ${player.faction.id}`, 'muted');
     identity.append(playerName, factionName);
     const signOut = button(state.removingKey ? 'Removing key…' : 'Sign out and remove key', () => void logout());
+    signOut.setAttribute('data-action', 'signout');
     signOut.disabled = state.removingKey;
-    panelUi = { name: playerName, faction: factionName, signOut };
-    profile.append(identity, signOut); content.append(profile);
+    const total = element('div', `${C.compact(player.battleStats.total)} total stats`, 'player-total');
+    total.setAttribute('aria-label', `Your battle stats: ${C.compact(player.battleStats.total)} total`);
+    panelUi = { name: playerName, faction: factionName, signOut, total, stats: new Map(), ratios: new Map() };
+    profile.append(identity, total); content.append(profile);
     const tabs = element('div', null, 'tabs'); tabs.setAttribute('aria-label', 'NWA sections');
     for (const [view, label] of [['targets', 'Targets'], ['suggestions', 'Suggestions']]) {
       const tab = button(label, () => {
@@ -925,28 +964,39 @@ function mountTargetList(platform, storageWarning = '') {
       tab.setAttribute('aria-pressed', String(state.view === view)); tabs.append(tab);
     }
     content.append(tabs);
-    if (state.view === 'suggestions') {
-      suggestionContainer = element('div'); content.append(suggestionContainer); renderSuggestions(); return;
-    }
-    panelUi.total = element('p', `Your battle stats: ${C.compact(player.battleStats.total)} total`, 'muted');
-    content.append(panelUi.total); panelUi.stats = new Map(); panelUi.ratios = new Map();
+    const preferencesPanel = element('details', null, 'preferences'); preferencesPanel.open = preferencesOpen;
+    preferencesPanel.addEventListener('toggle', () => { preferencesOpen = preferencesPanel.open; });
+    const preferencesSummary = element('summary', 'Preferences & account');
+    panelUi.preferences = preferencesPanel; panelUi.preferencesSummary = preferencesSummary;
+    preferencesPanel.append(preferencesSummary);
+    const preferencesBody = element('div', null, 'preferences-body'); preferencesPanel.append(preferencesBody);
+    preferencesBody.append(element('h3', 'Your battle stats'));
     const grid = element('div', null, 'statgrid');
     for (const key of ['strength', 'defense', 'speed', 'dexterity']) {
       const stat = element('div', null, 'stat'); const value = element('strong', C.compact(player.battleStats[key]));
       panelUi.stats.set(key, value); stat.append(element('small', key[0].toUpperCase() + key.slice(1)), value); grid.append(stat);
     }
-    content.append(grid);
+    preferencesBody.append(grid);
+    const account = element('div', null, 'account');
+    account.append(element('span', 'Removes your saved key and logins.', 'muted'), signOut);
+    if (state.view === 'suggestions') {
+      suggestionContainer = element('div'); content.append(suggestionContainer); renderSuggestions();
+      preferencesBody.append(account); content.append(preferencesPanel); return;
+    }
     const toolbar = element('div', null, 'toolbar');
-    const query = element('input'); query.type = 'search'; query.placeholder = 'Search player, faction or reason'; query.value = state.query;
+    const query = element('input'); query.type = 'search'; query.placeholder = 'Search targets'; query.value = state.query;
+    query.title = 'Search player, faction or reason';
     query.setAttribute('aria-label', 'Search targets'); query.addEventListener('input', () => { state.query = query.value; cancelFind(); renderCards(); });
     const mode = element('select'); mode.setAttribute('aria-label', 'Target view');
     for (const [value, label] of [['all', 'All targets'], ['suggested', 'Possible matches']]) {
       const option = element('option', label); option.value = value; mode.append(option);
     }
     mode.value = state.mode; mode.addEventListener('change', () => { state.mode = mode.value; renderCards(); });
-    toolbar.append(query, mode); content.append(toolbar);
-    content.append(element('div', 'Target stats (% of yours)', 'notice'));
-    const controls = element('div', null, 'controls');
+    panelUi.find = button('Find target', () => void findTarget(), 'primary find-target');
+    panelUi.find.disabled = state.finding || state.busy || state.removingKey;
+    toolbar.append(query, panelUi.find); content.append(toolbar);
+    const controls = element('div', null, 'controls filters');
+    controls.append(element('span', 'Target stats', 'filter-label'));
     const rangeSummary = element('div', null, 'stat-range-summary');
     const percent = value => String(Number((value * 100).toFixed(6)));
     const updateRangeSummary = () => {
@@ -971,7 +1021,8 @@ function mountTargetList(platform, storageWarning = '') {
       });
       ratioLabel.append(ratio, element('span', '%')); controls.append(ratioLabel);
     }
-    const refresh = button(state.loading ? 'Loading…' : 'Refresh list', () => void loadTargets()); refresh.disabled = state.loading; controls.append(refresh); content.append(controls);
+    controls.append(mode); content.append(controls);
+    const refresh = button(state.loading ? 'Loading…' : 'Refresh list', () => void loadTargets()); refresh.disabled = state.loading;
     panelUi.refresh = refresh; panelUi.percent = percent; panelUi.updateRangeSummary = updateRangeSummary;
     updateRangeSummary(); content.append(rangeSummary);
     const ageControls = element('div', null, 'controls');
@@ -988,9 +1039,9 @@ function mountTargetList(platform, storageWarning = '') {
     });
     ageLabel.append(age, element('span', 'days')); ageControls.append(ageLabel,
       button('Clear recent targets', () => { state.recentTargets = []; state.lastTargetId = null; savePreferences(); cancelFind(); message(''); renderCards(); }));
-    content.append(ageControls);
+    preferencesBody.append(element('h3', 'Target preferences'), ageControls);
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
-    ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; content.append(ageCaution);
+    ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; preferencesBody.append(ageCaution);
     const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
     const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
     for (const [value, label] of [['all', 'All targets'], ['shown', 'Shown targets']]) {
@@ -1001,15 +1052,24 @@ function mountTargetList(platform, storageWarning = '') {
     for (const [format, label] of [['csv', 'Export CSV'], ['markdown', 'Export Markdown']]) {
       const control = button(label, () => showExport(format)); panelUi.exportButtons.push(control); exports.append(control);
     }
-    panelUi.exportHost = element('div'); content.append(exports, panelUi.exportHost);
-    countNode = element('div', null, 'count'); cardContainer = element('div', null, 'cards'); content.append(countNode, cardContainer);
+    panelUi.exportHost = element('div'); preferencesBody.append(element('h3', 'Export target list'), exports, panelUi.exportHost);
+    countNode = element('div', null, 'count');
+    const diagnostics = element('details', null, 'pool-details'); diagnostics.open = diagnosticsOpen;
+    diagnostics.addEventListener('toggle', () => { diagnosticsOpen = diagnostics.open; });
+    panelUi.countSummary = element('summary'); panelUi.countDetail = element('div', null, 'count-detail');
+    diagnostics.append(panelUi.countSummary, panelUi.countDetail); countNode.append(diagnostics, refresh);
+    cardContainer = element('div', null, 'cards'); cardContainer.setAttribute('aria-label', 'Targets');
+    content.append(countNode, cardContainer);
     const note = element('div', null, 'footnote');
     panelUi.estimateNote = element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
     note.append(panelUi.estimateNote,
       element('p', 'Refreshing the list checks for updates; FFScouter may still have an older estimate. Recently opened targets are skipped for 10 minutes. The finder and list attack buttons require a shared reservation. Assignments last two minutes with the current backend, even when you choose another target.'),
       element('p', 'NWA uses availability checked within 30 seconds. Check status to update a target now. Status can change at any time; Torn makes the final availability check.'));
-    panelUi.poolMetadata = element('div'); panelUi.metadata = null; note.append(panelUi.poolMetadata);
-    content.append(note); updatePanelControls(); renderCards();
+    panelUi.poolMetadata = element('div', null, 'pool-warnings'); panelUi.metadata = null;
+    panelUi.poolUpdated = element('span');
+    const footer = element('div', null, 'pool-footer'); footer.append(panelUi.poolUpdated, element('span', `NWA · v${CONFIG.version}`));
+    preferencesBody.append(note, account); content.append(panelUi.poolMetadata, preferencesPanel, footer);
+    updatePanelControls(); updateLauncher(); renderCards();
   }
 
   function renderSuggestions() {
@@ -1098,23 +1158,31 @@ function mountTargetList(platform, storageWarning = '') {
       if (assessment.ratio !== null && !assessment.fresh) old++;
       if (assessment.ratio === null) unknown++;
       if (assessment.suggested) suggestions++;
-      if (assessment.suggested && assessment.ready && !target.reserved) ready++;
+      if (freshPool && state.reservationsSupported && assessment.suggested && assessment.ready && !target.reserved) ready++;
       if (state.mode === 'suggested' && !assessment.suggested) continue;
       if (query && !`${target.id} ${target.name} ${target.faction?.name || ''} ${C.reason(target)}`.toLowerCase().includes(query)) continue;
       selected.set(target.id, { target, assessment });
     }
-    const orderKey = [...selected.values()].map(({ target, assessment }) => `${target.id}:${Number(assessment.suggested)}:${assessment.ratio}`).join('|');
+    const priority = ({ target, assessment }) => assessment.suggested
+      ? target.reserved ? 1 : assessment.ready && freshPool && state.reservationsSupported ? 3 : 2 : 0;
+    const orderKey = [...selected.values()].map(row => `${row.target.id}:${priority(row)}:${row.assessment.ratio}`).join('|');
     if (orderKey !== orderedRowsKey) {
       orderedRowsKey = orderKey;
-      orderedIds = [...selected.values()].sort((a, b) => Number(b.assessment.suggested) - Number(a.assessment.suggested)
+      orderedIds = [...selected.values()].sort((a, b) => priority(b) - priority(a)
         || (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id).map(row => row.target.id);
     }
     const rows = orderedIds.map(id => selected.get(id));
     const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
-    setText(countNode, state.loading ? 'Loading the faction’s target pool…' : `${rows.length} shown · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
+    const shownReady = freshPool && state.reservationsSupported
+      ? rows.filter(({ target, assessment }) => assessment.suggested && assessment.ready && !target.reserved).length : 0;
+    setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} shown`);
+    setText(panelUi.countDetail, `${rows.length} shown · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
+    cardContainer.setAttribute('aria-busy', String(state.loading));
     for (const [id, cached] of cardNodes) if (!selected.has(id)) { cached.node.remove(); cardNodes.delete(id); }
-    if (!rows.length && !state.loading) {
-      const text = state.targets.length ? 'No targets match these filters. Try All targets or a different stat range.' : 'The target pool is empty. New targets will appear after your faction’s list is updated.';
+    if (!rows.length) {
+      const text = state.loading ? 'Loading the faction’s target pool…' : state.targets.length
+        ? 'No targets match these filters. Try All targets or a different stat range.'
+        : 'The target pool is empty. New targets will appear after your faction’s list is updated.';
       if (!emptyCard) { emptyCard = element('div', text, 'empty'); cardContainer.append(emptyCard); }
       else setText(emptyCard, text);
       mountedIds = []; return;
@@ -1123,7 +1191,7 @@ function mountTargetList(platform, storageWarning = '') {
     for (const { target, assessment } of rows) {
       const signature = JSON.stringify([target, assessment, freshPool, state.pendingChecks.has(target.id), state.loading,
         state.reservationsSupported, C.ageLabel(target.estimateUpdatedAt, now), C.ageLabel(target.lastAction, now),
-        Boolean(target.status?.until > now / 1000)]);
+        Boolean(target.status?.until > now / 1000), Date.parse(target.reservationExpiresAt) > now]);
       let cached = cardNodes.get(target.id);
       if (cached?.signature === signature) continue;
       if (!cached) {
@@ -1135,18 +1203,34 @@ function mountTargetList(platform, storageWarning = '') {
       const top = element('div', null, 'cardhead'); const name = element('div');
       name.append(link(`${target.name || 'Player'} [${target.id}] ↗`, `https://www.torn.com/profiles.php?XID=${target.id}`, 'name'),
         element('div', `${target.faction?.name || 'Faction unknown'}${target.level ? ` · Level ${target.level}` : ''}`, 'muted'));
-      top.append(name, element('span', assessment.label, `badge ${assessment.tone}`)); card.append(top);
+      top.append(name); card.append(top);
       const metrics = element('div', null, 'metrics');
-      const stats = element('div'); stats.append(element('small', 'Estimated battle stats'), element('strong', C.compact(target.estimatedStats)), element('small', `${target.estimateSource || 'No estimate'} · ${C.ageLabel(target.estimateUpdatedAt)}`));
-      const comparison = element('div'); comparison.append(element('small', 'Compared with you'), element('strong', assessment.ratio === null ? 'Unknown' : `${(assessment.ratio * 100).toFixed(0)}% of your stats`));
-      const status = element('div');
-      status.append(element('small', assessment.live ? 'Status checked just now' : 'Status needs checking'), element('strong', target.status?.state || 'Unknown'),
-        element('small', target.lastAction ? `Last active ${C.ageLabel(target.lastAction)}` : 'Activity unknown'));
-      if (target.status?.until > Date.now() / 1000) status.append(element('small', `Until ${new Date(target.status.until * 1000).toLocaleTimeString()}`));
-      metrics.append(stats, comparison, status); card.append(metrics);
+      const stats = element('div', null, 'estimate'); stats.setAttribute('aria-label', 'Estimated battle stats');
+      stats.append(element('strong', C.compact(target.estimatedStats)),
+        element('small', assessment.ratio === null ? 'Comparison unknown' : `${(assessment.ratio * 100).toFixed(0)}% of your stats`),
+        element('small', `${target.estimateSource || 'No estimate'} · ${C.ageLabel(target.estimateUpdatedAt, now)}`));
+      const status = element('div', null, 'availability');
+      const ownLease = !target.reserved && Date.parse(target.reservationExpiresAt) > now;
+      const canAttack = assessment.suggested && assessment.ready && freshPool && !target.reserved && state.reservationsSupported;
+      const unavailable = assessment.live && (target.status?.state !== 'Okay' || assessment.timedUnavailable);
+      const availability = target.reserved ? 'Reserved by another NWA member' : unavailable ? target.status?.state || 'Unavailable' : ownLease ? 'Reserved by you'
+        : !assessment.live ? 'Status needs checking' : canAttack ? 'Ready' : target.status?.state || 'Unknown';
+      status.append(element('strong', availability), element('span', assessment.label, `badge ${assessment.tone}`));
+      if (assessment.suggested && assessment.ready && !target.reserved && !freshPool) status.append(element('small', 'Refresh the list to open an attack'));
+      if ((ownLease || target.reserved) && !assessment.live) status.append(element('small', 'Status needs checking'));
+      if (!assessment.live && target.status?.state) status.append(element('small', `Last known: ${target.status.state}`));
+      if (target.reserved && unavailable) status.append(element('small', target.status?.state || 'Unavailable'));
+      if (ownLease && unavailable) status.append(element('small', 'Reserved by you'));
+      if (ownLease || target.reserved) {
+        const expiry = Date.parse(target.reservationExpiresAt);
+        if (Number.isFinite(expiry) && expiry > now) status.append(element('small', `Held until ${new Date(expiry).toLocaleTimeString()}`));
+      }
+      if (target.status?.until > now / 1000) status.append(element('small', `Until ${new Date(target.status.until * 1000).toLocaleTimeString()}`));
+      else if (!ownLease && !target.reserved) status.append(element('small', target.lastAction ? `Last active ${C.ageLabel(target.lastAction, now)}` : 'Activity unknown'));
+      metrics.append(stats, status); card.append(metrics);
       if (C.reason(target)) card.append(element('div', `Reason: ${C.reason(target)}`, 'notes'));
       const actions = element('div', null, 'actions');
-      const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id)); check.disabled = state.pendingChecks.has(target.id) || state.loading;
+      const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id), 'check-status'); check.disabled = state.pendingChecks.has(target.id) || state.loading;
       actions.append(check);
       const guardAttack = event => {
         if (!state.reservationsSupported) {
@@ -1160,14 +1244,14 @@ function mountTargetList(platform, storageWarning = '') {
         }
         return true;
       };
-      if (assessment.suggested && assessment.ready && freshPool && !target.reserved && state.reservationsSupported) {
+      if (canAttack) {
         const attack = button(state.pendingChecks.has(target.id) ? 'Reserving…' : 'Attack ↗', event => {
           if (guardAttack(event)) void checkStatus(target.id, true);
         }, 'attack');
         attack.disabled = state.pendingChecks.has(target.id); actions.append(attack);
       } else if (assessment.suggested && assessment.ready && freshPool && !target.reserved && !state.reservationsSupported) {
-        actions.append(element('small', 'Target coordination unavailable. Refresh the list.'));
-      } else actions.append(element('small', target.reserved ? 'Reserved by another NWA member' : !assessment.suggested ? assessment.label : assessment.live ? target.status?.description || 'Unavailable right now' : 'Check availability to open attack'));
+        status.append(element('small', 'Target coordination unavailable. Refresh the list.'));
+      }
       card.append(actions);
     }
     if (mountedIds.length !== orderedIds.length || mountedIds.some((id, index) => id !== orderedIds[index])) {
@@ -1179,6 +1263,7 @@ function mountTargetList(platform, storageWarning = '') {
   function toggle(open) {
     state.open = open; panel.hidden = !open; settings.setAttribute('aria-expanded', String(open));
     if (open) { findNotice(''); render(); }
+    else findNotice(finderStatus.textContent || quickNotice.textContent || '');
     if (open && state.token && !state.player && !state.finding) void loadTargets();
   }
   const saved = platform.getValue(storageKey, null);

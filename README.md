@@ -39,21 +39,21 @@ Open Torn and click the green **NWA** button on the right edge. Sign in with you
 
 NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. The finder and list attack buttons first get a shared backend reservation; if another member gets it first, the finder tries another. The current backend holds each assignment for **two minutes**, including earlier targets when you open another one. Your browser also skips players you opened in the last 10 minutes. You start the attack yourself. The finder tries up to five matches within eight seconds. If target coordination is unavailable, NWA asks you to refresh instead of opening an unreserved target. Ordinary Torn links, including those in exports, do not acquire a reservation.
 
-The small **⚙** underneath opens settings, the target list, and suggestions. Set **Min** and **Max** target stats as percentages of your own total; NWA only picks targets within that range. The default is **10–60%**, with the equivalent stat totals shown underneath. Your settings are saved between pages, and your existing maximum is kept when updating. Set **Min** to **0%** to include weaker targets.
+The small **⚙** underneath opens the compact target list and suggestions. **Find target** in the panel works like the green NWA button. Search and **Min / Max** stay above the list; each row shows the player's estimated stats, percentage of your total, availability and attack controls. On Torn PDA, the panel opens nearly full width.
 
-**Maximum estimate age** defaults to **7 days**. You can allow older estimates, up to 365 days; older estimates can be inaccurate, especially beyond 28 days. Refreshing the list may still return the same old FFScouter estimate. The list shows how many targets are ready, too old, or missing stats. **Clear recent targets** lets you choose recently opened players again.
+Set **Min** and **Max** as percentages of your own total. The default is **10–60%**, with the equivalent stat totals shown underneath. Your range is saved between pages. Set **Min** to **0%** to include weaker targets.
+
+Open **Preferences & account** below the targets, or use **⋯** in the header, for your detailed battle stats, estimate-age limit, exports and **Sign out and remove key**. **Maximum estimate age** defaults to **7 days**; older estimates can be inaccurate. **Clear recent targets** lets you choose recently opened players again. Tap the **ready / shown** count for fuller pool diagnostics.
 
 <img src="docs/images/nwa-controls.png" width="720" alt="Actual NWA controls with arrows: NWA finds a target and the gear underneath opens settings">
-
-<img src="docs/images/nwa-login.png" width="720" alt="Actual NWA sign-in panel: read the key storage notice, enter your Limited Torn API key and tap Sign in and save key">
 
 The backend is already set to [targetlist.grusmedia.no](https://targetlist.grusmedia.no). You only need your Torn key.
 
 ## Use
 
 - **Targets:** browse the list, search players/factions/reasons, or filter by estimated stats. **Possible matches** applies your minimum, maximum and estimate-age limit.
-- **Check status:** check a target before opening its attack page.
-- **Export:** open the gear, choose **All targets** or **Shown targets**, then **Export CSV** or **Export Markdown**. Download the file or use **Copy export**; the preview also supports manual text selection in Torn PDA. Exports include estimates, factions, reasons, status timestamps and Torn links.
+- **Check status:** refresh availability. Ready targets offer **Attack**; reserved, stale and unavailable targets are labelled in the row.
+- **Export:** open **Preferences & account**, choose **All targets** or **Shown targets**, then **Export CSV** or **Export Markdown**. Download the file or use **Copy export**; the preview also supports manual text selection in Torn PDA. Exports include estimates, factions, reasons, status timestamps and Torn links.
 - **Profiles and attack pages:** a small NWA badge shares the FairFight line, or the player's name/title line when FFScouter is absent or there is no room. It shows estimated battle stats without adding a row. Tap it for the full reason, estimate source and age. FFScouter is optional. The badge appears after your session and target list have loaded, including for targets outside your stat range.
 - **Suggestions:** suggest a player or faction with a required comment.
 - **Approvals:** faction leaders and co-leaders can approve or reject suggestions.
@@ -62,4 +62,4 @@ Your Limited key verifies your name and faction and reads your battle stats. We 
 
 Only allowed factions can use the list. Instant selection requires an availability check under 30 seconds old. A target can still enter hospital after a check. Battle stats are estimates; attacks are manual.
 
-Disable any separate old **Torn Faction Target List** entry. Your installed version appears in the settings header.
+Disable any separate old **Torn Faction Target List** entry. Your installed version appears at the bottom of the target panel.
