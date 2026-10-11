@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.5.2
+// @version      0.5.3
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/codex/initial/dist/torn-targetlist.user.js
@@ -242,7 +242,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.2' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.5.3' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -545,9 +545,139 @@ function mountTargetList(platform, storageWarning = '') {
     const age = Date.now() - state.poolLoadedAt;
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
   }
-  let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null, pageNoticeObserver = null, pageNoticeTimer = null;
+  let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null;
+  let pageNoticeEstimate = null, pageNoticeEstimateDetail = null, pageNoticeDetail = null, pageNoticeDetails = null;
+  let pageNoticeObserver = null, pageNoticeTimer = null, pageNoticeAnchor = null, pageNoticeResizeObserver = null;
   function removePageNotice() {
-    pageNotice?.remove(); pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
+    pageNotice?.remove(); pageNoticeResizeObserver?.disconnect(); pageNoticeAnchor = null;
+    pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
+    pageNoticeEstimate = null; pageNoticeEstimateDetail = null; pageNoticeDetail = null; pageNoticeDetails = null;
+  }
+  function firstTextLine(anchor) {
+    const rect = anchor.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    // Text ranges measure the occupied part of a block, including FFScouter's
+    // display:contents React mount, without counting its optional second row.
+    if (!document.createTreeWalker || !document.createRange) return rect;
+    const walker = document.createTreeWalker(anchor, 4); // NodeFilter.SHOW_TEXT
+    const range = document.createRange();
+    let line = null, node;
+    const inlineBoxes = new Set();
+    while ((node = walker.nextNode())) {
+      if (!node.textContent.trim()) continue;
+      for (let parent = node.parentElement; parent && parent !== anchor; parent = parent.parentElement) {
+        if (['inline', 'inline-block', 'inline-flex'].includes(window.getComputedStyle?.(parent).display)) inlineBoxes.add(parent);
+      }
+      range.selectNodeContents(node);
+      for (const part of range.getClientRects()) {
+        if (part.width <= 0 || part.height <= 0) continue;
+        if (!line || part.top < line.top - part.height / 2) {
+          line = { left: part.left, right: part.right, top: part.top, bottom: part.bottom, height: part.height };
+        } else if (Math.abs(part.top - line.top) < Math.min(part.height, line.height) / 2) {
+          line.right = Math.max(line.right, part.right); line.bottom = Math.max(line.bottom, part.bottom);
+          line.height = line.bottom - line.top;
+        }
+      }
+    }
+    if (line) {
+      // The FF badge's padding and trailing source SVG occupy space too, even
+      // when the following stats text has wrapped onto a second line.
+      for (const box of [...inlineBoxes, ...(anchor.querySelectorAll?.('svg, img, canvas, video, button, input, select') || [])]) {
+        for (const part of box.getClientRects()) {
+          if (part.width > 0 && part.height > 0 && part.height <= line.height + 12
+              && part.top < line.bottom && part.bottom > line.top) line.right = Math.max(line.right, part.right);
+        }
+      }
+    }
+    return line;
+  }
+  function pageNoticePlacement(id) {
+    const viewport = window.visualViewport;
+    const left = Math.max(0, viewport?.offsetLeft || 0);
+    const top = Math.max(0, viewport?.offsetTop || 0);
+    const width = viewport?.width || window.innerWidth || document.documentElement.clientWidth;
+    const height = viewport?.height || window.innerHeight || document.documentElement.clientHeight;
+    const right = left + width, bottom = top + height;
+    const placement = (anchor, type) => {
+      const line = firstTextLine(anchor);
+      if (!line || line.bottom <= top || line.top >= bottom) return null;
+      const badgeTop = Math.max(top, Math.min(bottom - 22, line.top + (line.height - 22) / 2));
+      const anchorRect = anchor.getBoundingClientRect();
+      const parentRect = anchor.parentElement?.getBoundingClientRect?.();
+      let edge = Math.min(right - 8, Math.max(anchorRect.right, parentRect?.right || 0));
+      // Respect native controls already sharing the heading's row.
+      for (const sibling of anchor.parentElement?.children || []) {
+        if (sibling === anchor || sibling === pageNotice) continue;
+        const rect = sibling.getBoundingClientRect?.();
+        if (rect?.width > 0 && rect.height > 0 && rect.left > line.right
+            && rect.top < badgeTop + 22 && rect.bottom > badgeTop) edge = Math.min(edge, rect.left - 6);
+      }
+      for (const control of root.querySelectorAll?.('.launcher, .settings-toggle') || []) {
+        const rect = control.getBoundingClientRect?.();
+        if (rect?.width > 0 && rect.top < badgeTop + 22 && rect.bottom > badgeTop) edge = Math.min(edge, rect.left - 6);
+      }
+      const x = Math.max(left + 8, line.right + 8), available = Math.floor(edge - x);
+      if (available < 90) return null;
+      return { anchor, type, left: x, top: badgeTop,
+        width: Math.min(340, available), viewportLeft: left, viewportRight: right, viewportWidth: width,
+        viewportTop: top, viewportBottom: bottom, viewportHeight: height };
+    };
+    for (const anchor of document.querySelectorAll?.('.ffscouter-info-line') || []) {
+      const match = placement(anchor, 'ffscouter');
+      if (match) return match;
+    }
+    const attack = new URL(window.location.href).pathname !== '/profiles.php';
+    if (attack) {
+      const labels = [...(document.querySelectorAll?.('[class*="labelsContainer"]') || [])];
+      const defenders = labels.filter(label => label.closest?.('[class*="defender"]'));
+      const matching = defenders.filter(label => [...(label.closest('[class*="defender"]').querySelectorAll('a[href*="profiles.php"]'))]
+        .some(link => {
+          try { return C.pageTargetId(new URL(link.getAttribute('href') || link.href, window.location.href).href) === id; }
+          catch { return false; }
+        }));
+      for (const anchor of matching.length ? matching : defenders.length === 1 ? defenders : []) {
+        const match = placement(anchor, 'attack');
+        if (match) return match;
+      }
+    }
+    const headings = [...(document.querySelectorAll?.('h1, h2, h3, h4, [role="heading"]') || [])]
+      .filter(heading => !host.contains(heading) && !pageNotice?.contains(heading)
+        && heading.closest?.('#content-wrapper, #mainContainer, main, .content-wrapper, [role="main"]'));
+    const named = headings.filter(heading => heading.textContent.includes(`[${id}]`));
+    for (const anchor of [...named, headings[0]].filter(Boolean)) {
+      const match = placement(anchor, attack ? 'attack' : 'profile');
+      if (match) return match;
+    }
+    return null;
+  }
+  function positionPageNotice(id) {
+    const match = pageNoticePlacement(id);
+    if (pageNoticeAnchor !== match?.anchor) {
+      pageNoticeResizeObserver?.disconnect(); pageNoticeAnchor = match?.anchor || null;
+      if (pageNoticeAnchor && typeof ResizeObserver === 'function') {
+        pageNoticeResizeObserver ||= new ResizeObserver(schedulePageNotice);
+        pageNoticeResizeObserver.observe(pageNoticeAnchor);
+        if (pageNoticeAnchor.parentElement) pageNoticeResizeObserver.observe(pageNoticeAnchor.parentElement);
+      }
+    }
+    if (!match) { pageNotice.remove(); return; }
+    const style = (node, property, value) => { if (node.style[property] !== value) node.style[property] = value; };
+    const attribute = (name, value) => { if (pageNotice.getAttribute(name) !== value) pageNotice.setAttribute(name, value); };
+    attribute('data-placement', match.type); attribute('data-compact', String(match.width < 190));
+    style(pageNotice, 'left', `${match.left}px`); style(pageNotice, 'top', `${match.top}px`); style(pageNotice, 'width', `${match.width}px`);
+    const detailWidth = Math.min(300, match.viewportWidth - 16);
+    const detailLeft = Math.max(match.viewportLeft + 8, Math.min(match.left, match.viewportRight - detailWidth - 8));
+    style(pageNoticeDetail, 'width', `${detailWidth}px`); style(pageNoticeDetail, 'left', `${detailLeft - match.left}px`);
+    const below = Math.max(0, match.viewportBottom - match.top - 22 - 12);
+    const above = Math.max(0, match.top - match.viewportTop - 12);
+    const preferredHeight = Math.min(200, match.viewportHeight * 0.4);
+    const upwards = below < preferredHeight && above > below;
+    style(pageNoticeDetail, 'top', upwards ? 'auto' : 'calc(100% + 4px)');
+    style(pageNoticeDetail, 'bottom', upwards ? 'calc(100% + 4px)' : 'auto');
+    style(pageNoticeDetail, 'maxHeight', `${Math.min(preferredHeight, upwards ? above : below)}px`);
+    // A fixed badge shares the existing text line without changing its wrapping
+    // or height. Body mounting also keeps the popup out of Torn's clipped panels.
+    if (pageNotice.parentNode !== document.body) document.body.append(pageNotice);
   }
   function updatePageNotice() {
     if (host.isConnected === false) {
@@ -562,42 +692,61 @@ function mountTargetList(platform, storageWarning = '') {
       const noticeRoot = pageNotice.attachShadow({ mode: 'closed' });
       const style = element('style');
       style.textContent = `
-        :host{all:initial;display:block;box-sizing:border-box;width:max-content;max-width:min(340px,100%);min-width:0;margin:4px 0;font:10px/1.2 Arial,Helvetica,sans-serif;color:#d4d4d8}
+        :host{all:initial;position:fixed;z-index:2147483001;display:inline-block;box-sizing:border-box;max-width:340px;min-width:0;margin:0;font:10px/1.2 Arial,Helvetica,sans-serif;color:#d4d4d8}
         *{box-sizing:border-box}
         .notice{position:relative;max-width:100%;border:1px solid rgba(113,113,122,.65);border-radius:4px;background:rgba(24,24,27,.72)}
         summary{display:flex;align-items:center;gap:5px;height:20px;min-width:0;padding:1px 5px;list-style:none;cursor:pointer}
         summary::-webkit-details-marker{display:none}
         summary:focus-visible{outline:2px solid #9fbd57;outline-offset:2px;border-radius:3px}
         .title{flex:0 0 auto;color:#9fbd57;font-size:9px;font-weight:800;white-space:nowrap}
+        .estimate{flex:0 0 auto;white-space:nowrap}.estimate[data-stale="true"]{color:#e6bd76}
         .reason{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .chevron{flex:0 0 auto;margin-left:auto;color:#a1a1aa;font-size:10px}
         details[open] .chevron{transform:rotate(180deg)}
-        .detail{position:absolute;z-index:2147483001;top:calc(100% + 4px);left:0;width:100%;max-height:min(200px,40vh);overflow:auto;padding:8px;border:1px solid #52525b;border-radius:4px;background:#18181b;color:#e4e4e7;font-size:11px;line-height:1.4;overflow-wrap:anywhere;box-shadow:0 4px 12px #0004}
-        p{margin:0}.full-reason{margin-top:4px;white-space:pre-wrap}
+        :host([data-compact="true"]) summary{gap:3px;padding:1px 3px}
+        :host([data-compact="true"]) .reason,:host([data-compact="true"]) .estimate-label{display:none}
+        :host([data-compact="true"]) .estimate[data-known="true"] .estimate-value::before{content:'~'}
+        .detail{position:absolute;z-index:2147483001;top:calc(100% + 4px);left:0;max-height:min(200px,40vh);overflow:auto;padding:8px;border:1px solid #52525b;border-radius:4px;background:#18181b;color:#e4e4e7;font-size:11px;line-height:1.4;overflow-wrap:anywhere;box-shadow:0 4px 12px #0004}
+        p{margin:0}.full-reason,.estimate-detail{margin-top:4px;white-space:pre-wrap}
       `;
       const notice = element('section', null, 'notice');
       notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', 'NWA target list notice');
-      const details = element('details'); pageNoticeSummary = element('summary');
+      pageNoticeDetails = element('details'); pageNoticeSummary = element('summary');
       pageNoticeReason = element('span', null, 'reason');
+      const estimate = element('span', null, 'estimate');
+      pageNoticeEstimate = element('span', null, 'estimate-value');
+      estimate.append(element('span', 'Est. ', 'estimate-label'), pageNoticeEstimate);
       const chevron = element('span', '⌄', 'chevron'); chevron.setAttribute('aria-hidden', 'true');
-      pageNoticeSummary.append(element('strong', 'NWA target list', 'title'), pageNoticeReason, chevron);
-      const detail = element('div', null, 'detail'); pageNoticeFullReason = element('p', null, 'full-reason');
-      detail.append(element('p', 'This player is on the NWA target list.'), pageNoticeFullReason);
-      details.append(pageNoticeSummary, detail); notice.append(details);
+      pageNoticeSummary.append(element('strong', 'NWA', 'title'), estimate, pageNoticeReason, chevron);
+      pageNoticeDetail = element('div', null, 'detail'); pageNoticeFullReason = element('p', null, 'full-reason');
+      pageNoticeEstimateDetail = element('p', null, 'estimate-detail');
+      pageNoticeDetail.append(element('p', 'This player is on the NWA target list.'), pageNoticeEstimateDetail, pageNoticeFullReason);
+      pageNoticeDetails.append(pageNoticeSummary, pageNoticeDetail); notice.append(pageNoticeDetails);
       noticeRoot.append(style, notice);
+      noticeRoot.addEventListener('keydown', event => {
+        if (event.key === 'Escape') { pageNoticeDetails.open = false; pageNoticeSummary.focus(); }
+      });
     }
     const reason = (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || 'No reason provided.';
     const text = `Reason: ${reason}`;
     // Reasons are text, including any markup characters supplied in a suggestion.
     if (pageNoticeReason.textContent !== text) {
-      pageNoticeReason.textContent = text; pageNoticeFullReason.textContent = text; pageNoticeSummary.title = text;
+      pageNoticeReason.textContent = text; pageNoticeFullReason.textContent = text;
     }
-    const container = document.querySelector?.('#content-wrapper')
-      || document.querySelector?.('#mainContainer .content-wrapper')
-      || document.querySelector?.('#mainContainer') || document.querySelector?.('main')
-      || document.querySelector?.('.content-wrapper') || document.body;
-    if (pageNotice.parentNode !== container) container.prepend(pageNotice);
+    const known = typeof target.estimatedStats === 'number' && Number.isFinite(target.estimatedStats) && target.estimatedStats > 0;
+    const estimate = known ? C.compact(target.estimatedStats) : 'Unknown';
+    const fresh = known && assessTarget(target).fresh;
+    const estimateDetail = known
+      ? `Estimated battle stats: ${estimate} · ${target.estimateSource || 'Source unknown'} · ${C.ageLabel(target.estimateUpdatedAt)}${fresh ? '' : ' · Estimate needs refresh'}`
+      : 'Estimated battle stats: Unknown · No estimate available';
+    if (pageNoticeEstimate.textContent !== estimate) pageNoticeEstimate.textContent = estimate;
+    if (pageNoticeEstimate.parentElement.getAttribute('data-known') !== String(known)) pageNoticeEstimate.parentElement.setAttribute('data-known', String(known));
+    if (pageNoticeEstimate.parentElement.getAttribute('data-stale') !== String(known && !fresh)) pageNoticeEstimate.parentElement.setAttribute('data-stale', String(known && !fresh));
+    if (pageNoticeEstimateDetail.textContent !== estimateDetail) pageNoticeEstimateDetail.textContent = estimateDetail;
+    const description = `${estimateDetail}. ${text}`;
+    if (pageNoticeSummary.title !== description) { pageNoticeSummary.title = description; pageNoticeSummary.setAttribute('aria-label', `NWA target list. ${description}`); }
+    positionPageNotice(id);
   }
   function schedulePageNotice() {
     if (pageNoticeTimer !== null) return;
@@ -1097,9 +1246,13 @@ function mountTargetList(platform, storageWarning = '') {
   });
   window.addEventListener?.('popstate', updatePageNotice);
   window.addEventListener?.('hashchange', updatePageNotice);
+  window.addEventListener?.('resize', schedulePageNotice);
+  window.addEventListener?.('scroll', schedulePageNotice, { passive: true, capture: true });
+  window.visualViewport?.addEventListener('resize', schedulePageNotice);
+  window.visualViewport?.addEventListener('scroll', schedulePageNotice);
   if (typeof MutationObserver === 'function') {
     pageNoticeObserver = new MutationObserver(schedulePageNotice);
-    pageNoticeObserver.observe(document.body, { childList: true, subtree: true });
+    pageNoticeObserver.observe(document.body, { childList: true, characterData: true, subtree: true });
   }
   // Expire the session and checked attack links even while the panel is idle.
   setInterval(() => {

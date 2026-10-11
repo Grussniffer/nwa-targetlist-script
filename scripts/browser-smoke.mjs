@@ -340,12 +340,19 @@ async function noticeGeometry(page) {
       return { left, right, top, bottom, width, height };
     };
     const reason = root.querySelector('.reason');
+    const content = document.querySelector('#content-wrapper');
     return {
       host: rect(host), summary: rect(root.querySelector('summary')),
-      open: root.querySelector('details').open, headingTop: document.querySelector('#content-wrapper h1').getBoundingClientRect().top,
+      open: root.querySelector('details').open, headingTop: content.querySelector('h1').getBoundingClientRect().top,
+      nextContentTop: content.querySelector('p')?.getBoundingClientRect().top,
+      contentHeight: content.getBoundingClientRect().height,
+      parent: host.parentElement.tagName, position: getComputedStyle(host).position,
+      placement: host.getAttribute('data-placement'),
+      estimate: root.querySelector('.estimate')?.textContent,
+      estimateDetail: root.querySelector('.estimate-detail')?.textContent,
       reason: { text: reason.textContent, width: reason.clientWidth, scrollWidth: reason.scrollWidth,
         overflow: getComputedStyle(reason).overflow, ellipsis: getComputedStyle(reason).textOverflow,
-        whiteSpace: getComputedStyle(reason).whiteSpace },
+        whiteSpace: getComputedStyle(reason).whiteSpace, display: getComputedStyle(reason).display },
       fullReason: root.querySelector('.full-reason').textContent, detail: rect(root.querySelector('.detail')),
       viewportWidth: innerWidth, documentWidth: document.documentElement.scrollWidth,
     };
@@ -354,14 +361,20 @@ async function noticeGeometry(page) {
 
 function assertCompactNotice(geometry, longReason = false) {
   assert.equal(geometry.open, false, 'the reason chip starts collapsed');
+  assert.equal(geometry.parent, 'BODY', 'the badge escapes clipped Torn and FFScouter containers');
+  assert.equal(geometry.position, 'fixed', 'the badge contributes no row to page flow');
+  assert.match(geometry.estimate, /^Est\. /, 'NWA shows its own stored estimate');
   assert(geometry.host.height > 0 && geometry.host.height <= 22.1, JSON.stringify(geometry));
   assert(geometry.host.width > 0 && geometry.host.width <= 340.1, JSON.stringify(geometry));
   assert(geometry.host.left >= 0 && geometry.host.right <= geometry.viewportWidth && geometry.documentWidth <= geometry.viewportWidth, JSON.stringify(geometry));
   if (longReason) {
-    assert(geometry.reason.scrollWidth > geometry.reason.width, 'a long reason is visually truncated in the collapsed row');
-    assert.equal(geometry.reason.whiteSpace, 'nowrap');
-    assert.equal(geometry.reason.overflow, 'hidden');
-    assert.equal(geometry.reason.ellipsis, 'ellipsis');
+    assert.equal(geometry.fullReason, geometry.reason.text, 'the complete reason remains available in the popup');
+    if (geometry.reason.display !== 'none') {
+      assert(geometry.reason.scrollWidth > geometry.reason.width, 'a long reason is visually truncated in the collapsed row');
+      assert.equal(geometry.reason.whiteSpace, 'nowrap');
+      assert.equal(geometry.reason.overflow, 'hidden');
+      assert.equal(geometry.reason.ellipsis, 'ellipsis');
+    }
   }
 }
 
@@ -381,6 +394,62 @@ async function tapShadow(page, selector) {
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   }, selector);
   await page.touchscreen.tap(point.x, point.y);
+}
+
+function makeFfscouterFixture(input) {
+  const { reason, longLine = false, marginTop = 140 } = typeof input === 'object' ? input : { reason: input };
+  const content = document.createElement('main'); content.id = 'content-wrapper';
+  content.style.cssText = `margin:${marginTop}px 20px 20px;max-width:760px;overflow:hidden`;
+  content.innerHTML = '<h1>Attacking</h1>'
+    + '<div class="ffscouter-info-line" style="font:12px/22px Arial,sans-serif;white-space:nowrap">'
+    + '<div class="ffscouter-react-child" style="display:contents">'
+    + '<span class="ffscouter-first-line" style="display:inline-block;padding:0 4px;border-radius:3px;background:#253b32">FairFight: 2.85</span>'
+    + '<svg class="ffscouter-source-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" style="width:16px;height:16px;margin-left:4px;vertical-align:middle" aria-label="Estimate source">'
+    + '<circle cx="8" cy="8" r="6" fill="#79ad8e"/></svg><br>'
+    + '<span class="ffscouter-battle-estimate">Estimated Battle Stats: 5.2M</span></div></div>'
+    + '<p id="next-attack-content">Mock Torn attack controls and defender details.</p>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px;padding:16px;border:1px solid #354956;border-radius:5px;background:#19232d">'
+    + '<div><strong>MockChainer [90001]</strong><div style="height:8px;margin:12px 0;background:#69b24a"></div>'
+    + '<div style="height:110px;background:#14222d;padding:12px;font-size:12px">Attacker · mock browser fixture</div></div>'
+    + '<div class="defender-wrapper"><div class="labelsContainer_mock"><a href="https://www.torn.com/profiles.php?XID=101" style="color:inherit">Willow [101]</a></div>'
+    + '<div style="height:8px;margin:12px 0;background:#b78b4c"></div>'
+    + '<div style="height:110px;background:#14222d;padding:12px;font-size:12px">Defender · mock browser fixture</div></div></div>';
+  if (longLine) {
+    const line = content.querySelector('.ffscouter-info-line');
+    line.style.font = '14px/22px Arial,sans-serif'; line.style.whiteSpace = 'normal';
+    line.querySelector('.ffscouter-first-line').textContent = 'FairFight: 2.39 (Moderately difficult) Est. Stats: 724M';
+    line.querySelector('br').remove(); line.querySelector('.ffscouter-battle-estimate').remove();
+  }
+  document.body.append(content); window.__mock.targets[0].reason = reason;
+  window.__noticeFlowBefore = {
+    headingTop: content.querySelector('h1').getBoundingClientRect().top,
+    nextContentTop: content.querySelector('p').getBoundingClientRect().top,
+    height: content.getBoundingClientRect().height,
+    fairFightText: content.querySelector('.ffscouter-info-line').textContent
+  };
+}
+
+async function assertAlongsideFfscouter(page) {
+  const geometry = await noticeGeometry(page);
+  const row = await page.evaluate(() => {
+    const line = document.querySelector('.ffscouter-first-line').getBoundingClientRect();
+    const sourceIcon = document.querySelector('.ffscouter-source-icon').getBoundingClientRect();
+    return { left: line.left, right: line.right, top: line.top, bottom: line.bottom,
+      sourceRight: sourceIcon.right,
+      text: document.querySelector('.ffscouter-info-line').textContent,
+      bodyChild: document.getElementById('nwa-target-page-notice').parentNode === document.body,
+      reactRect: document.querySelector('.ffscouter-react-child').getBoundingClientRect().height };
+  });
+  assertCompactNotice(geometry, true);
+  assert.equal(geometry.placement, 'ffscouter');
+  assert.equal(row.reactRect, 0, 'the fixture exercises FFScouter display:contents React children');
+  assert(geometry.host.left >= row.sourceRight + 2, 'NWA does not overlap FairFight badge padding or its trailing source icon');
+  assert(Math.abs((geometry.host.top + geometry.host.bottom) / 2 - (row.top + row.bottom) / 2) <= 3,
+    `NWA must share the first FairFight line: ${JSON.stringify({ geometry, row })}`);
+  assert.equal(row.bodyChild, true, 'the badge avoids clipping by the FFScouter container');
+  assert.match(geometry.estimate, /300K/, 'NWA uses its own estimate rather than FFScouter rendered text');
+  assert.doesNotMatch(geometry.estimate, /5\.2M/);
+  return geometry;
 }
 
 try {
@@ -1080,6 +1149,8 @@ try {
     content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
     content.innerHTML = '<h1>Willow [101]</h1><p>Mock Torn player profile content.</p>';
     document.body.append(content);
+    window.__noticeFlowBefore = { headingTop: content.querySelector('h1').getBoundingClientRect().top,
+      nextContentTop: content.querySelector('p').getBoundingClientRect().top, height: content.getBoundingClientRect().height };
     window.__mock.targets[0].notes = reason;
   }, longNoticeReason, 'https://www.torn.com/profiles.php?XID=101');
   assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice')), null);
@@ -1087,11 +1158,19 @@ try {
   await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
   assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.textContent), /This player is on the NWA target list\./);
   assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /Reason: Preferred chain target/);
-  assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.id), 'nwa-target-page-notice');
+  assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.tagName), 'H1');
+  assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice').parentElement === document.body), true);
   assert.equal(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('section').getAttribute('aria-label')), 'NWA target list notice');
   await shadow(profileNotice, '.header .icon', 'click');
   const collapsedNotice = await noticeGeometry(profileNotice);
   assertCompactNotice(collapsedNotice, true);
+  const profileFlowBefore = await profileNotice.evaluate(() => window.__noticeFlowBefore);
+  assert.equal(collapsedNotice.headingTop, profileFlowBefore.headingTop);
+  assert.equal(collapsedNotice.nextContentTop, profileFlowBefore.nextContentTop);
+  assert.equal(collapsedNotice.contentHeight, profileFlowBefore.height, 'the NWA badge adds no row to the profile');
+  assert.equal(collapsedNotice.placement, 'profile');
+  assert.equal(collapsedNotice.estimate, 'Est. 300K');
+  assert.match(collapsedNotice.estimateDetail, /FFScouter/i);
   await profileNotice.screenshot({ path: path.join(artifacts, 'browser-profile-notice-desktop.png'), fullPage: true });
   await clickNotice(profileNotice);
   await wait(profileNotice, () => window.__playerNoticeShadow.querySelector('details').open);
@@ -1105,6 +1184,7 @@ try {
   await wait(profileNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
   for (const width of [390, 320]) {
     await profileNotice.setViewportSize({ width, height: 844 });
+    await profileNotice.waitForTimeout(150);
     const collapsed = await noticeGeometry(profileNotice);
     assertCompactNotice(collapsed, true);
     await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('summary').focus());
@@ -1119,11 +1199,15 @@ try {
     await profileNotice.screenshot({ path: path.join(artifacts, width === 390 ? 'browser-profile-notice-mobile.png' : 'browser-profile-notice-mobile-320.png'), fullPage: true });
   }
   await profileNotice.evaluate(() => {
+    window.__noticeBeforeReplacement = document.getElementById('nwa-target-page-notice');
     const replacement = document.createElement('main'); replacement.id = 'content-wrapper';
     replacement.innerHTML = '<h1>Replacement profile content</h1>';
     document.getElementById('content-wrapper').replaceWith(replacement);
   });
-  await wait(profileNotice, () => document.getElementById('content-wrapper').firstElementChild?.id === 'nwa-target-page-notice');
+  await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice'))
+    && document.getElementById('nwa-target-page-notice').getAttribute('data-placement') === 'profile');
+  assert.equal(await profileNotice.evaluate(() => document.getElementById('nwa-target-page-notice') === window.__noticeBeforeReplacement), true);
+  assert.equal(await profileNotice.evaluate(() => document.querySelector('#content-wrapper').firstElementChild.tagName), 'H1');
   assert.equal(await profileNotice.evaluate(() => document.querySelectorAll('#nwa-target-page-notice').length), 1);
   await profileNotice.evaluate(() => {
     history.pushState({}, '', '/profiles.php?XID=999');
@@ -1144,7 +1228,173 @@ try {
   });
   await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
   await profileNotice.close();
-  console.log('PASS compact profile chip and ellipsis, mouse and keyboard disclosure without layout movement, desktop/390/320px width, stat-independent attack notice, SPA and container cleanup');
+  console.log('PASS independent profile badge shows NWA estimate without adding a row; mouse/keyboard popup, desktop/390/320px width, stat-independent attack fallback and SPA cleanup');
+
+  const ffNotice = await mount(undefined, [source], context, makeFfscouterFixture, longNoticeReason,
+    'https://www.torn.com/page.php?sid=attack&user2ID=101');
+  await login(ffNotice); await shadow(ffNotice, '.header .icon', 'click');
+  await wait(ffNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-placement') === 'ffscouter');
+  const ffCollapsed = await assertAlongsideFfscouter(ffNotice);
+  const ffBefore = await ffNotice.evaluate(() => window.__noticeFlowBefore);
+  assert.equal(ffCollapsed.headingTop, ffBefore.headingTop);
+  assert.equal(ffCollapsed.nextContentTop, ffBefore.nextContentTop);
+  assert.equal(ffCollapsed.contentHeight, ffBefore.height, 'NWA adds no height to the existing FFScouter lines');
+  assert.equal(await ffNotice.evaluate(() => document.querySelector('.ffscouter-info-line').textContent), ffBefore.fairFightText,
+    'FFScouter text is not rewritten');
+  await ffNotice.screenshot({ path: path.join(artifacts, 'browser-ffscouter-nwa-desktop.png'), fullPage: true });
+  await clickNotice(ffNotice);
+  await wait(ffNotice, () => window.__playerNoticeShadow.querySelector('details').open);
+  const ffExpanded = await noticeGeometry(ffNotice);
+  assert.equal(ffExpanded.headingTop, ffBefore.headingTop);
+  assert.equal(ffExpanded.nextContentTop, ffBefore.nextContentTop);
+  assert.equal(ffExpanded.contentHeight, ffBefore.height);
+  assert.equal(ffExpanded.fullReason, `Reason: ${longNoticeReason}`);
+  assert.match(ffExpanded.estimateDetail, /300K/);
+  assert.match(ffExpanded.estimateDetail, /FFScouter/);
+  await clickNotice(ffNotice);
+  await ffNotice.evaluate(() => {
+    window.__sameNoticeHost = document.getElementById('nwa-target-page-notice');
+    window.__ffscouterMarkup = document.querySelector('.ffscouter-info-line').outerHTML;
+    document.querySelector('.ffscouter-info-line').remove();
+  });
+  await wait(ffNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-placement') === 'attack');
+  assert.match((await noticeGeometry(ffNotice)).estimate, /300K/, 'NWA still works after FFScouter disappears');
+  await ffNotice.evaluate(() => {
+    document.querySelector('#next-attack-content').insertAdjacentHTML('beforebegin', window.__ffscouterMarkup);
+  });
+  await wait(ffNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-placement') === 'ffscouter');
+  await assertAlongsideFfscouter(ffNotice);
+  await ffNotice.evaluate(() => {
+    const replacement = document.createElement('div'); replacement.innerHTML = window.__ffscouterMarkup;
+    replacement.firstElementChild.querySelector('.ffscouter-first-line').textContent = 'FairFight: 3.10';
+    document.querySelector('.ffscouter-info-line').replaceWith(replacement.firstElementChild);
+  });
+  await ffNotice.waitForTimeout(150);
+  await assertAlongsideFfscouter(ffNotice);
+  assert.equal(await ffNotice.evaluate(() => document.getElementById('nwa-target-page-notice') === window.__sameNoticeHost), true,
+    'late or replaced FFScouter markup moves the existing badge');
+  assert.equal(await ffNotice.evaluate(() => document.querySelectorAll('#nwa-target-page-notice').length), 1);
+  await ffNotice.close();
+  console.log('PASS NWA shares FFScouter FairFight first line with its own estimate, no added row or rewritten text; absent, late and replaced FFScouter preserve one badge');
+
+  const ffTouchContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await ffTouchContext.route('**/*', route => { networkRequests++; return route.abort(); });
+  try {
+    const ffTouch = await mount({ width: 390, height: 844 }, [source], ffTouchContext, makeFfscouterFixture, longNoticeReason,
+      'https://www.torn.com/page.php?sid=attack&user2ID=101');
+    await login(ffTouch); await shadow(ffTouch, '.header .icon', 'click');
+    for (const width of [390, 320]) {
+      await ffTouch.setViewportSize({ width, height: 844 });
+      await ffTouch.waitForTimeout(150);
+      const collapsed = await assertAlongsideFfscouter(ffTouch);
+      await clickNotice(ffTouch, true);
+      await wait(ffTouch, () => window.__playerNoticeShadow.querySelector('details').open);
+      const expanded = await noticeGeometry(ffTouch);
+      assert.equal(expanded.headingTop, collapsed.headingTop);
+      assert.equal(expanded.nextContentTop, collapsed.nextContentTop);
+      assert.equal(expanded.contentHeight, collapsed.contentHeight);
+      assert.equal(expanded.fullReason, `Reason: ${longNoticeReason}`);
+      assert(expanded.detail.left >= 0 && expanded.detail.right <= width, JSON.stringify(expanded));
+      assert.equal(await ffTouch.evaluate(() => {
+        const detail = window.__playerNoticeShadow.querySelector('.detail').getBoundingClientRect();
+        return document.elementFromPoint(detail.left + detail.width / 2, detail.top + Math.min(15, detail.height / 2))?.id;
+      }), 'nwa-target-page-notice');
+      await ffTouch.screenshot({ path: path.join(artifacts, `browser-ffscouter-nwa-touch-${width}.png`), fullPage: true });
+      await clickNotice(ffTouch, true);
+      await wait(ffTouch, () => !window.__playerNoticeShadow.querySelector('details').open);
+    }
+    await ffTouch.close();
+
+    const longFfDesktop = await mount(undefined, [source], context, makeFfscouterFixture,
+      { reason: longNoticeReason, longLine: true }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+    await login(longFfDesktop); await shadow(longFfDesktop, '.header .icon', 'click');
+    const longDesktopGeometry = await assertAlongsideFfscouter(longFfDesktop);
+    const longDesktopBefore = await longFfDesktop.evaluate(() => window.__noticeFlowBefore);
+    assert.equal(longDesktopGeometry.headingTop, longDesktopBefore.headingTop);
+    assert.equal(longDesktopGeometry.nextContentTop, longDesktopBefore.nextContentTop);
+    assert.equal(longDesktopGeometry.contentHeight, longDesktopBefore.height);
+    await longFfDesktop.screenshot({ path: path.join(artifacts, 'browser-ffscouter-long-nwa-desktop.png'), fullPage: true });
+    await longFfDesktop.close();
+    for (const width of [390, 320]) {
+      const longFfTouch = await mount({ width, height: 844 }, [source], ffTouchContext, makeFfscouterFixture,
+        { reason: longNoticeReason, longLine: true }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+      await login(longFfTouch); await shadow(longFfTouch, '.header .icon', 'click');
+      const geometry = await noticeGeometry(longFfTouch); assertCompactNotice(geometry, true);
+      assert.equal(geometry.placement, 'attack', 'a full FFScouter line uses an existing native attack line');
+      const before = await longFfTouch.evaluate(() => window.__noticeFlowBefore);
+      assert.equal(geometry.headingTop, before.headingTop);
+      assert.equal(geometry.nextContentTop, before.nextContentTop);
+      assert.equal(geometry.contentHeight, before.height);
+      assert.equal(await longFfTouch.evaluate(() => {
+        const badge = document.getElementById('nwa-target-page-notice').getBoundingClientRect();
+        const ff = document.querySelector('.ffscouter-first-line').getBoundingClientRect();
+        return Math.max(0, Math.min(badge.right, ff.right) - Math.max(badge.left, ff.left))
+          * Math.max(0, Math.min(badge.bottom, ff.bottom) - Math.max(badge.top, ff.top));
+      }), 0, 'native fallback never covers the long FairFight/estimate text');
+      assert.equal(await longFfTouch.evaluate(() => {
+        const badge = document.getElementById('nwa-target-page-notice').getBoundingClientRect();
+        const launcher = window.__targetlistShadow.querySelector('.launcher').getBoundingClientRect();
+        return Math.max(0, Math.min(badge.right, launcher.right) - Math.max(badge.left, launcher.left))
+          * Math.max(0, Math.min(badge.bottom, launcher.bottom) - Math.max(badge.top, launcher.top));
+      }), 0, 'the inline badge does not obscure NWA’s floating finder button');
+      await clickNotice(longFfTouch, true);
+      await wait(longFfTouch, () => window.__playerNoticeShadow.querySelector('details').open);
+      const expanded = await noticeGeometry(longFfTouch);
+      assert.match(expanded.estimateDetail, /300K/);
+      assert.doesNotMatch(expanded.estimateDetail, /724M/);
+      assert.equal(expanded.fullReason, `Reason: ${longNoticeReason}`);
+      assert(expanded.detail.left >= 0 && expanded.detail.right <= width, JSON.stringify(expanded));
+      await longFfTouch.screenshot({ path: path.join(artifacts, `browser-ffscouter-long-nwa-mobile-${width}.png`), fullPage: true });
+      await longFfTouch.close();
+    }
+    console.log('PASS screenshot-shaped long FairFight/difficulty/estimate row shares NWA on desktop; 390/320px native fallback avoids overlap and adds no height');
+
+    const bottomFfTouch = await mount({ width: 320, height: 300 }, [source], ffTouchContext, makeFfscouterFixture,
+      { reason: longNoticeReason, marginTop: 220 }, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+    await login(bottomFfTouch); await shadow(bottomFfTouch, '.header .icon', 'click');
+    const bottomCollapsed = await assertAlongsideFfscouter(bottomFfTouch);
+    await clickNotice(bottomFfTouch, true);
+    await wait(bottomFfTouch, () => window.__playerNoticeShadow.querySelector('details').open);
+    const bottomExpanded = await noticeGeometry(bottomFfTouch);
+    assert(bottomExpanded.detail.top >= 0 && bottomExpanded.detail.bottom <= 300, JSON.stringify(bottomExpanded));
+    assert(bottomExpanded.detail.bottom <= bottomExpanded.host.top, 'a low anchor opens the popup above its badge');
+    assert.equal(bottomExpanded.headingTop, bottomCollapsed.headingTop);
+    assert.equal(bottomExpanded.nextContentTop, bottomCollapsed.nextContentTop);
+    assert.equal(bottomExpanded.contentHeight, bottomCollapsed.contentHeight);
+    assert.equal(bottomExpanded.fullReason, `Reason: ${longNoticeReason}`);
+    await bottomFfTouch.screenshot({ path: path.join(artifacts, 'browser-ffscouter-nwa-popup-small-height.png'), fullPage: true });
+    assert.equal(await bottomFfTouch.evaluate(() => {
+      const detail = window.__playerNoticeShadow.querySelector('.detail');
+      const scrollable = detail.scrollHeight > detail.clientHeight;
+      detail.scrollTop = detail.scrollHeight;
+      return scrollable && detail.scrollTop > 0;
+    }), true, 'the complete long reason remains scrollable inside the small visible viewport');
+    await bottomFfTouch.close();
+    console.log('PASS low FFScouter anchor in a 320x300 viewport opens the scrollable full-reason popup above the badge with no page movement');
+
+    const unknownNarrow = await mount({ width: 320, height: 844 }, [source], ffTouchContext, makeFfscouterFixture,
+      longNoticeReason, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
+    await unknownNarrow.evaluate(() => {
+      const content = document.getElementById('content-wrapper');
+      const icon = document.querySelector('.ffscouter-source-icon').getBoundingClientRect();
+      content.style.width = `${Math.ceil(icon.right - content.getBoundingClientRect().left + 8 + 90)}px`;
+      Object.assign(window.__mock.targets[0], { estimatedStats: null, estimateUpdatedAt: null, estimateSource: null });
+    });
+    await login(unknownNarrow); await shadow(unknownNarrow, '.header .icon', 'click');
+    const unknownGeometry = await noticeGeometry(unknownNarrow); assertCompactNotice(unknownGeometry, true);
+    assert.equal(unknownGeometry.placement, 'ffscouter');
+    assert(unknownGeometry.host.width >= 90 && unknownGeometry.host.width <= 92, JSON.stringify(unknownGeometry));
+    assert.match(unknownGeometry.estimate, /Unknown/);
+    assert.equal(await unknownNarrow.evaluate(() => {
+      const host = document.getElementById('nwa-target-page-notice').getBoundingClientRect();
+      const root = window.__playerNoticeShadow;
+      return [...root.querySelectorAll('summary > *')].filter(node => getComputedStyle(node).display !== 'none')
+        .every(node => { const rect = node.getBoundingClientRect(); return rect.left >= host.left && rect.right <= host.right; });
+    }), true, 'NWA, Unknown estimate and chevron fit the minimum inline width');
+    await unknownNarrow.close();
+    console.log('PASS Unknown estimate stays within the minimum 90px NWA badge without covering adjacent content');
+  } finally { await ffTouchContext.close(); }
+  console.log('PASS 390/320px touch FFScouter first-line badge stays clear of FairFight text and exposes its complete NWA estimate/reason without overflow or layout changes');
 
   const noticeTouchContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await noticeTouchContext.route('**/*', route => { networkRequests++; return route.abort(); });
@@ -1152,12 +1402,15 @@ try {
     const touchNotice = await mount({ width: 390, height: 844 }, [source], noticeTouchContext, reason => {
       const content = document.createElement('main'); content.id = 'content-wrapper';
       content.style.cssText = 'margin:100px 20px 20px;max-width:760px';
-      content.innerHTML = '<h1>Attack Willow [101]</h1><p>Mock touch attack page content.</p>';
+      content.innerHTML = '<h1>Attacking</h1><div class="defender-wrapper"><div class="labelsContainer_mock">'
+        + '<a href="https://www.torn.com/profiles.php?XID=101" style="color:inherit">Willow [101]</a></div></div>'
+        + '<p>Mock touch attack page content.</p>';
       document.body.append(content); window.__mock.targets[0].reason = reason;
     }, longNoticeReason, 'https://www.torn.com/page.php?sid=attack&user2ID=101');
     await login(touchNotice); await shadow(touchNotice, '.header .icon', 'click');
     for (const width of [390, 320]) {
       await touchNotice.setViewportSize({ width, height: 844 });
+      await touchNotice.waitForTimeout(150);
       const collapsed = await noticeGeometry(touchNotice); assertCompactNotice(collapsed, true);
       await clickNotice(touchNotice, true);
       await wait(touchNotice, () => window.__playerNoticeShadow.querySelector('details').open);
@@ -1165,16 +1418,10 @@ try {
       assert.equal(expanded.headingTop, collapsed.headingTop, 'native touch expansion does not move attack content');
       assert.equal(expanded.fullReason, `Reason: ${longNoticeReason}`);
       assert(expanded.detail.left >= 0 && expanded.detail.right <= width, JSON.stringify(expanded));
-      if (width === 320) {
-        assert.equal(await touchNotice.evaluate(() => {
-          const popup = window.__playerNoticeShadow.querySelector('.detail').getBoundingClientRect();
-          const launcher = window.__targetlistShadow.querySelector('.launcher').getBoundingClientRect();
-          const left = Math.max(popup.left, launcher.left), right = Math.min(popup.right, launcher.right);
-          const top = Math.max(popup.top, launcher.top), bottom = Math.min(popup.bottom, launcher.bottom);
-          if (right <= left || bottom <= top) throw new Error('Touch fixture must exercise the popup/launcher overlap');
-          return document.elementFromPoint((left + right) / 2, (top + bottom) / 2)?.id;
-        }), 'nwa-target-page-notice', 'expanded reason text stays above the floating NWA launcher');
-      }
+      assert.equal(await touchNotice.evaluate(() => {
+        const popup = window.__playerNoticeShadow.querySelector('.detail').getBoundingClientRect();
+        return document.elementFromPoint(popup.left + popup.width / 2, popup.top + Math.min(15, popup.height / 2))?.id;
+      }), 'nwa-target-page-notice', 'expanded reason text remains touch accessible above page overlays');
       await touchNotice.screenshot({ path: path.join(artifacts, `browser-attack-notice-expanded-mobile-${width}.png`), fullPage: true });
       await clickNotice(touchNotice, true);
       await wait(touchNotice, () => !window.__playerNoticeShadow.querySelector('details').open);
@@ -1378,6 +1625,7 @@ try {
   console.log(`Mock stat-range screenshots: ${path.join(artifacts, 'browser-stat-range-desktop.png')}, ${path.join(artifacts, 'browser-stat-range-mobile-390.png')} and ${path.join(artifacts, 'browser-stat-range-mobile-320.png')}`);
   console.log(`Mock suggestion screenshots: ${path.join(artifacts, 'browser-suggestions-desktop.png')} and ${path.join(artifacts, 'browser-suggestions-mobile.png')}`);
   console.log(`Mock target notice screenshots: ${path.join(artifacts, 'browser-profile-notice-desktop.png')}, ${path.join(artifacts, 'browser-profile-notice-mobile.png')} and ${path.join(artifacts, 'browser-attack-notice-desktop.png')}`);
+  console.log(`Mock FFScouter/NWA screenshots: ${path.join(artifacts, 'browser-ffscouter-nwa-desktop.png')}, ${path.join(artifacts, 'browser-ffscouter-nwa-touch-390.png')} and ${path.join(artifacts, 'browser-ffscouter-nwa-touch-320.png')}`);
 } finally {
   await context.close();
   await browser.close();
