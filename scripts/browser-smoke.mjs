@@ -179,6 +179,22 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           window.__mock.feedSnapshots.set(cursor, snapshot);
         } else data.targets = snapshot;
         if (window.__mock.reservations) data.reservations = window.__mock.reservations;
+        if (window.__mock.nextTarget) data.capabilities = { nextTarget: true, requestDeadlineMs: 8000, schema: { status: 'ready', failedChecks: [] } };
+      } else if (url.pathname === '/api/targets/next' && request.method === 'POST') {
+        if (!window.__mock.nextTarget) {
+          status = 404; data = { error: { code: 'NOT_FOUND', message: 'Endpoint not found.' } };
+        } else {
+          const selection = JSON.parse(request.data);
+          const target = targets.find(row => row.estimatedStats / player.battleStats.total >= selection.minRatio
+            && row.estimatedStats / player.battleStats.total <= selection.maxRatio && !selection.recentTargetIds.includes(row.id));
+          if (!target) {
+            status = 409; data = { error: { code: 'NO_TARGET_AVAILABLE', message: 'No matching target.' } };
+          } else {
+            data = { player, target: { ...structuredClone(target), reserved: false,
+              checkedAt: new Date(Date.now()).toISOString(), status: { state: 'Okay', description: 'Okay (mock)', until: null },
+              reservationExpiresAt: new Date(Date.now() + 120000).toISOString() } };
+          }
+        }
       } else if (/^\/api\/targets\/\d+\/reservation$/.test(url.pathname) && request.method === 'POST') {
         const id = Number(url.pathname.split('/')[3]);
         if (window.__mock.reservedTargets.has(id)) {
@@ -306,6 +322,60 @@ function makePerformanceFeed({ size = 1000, reservation = false } = {}) {
   if (reservation) mock.holds.push('/api/targets/101/reservation');
 }
 
+async function checkSingleRequestFinder(pageContext, scripts, mode) {
+  for (const cold of [false, true]) {
+    const page = await mount(mode === 'PDA' ? { width: 390, height: 844 } : undefined, scripts, pageContext, cold => {
+      const mock = window.__mock;
+      mock.nextTarget = true;
+      mock.store.set(`targetlist.session.${mock.serviceOrigin}`, { token: 'mock-session-token', expiresAt: new Date(Date.now() + 3600000).toISOString() });
+      mock.holds.push('/api/targets/next');
+      if (cold) mock.holds.push('/api/targets');
+    }, cold);
+    if (!cold) await wait(page, () => window.__mock.feedResponses.length === 1);
+    const before = await page.evaluate(() => window.__mock.requests.length);
+    const destination = 'https://www.torn.com/page.php?sid=attack&user2ID=101';
+    let navigations = 0;
+    await page.route(destination, route => {
+      navigations++;
+      return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><h1>Reserved mock destination</h1>' });
+    });
+    await shadow(page, '.launcher', 'click');
+    await wait(page, () => window.__mock.pending.some(request => new URL(request.url).pathname === '/api/targets/next'));
+    const calls = await page.evaluate(before => window.__mock.requests.slice(before), before);
+    assert.equal(calls.length, 1, `${mode}: ${cold ? 'cold' : 'warm'} finder uses exactly one new request`);
+    assert.equal(calls[0].path, '/api/targets/next');
+    assert.equal(calls[0].method, 'POST');
+    if (mode !== 'PDA') assert.equal(calls[0].timeout, 10000);
+    const body = JSON.parse(calls[0].data);
+    assert.match(body.requestId, /^[A-Za-z0-9_-]{16,96}$/);
+    assert.deepEqual([body.minRatio, body.maxRatio, body.estimateDays, body.timeoutMs], [0.1, 0.6, 7, 8000]);
+    assert.equal(navigations, 0, `${mode}: waits for successful reservation`);
+    if (mode === 'PDA') assert.equal(await page.evaluate(() => window.__mock.pda.calls.at(-1).name), 'PDA_httpPost');
+    const navigated = page.waitForURL(destination, { timeout: 5000 });
+    await page.evaluate(() => window.__mock.release('/api/targets/next'));
+    await navigated;
+    assert.equal(navigations, 1);
+    await page.close();
+  }
+  const cancelled = await mount(undefined, scripts, pageContext, () => {
+    const mock = window.__mock;
+    mock.nextTarget = true;
+    mock.store.set(`targetlist.session.${mock.serviceOrigin}`, { token: 'mock-session-token', expiresAt: new Date(Date.now() + 3600000).toISOString() });
+    mock.holds.push('/api/targets/next');
+  });
+  await wait(cancelled, () => window.__mock.feedResponses.length === 1);
+  await shadow(cancelled, '.launcher', 'click');
+  await wait(cancelled, () => window.__mock.pending.length === 1);
+  await shadow(cancelled, '.settings-toggle', 'click');
+  assert.equal(await cancelled.evaluate(() => window.__targetlistShadow.querySelector('.panel').hidden), false,
+    `${mode}: settings opens immediately while a finder request is pending`);
+  await cancelled.evaluate(() => window.__mock.release('/api/targets/next'));
+  await cancelled.waitForTimeout(50);
+  assert.equal(cancelled.url(), 'about:blank', `${mode}: a cancelled selection never navigates on late success`);
+  await cancelled.close();
+  console.log(`PASS ${mode} one-request warm/cold finder, native transport, immediate settings and cancelled late-result navigation`);
+}
+
 async function checkDeltaRendering(pageContext, scripts, mode) {
   const viewport = mode === 'PDA' ? { width: 390, height: 844 } : { width: 1280, height: 960 };
   const page = await mount(viewport, scripts, pageContext, makePerformanceFeed, {}, 'https://www.torn.com/profiles.php?XID=101');
@@ -315,8 +385,19 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
   assert.equal(closed.cards, 0, `${mode}: restoring a large pool does not create hidden cards`);
   assert.equal(closed.panelClosed, true);
   await shadow(page, '.settings-toggle', 'click');
+  await wait(page, () => window.__targetlistShadow.querySelectorAll('.card').length === 50);
+  const initialNodes = await page.evaluate(() => window.__targetlistShadow.querySelectorAll('*').length);
+  await page.evaluate(() => window.__targetlistShadow.querySelector('.queuefooter').scrollIntoView({ block: 'end' }));
+  await wait(page, () => window.__targetlistShadow.querySelectorAll('.card').length >= 100);
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length < 1000), true,
+    `${mode}: scrolling loads another batch rather than mounting the complete pool`);
+  await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    while (root.querySelectorAll('.card').length < 1000) root.querySelector('.queuefooter button').click();
+  });
   await wait(page, () => window.__targetlistShadow.querySelectorAll('.card').length === 1000);
   const openedNodes = await page.evaluate(() => window.__targetlistShadow.querySelectorAll('*').length);
+  assert(initialNodes < openedNodes / 5, `${mode}: initial lazy DOM is substantially smaller than the full list`);
   await page.evaluate(() => {
     const root = window.__targetlistShadow;
     const card = id => [...root.querySelectorAll('.card')].find(node => node.querySelector('.name').textContent.includes(`[${id}]`));
@@ -435,7 +516,7 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
   assert.equal(await page.evaluate(() => Boolean(document.getElementById('nwa-target-page-notice'))), false);
   await page.close();
   console.log(`PASS ${mode} delta synchronization, lazy 1,000-target settings, keyed status patches, preserved controls/scroll/focus, delisting, unknown-cursor reset and expiry races`);
-  console.log(`PERF ${mode}: closed ${closed.cards} cards/${closed.nodes} nodes; opened 1,000 cards/${openedNodes} nodes; full ${metrics.full} bytes; unchanged delta ${metrics.unchanged} bytes; one-status delta ${metrics.oneStatus} bytes`);
+  console.log(`PERF ${mode}: closed ${closed.cards} cards/${closed.nodes} nodes; initial lazy 50 cards/${initialNodes} nodes; fully expanded 1,000 cards/${openedNodes} nodes; full ${metrics.full} bytes; unchanged delta ${metrics.unchanged} bytes; one-status delta ${metrics.oneStatus} bytes`);
 
   const finder = await mount(viewport, scripts, pageContext, makePerformanceFeed, { reservation: true });
   await wait(finder, () => window.__mock.feedResponses.length === 1);
@@ -1236,7 +1317,7 @@ try {
     ['POST', '/api/targets/101/reservation'], ['POST', '/api/targets/104/reservation']
   ]);
   assert.equal(reservationRequests.some(request => request.path.endsWith('/status')), false);
-  assert(reservationRequests.slice(-2).every(request => request.timeout <= 3000));
+  assert(reservationRequests.slice(-2).every(request => request.timeout === 10000), 'client transport allows the guarded backend deadline to complete');
   const reservedNavigation = reservation.waitForURL(leasedAttackUrl, { timeout: 5000 });
   await reservation.evaluate(() => window.__mock.release('/api/targets/104/reservation'));
   await reservedNavigation;
@@ -2257,6 +2338,7 @@ try {
     console.log('PASS transient PDA storage failure keeps the saved token and preferences; a fresh successful document restores without entering the key again');
   } finally { await pdaContext.close(); }
 
+  await checkSingleRequestFinder(context, [source], 'GM');
   await checkDeltaRendering(context, [source], 'GM');
   await checkExports(context, [source], 'GM');
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
@@ -2264,6 +2346,7 @@ try {
   try {
     await checkProfessionalLayout(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkLeaseAvailability(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkSingleRequestFinder(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
   }

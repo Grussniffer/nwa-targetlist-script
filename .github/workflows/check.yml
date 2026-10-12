@@ -20,7 +20,7 @@ jobs:
           package-manager-cache: false
       - run: npm install --ignore-scripts
       - run: npm run build
-      - run: git diff --exit-code -- dist/torn-targetlist.user.js
+      - run: git diff --exit-code -- dist/torn-targetlist.user.js dist/torn-targetlist.meta.js
       - run: npm run check
       - run: npm test
       - run: npx playwright install --with-deps chromium

@@ -37,9 +37,11 @@ Keep the script enabled on all Torn pages. NWA includes PDA support and remember
 
 Open Torn and click the green **NWA** button on the right edge. Sign in with your **Limited Torn API key** the first time.
 
-NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. The finder and list attack buttons first get a shared backend reservation; if another member gets it first, the finder tries another. The current backend holds each assignment for **two minutes**, including earlier targets when you open another one. Your browser also skips players you opened in the last 10 minutes. You start the attack yourself. The finder tries up to five matches within eight seconds. If target coordination is unavailable, NWA asks you to refresh instead of opening an unreserved target. Ordinary Torn links, including those in exports, do not acquire a reservation.
+NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. With backend 0.9.0 or later, the server chooses and reserves a target in one request. The backend holds each assignment for **two minutes**, including earlier targets when you open another one. Your browser also skips players you opened in the last 10 minutes. You start the attack yourself. Older backends keep the existing coordinated finder and show an update notice. If target coordination is unavailable, NWA asks you to refresh instead of opening an unreserved target. Ordinary Torn links, including those in exports, do not acquire a reservation.
 
 The small **⚙** underneath opens the compact target list and suggestions. **Find target** in the panel works like the green NWA button. Search and **Min / Max** stay above the list; each row shows the player's estimated stats, percentage of your total, availability and attack controls. On Torn PDA, the panel opens nearly full width.
+
+Large lists load more rows as you scroll, with **Show more** available when needed. Search, counts and exports still cover the complete matching list. The panel opens immediately; background refreshing slows while idle and resumes promptly when you use NWA. Temporary connection failures retry with a delay without clearing your login.
 
 Set **Min** and **Max** as percentages of your own total. The default is **10–60%**, with the equivalent stat totals shown underneath. Your range is saved between pages. Set **Min** to **0%** to include weaker targets.
 

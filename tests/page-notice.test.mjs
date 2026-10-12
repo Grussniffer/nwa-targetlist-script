@@ -107,7 +107,11 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   const requests = []; const timers = []; const timeouts = new Map(); const observers = [];
   const storage = new Map();
   if (saved) storage.set('targetlist.session.https://targetlist.grusmedia.no', { token: 'saved-session', expiresAt: new Date(NOW + 3600000).toISOString() });
-  class MutationObserver { constructor(callback) { this.callback = callback; observers.push(this); } observe() { this.active = true; } disconnect() { this.active = false; } }
+  class MutationObserver {
+    constructor(callback) { this.callback = callback; this.areas = []; observers.push(this); }
+    observe(node, options) { this.areas.push({ node, options }); this.active = true; }
+    disconnect() { this.active = false; this.areas = []; }
+  }
   function mountContent() {
     const content = new Element('main'); content.id = 'mainContainer'; content.className = 'content-wrapper';
     content.rect = { left: 40, top: 40, width: 1120, height: 700 };
@@ -142,7 +146,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   function control(label) { const root = document.getElementById('torn-targetlist-host').shadow; const button = all(root).find(node => node.tagName === 'BUTTON' && node.textContent === label); assert.ok(button, `button ${label} exists`); return button; }
   function notice() { return document.getElementById('nwa-target-page-notice'); }
   function noticeText() { return notice()?.shadow?.textContent || notice()?.textContent || ''; }
-  return { document, body, window, storage, requests, timers, feed, response, control, mutation, notice, noticeText,
+  return { document, body, window, storage, requests, timers, observers, feed, response, control, mutation, notice, noticeText,
     openSettings() {
       const root = document.getElementById('torn-targetlist-host').shadow;
       all(root).find(node => node.className === 'settings-toggle').emit('click');
@@ -333,4 +337,28 @@ test('a failed authorization refresh and an expired cached feed cannot continue 
     } else page.tick(NOW + 30000);
     assert.equal(page.notice(), null, interruption);
   }
+});
+
+test('ordinary Torn pages and unlisted profiles do not observe body mutations', async () => {
+  for (const url of ['https://www.torn.com/index.php', 'https://www.torn.com/profiles.php?XID=901']) {
+    const page = fixture(url); await page.feed();
+    assert.equal(page.observers.some(observer => observer.active), false);
+    page.openSettings(); assert.ok(page.control('Find target'), 'settings still open immediately without an observer');
+  }
+});
+
+test('a listed player observes its notice area with shallow ancestor remount detection and pauses while hidden', async () => {
+  const page = fixture('https://www.torn.com/page.php?sid=attack&user2ID=900'); await page.feed();
+  const observer = page.observers.find(value => value.active);
+  assert.ok(observer);
+  assert.notEqual(observer.areas[0].node, page.body);
+  assert.equal(observer.areas[0].options.subtree, true);
+  assert.ok(observer.areas.some(area => area.node === page.body && !area.options.subtree), 'body detects only direct child remounts');
+  page.replaceContent(); assert.ok(page.notice(), 'dynamic attack content remounts without a full-page observer');
+  page.document.visibilityState = 'hidden'; page.document.emit('visibilitychange');
+  assert.equal(page.observers.some(value => value.active), false); assert.equal(page.notice(), null);
+  page.document.visibilityState = 'visible'; page.document.emit('visibilitychange');
+  await page.feed(); assert.ok(page.notice());
+  page.changeUrl('https://www.torn.com/index.php');
+  assert.equal(page.observers.some(value => value.active), false); assert.equal(page.notice(), null);
 });

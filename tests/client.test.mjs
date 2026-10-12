@@ -59,6 +59,7 @@ class Element {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
     this.listeners.get(name).push(callback);
   }
+  removeEventListener(name, callback) { this.listeners.set(name, (this.listeners.get(name) || []).filter(value => value !== callback)); }
   attachShadow() { return this.shadow = new Element('shadow-root'); }
   get lastChild() { return this.children.at(-1); }
   focus() { if (this.getRootNode()) this.getRootNode().activeElement = this; }
@@ -92,7 +93,12 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
   const body = new Element('body'); const requests = []; const navigations = []; const storage = new Map(); const writes = []; const timers = []; const timeouts = new Map(); const timeoutDelays = new Map();
   const document = new Element('document');
-  const copied = []; const copyCommands = [];
+  const copied = []; const copyCommands = []; const clearedIntervals = [], intersections = [];
+  class IntersectionObserver {
+    constructor(callback, options) { this.callback = callback; this.options = options; intersections.push(this); }
+    observe(node) { this.node = node; this.active = true; }
+    disconnect() { this.active = false; }
+  }
   Object.assign(document, { body, visibilityState: visibility,
     getElementById: id => descendants(body).find(element => element.id === id), createElement: tag => new Element(tag),
     createElementNS: (namespace, tag) => { const node = new Element(tag); node.namespaceURI = namespace; return node; },
@@ -104,7 +110,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   if (saved) storage.set(storageKey, saved);
   if (preferences) storage.set(preferencesKey, preferences);
   const context = vm.createContext({
-    URL, Blob, Intl, Date: Clock, console,
+    URL, Blob, Intl, Date: Clock, console, IntersectionObserver,
     navigator: { clipboard: { writeText: async value => {
       if (clipboard.reject) throw new Error('Mock clipboard unavailable');
       copied.push(value);
@@ -116,6 +122,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     GM_setValue: (key, value) => { storage.set(key, value); writes.push(value); },
     GM_deleteValue: key => storage.delete(key),
     setInterval: callback => { timers.push(callback); },
+    clearInterval: id => { clearedIntervals.push(id); },
     setTimeout: (callback, delay) => { const id = nextTimer++; timeouts.set(id, callback); timeoutDelays.set(id, delay); return id; },
     clearTimeout: id => { timeouts.delete(id); timeoutDelays.delete(id); },
   });
@@ -149,7 +156,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const deletion = requests.at(-1); response(deletion, null, 204); await flush();
     return deletion;
   }
-  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel, copied, copyCommands,
+  return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, clearedIntervals, intersections, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel, copied, copyCommands,
     settings: () => find(element => element.className === 'settings-toggle'),
     text: () => textContent(root), setNow: value => { clock = value; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
@@ -687,11 +694,11 @@ test('NWA stops on rate limits and service failures that are not isolated target
   }
 });
 
-test('NWA skips isolated lookup and network failures and succeeds with the next target', async () => {
-  for (const outcome of ['torn', 'torn503', 'targets', 'network', 'timeout']) {
+test('legacy NWA skips definite isolated lookup failures and succeeds with the next target', async () => {
+  for (const outcome of ['torn', 'torn503', 'targets']) {
     const app = fixture(); await app.signIn([target, { ...target, id: target.id + 1 }]);
     const before = app.requests.length; app.button('NWA').emit('click'); const first = app.requests.at(-1);
-    assert.equal(first.timeout, 3000);
+    assert.equal(first.timeout, 10000);
     if (outcome === 'network') first.onerror();
     else if (outcome === 'timeout') { app.setNow(NOW + 3000); first.ontimeout(); }
     else app.response(first, { error: { code: outcome.startsWith('torn') ? 'TORN_UNAVAILABLE' : 'TARGETS_UNAVAILABLE', message: 'Temporary target lookup failure.' } }, outcome === 'torn' ? 502 : 503);
@@ -705,21 +712,20 @@ test('NWA skips isolated lookup and network failures and succeeds with the next 
   }
 });
 
-test('NWA limits candidate attempts to the remaining eight-second request budget', async () => {
-  const app = fixture(); await app.signIn(Array.from({ length: 5 }, (_, index) => ({ ...target, id: target.id + index })));
-  const before = app.requests.length; app.button('NWA').emit('click');
-  for (const [elapsed, expectedTimeout] of [[3000, 3000], [6000, 3000], [8000, 2000]]) {
-    const request = app.requests.at(-1);
-    assert.equal(request.timeout, expectedTimeout);
-    assert.equal([...app.timeoutDelays.values()].at(-1), expectedTimeout);
-    app.setNow(NOW + elapsed); request.ontimeout(); await flush();
+test('legacy finder stops after an ambiguous timeout or network response and ignores late success', async () => {
+  for (const failure of ['ontimeout', 'onerror']) {
+    const app = fixture(); await app.signIn(Array.from({ length: 5 }, (_, index) => ({ ...target, id: target.id + index })));
+    const before = app.requests.length; app.button('NWA').emit('click'); const request = app.requests.at(-1);
+    assert.equal(request.timeout, 10000);
+    app.setNow(NOW + 10000); request[failure](); await flush();
+    assert.equal(app.requests.length, before + 1, 'no second potentially abandoned lease');
+    app.response(request, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 10000).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() }); await flush();
+    assert.deepEqual(app.navigations, []);
+    assert.equal(app.button('NWA').disabled, false);
   }
-  assert.equal(app.requests.length, before + 3);
-  assert.deepEqual(app.navigations, []);
-  assert.equal(app.button('NWA').disabled, false);
 });
 
-test('a stale feed refresh uses part of the same eight-second finder budget', async () => {
+test('a stale legacy feed refresh still gives a reservation longer than its server deadline', async () => {
   const app = fixture(); await app.signIn();
   app.setNow(NOW + 30000); app.button('NWA').emit('click');
   const feed = app.requests.at(-1);
@@ -728,21 +734,22 @@ test('a stale feed refresh uses part of the same eight-second finder budget', as
   app.setNow(NOW + 35000);
   app.response(feed, { player, targets: [target], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
-  assert.equal(app.requests.at(-1).timeout, 3000);
+  assert.equal(app.requests.at(-1).timeout, 10000);
   app.setNow(NOW + 38000); app.requests.at(-1).ontimeout(); await flush();
   assert.deepEqual(app.navigations, []);
   assert.equal(app.button('NWA').disabled, false);
 });
 
-test('joining a slow startup feed has an eight-second finder deadline and late feed completion cannot navigate', async () => {
+test('a cold modern finder is independent of a slow startup feed and late completion cannot navigate', async () => {
   const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() });
   const feed = app.requests[0]; app.button('NWA').emit('click');
-  const timer = [...app.timeoutDelays].find(([, delay]) => delay === 8000)?.[0];
-  assert.ok(timer, 'shared background feed has a separate bounded finder wait');
-  app.setNow(NOW + 8000); app.timeouts.get(timer)(); await flush();
+  const next = app.requests.at(-1);
+  assert.equal(next.url, `${serviceBase}/api/targets/next`);
+  assert.equal(next.timeout, 10000);
+  app.setNow(NOW + 10000); next.ontimeout(); await flush();
   assert.equal(app.button('NWA').disabled, false);
   assert.deepEqual(app.navigations, []);
-  assert.match(app.text(), /within 8 seconds/);
+  assert.match(app.text(), /timed out/);
   app.response(feed, { player, targets: [{ ...target, checkedAt: new Date(NOW + 8000).toISOString() }], warnings: [], reservations: coordination }); await flush();
   assert.deepEqual(app.navigations, []);
 });
@@ -1138,33 +1145,32 @@ test('NWA bounds unavailable-target checks to five per click', async () => {
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${candidates[5].id}`]);
 });
 
-test('a restored session loads an authorized pool before NWA checks a target', async () => {
+test('a restored session can select a target without waiting for the startup pool', async () => {
   const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString() });
   app.button('NWA').emit('click'); app.button('NWA').emit('click');
-  assert.equal(app.requests.length, 1);
+  assert.equal(app.requests.length, 2);
   assert.equal(app.requests[0].url, `${serviceBase}/api/targets`);
   assert.deepEqual(app.navigations, []);
-  app.response(app.requests[0], { player, targets: [target], warnings: [], reservations: coordination }); await flush();
-  assert.equal(app.requests.length, 2);
-  assert.equal(app.requests[1].url, `${serviceBase}/api/targets/${target.id}/reservation`);
-  app.response(app.requests[1], { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() });
+  assert.equal(app.requests[1].url, `${serviceBase}/api/targets/next`);
+  app.response(app.requests[1], { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } });
   await flush();
   assert.equal(app.navigations.length, 1);
 });
 
-test('clicking NWA during startup preload resumes once using the fresh feed without opening settings', async () => {
+test('a cold missing next-target route falls back once to the pending legacy feed', async () => {
   const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString() });
   assert.equal(app.requests.length, 1);
   assert.equal(app.button('NWA').disabled, false);
   app.button('NWA').emit('click'); app.button('NWA').emit('click');
-  assert.equal(app.requests.length, 1, 'clicks share the startup feed request');
+  assert.equal(app.requests.length, 2, 'clicks share a single optimistic target selection');
+  app.response(app.requests[1], { error: { code: 'NOT_FOUND', message: 'Unknown route.' } }, 404); await flush();
   assert.deepEqual(app.navigations, []);
   app.response(app.requests[0], { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], warnings: [], reservations: coordination });
   await flush();
   assert.deepEqual(app.navigations, []);
   await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
-  assert.equal(app.requests.length, 2);
+  assert.equal(app.requests.length, 3);
   assert.equal(app.find(element => element.className === 'panel').hidden, true);
   assert.deepEqual(Object.keys(app.storage.get(app.storageKey)).sort(), ['expiresAt', 'token']);
 });
@@ -1382,11 +1388,14 @@ test('background feed refreshes retain the focused suggestion textarea and its d
   assert.equal(app.find(element => element.tagName === 'TEXTAREA').value, 'An unfinished reason with the cursor still here');
 });
 
-test('a closed settings panel is not rebuilt by background refresh and shows current data when opened', async () => {
+test('a closed idle settings panel polls more slowly and shows refreshed data immediately when opened', async () => {
   const app = fixture(); await app.signIn();
   const oldProfile = app.find(element => element.className === 'profile');
   app.closePanel();
+  const before = app.requests.length;
   app.setNow(NOW + 10_000); app.timers[0]();
+  assert.equal(app.requests.length, before);
+  app.setNow(NOW + 30_000); app.timers[0]();
   app.response(app.requests.at(-1), { player: { ...player, name: 'Updated Allowed Player' },
     targets: [{ ...target, name: 'Refreshed Target' }], warnings: [], reservations: coordination }); await flush();
   assert.equal(app.find(element => element.className === 'profile'), oldProfile);
@@ -1413,8 +1422,155 @@ test('a restored session keeps a large pool out of the DOM until settings are op
   await completeLease(app);
   assert.equal(app.navigations.length, 1);
   app.openPanel();
-  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, targets.length);
-  assert.match(app.text(), /Pool Player 249/);
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 50);
+  assert.doesNotMatch(app.text(), /Pool Player 249/);
+  app.button('Show more (200 remaining)').emit('click');
+  assert.equal(descendants(app.root).filter(element => element.className === 'card').length, 100);
+});
+
+test('lazy cards load another batch near the panel edge while search and exports cover the entire pool', async () => {
+  const targets = Array.from({ length: 525 }, (_, index) => ({ ...target, id: target.id + index, name: `Pool Player ${index}` }));
+  const app = fixture(); await app.signIn(targets);
+  const cards = () => descendants(app.root).filter(element => element.className === 'card');
+  assert.equal(cards().length, 50);
+  const observer = app.intersections.at(-1);
+  assert.equal(observer.options.root, app.find(element => element.className === 'scroll'));
+  const first = cards()[0];
+  observer.callback([{ isIntersecting: true }]);
+  assert.equal(cards().length, 100); assert.equal(cards()[0], first, 'existing card nodes survive appending a batch');
+  app.button('Export CSV').emit('click');
+  assert.match(app.find(element => element.attributes.get('aria-label') === 'Exported target list').value, /Pool Player 524/);
+  const search = app.find(element => element.type === 'search'); search.value = 'Pool Player 524'; search.emit('input');
+  assert.equal(cards().length, 1); assert.match(textContent(cards()[0]), /Pool Player 524/);
+  search.value = ''; search.emit('input'); assert.equal(cards().length, 50, 'a new filter resets the render budget');
+  app.closePanel(); observer.callback([{ isIntersecting: true }]); assert.equal(cards().length, 50);
+});
+
+test('a capable backend finds and reserves in one request with inclusive preferences and recent IDs', async () => {
+  const app = fixture(null, { minRatio: 0.1, maxRatio: 0.6, estimateDays: 14, recentTargets: [{ id: 456, at: NOW }] });
+  await app.signIn([target], { capabilities: { nextTarget: true, schema: { status: 'ready' } } });
+  const before = app.requests.length; app.button('NWA').emit('click'); app.button('NWA').emit('click');
+  assert.equal(app.requests.length, before + 1);
+  const next = app.requests.at(-1), body = JSON.parse(next.data);
+  assert.equal(next.url, `${serviceBase}/api/targets/next`); assert.equal(next.timeout, 10000);
+  assert.deepEqual({ ...body, requestId: undefined }, { minRatio: 0.1, maxRatio: 0.6, estimateDays: 14, recentTargetIds: [456], query: '', timeoutMs: 8000, requestId: undefined });
+  assert.match(body.requestId, /^[A-Za-z0-9_-]{16,96}$/);
+  app.response(next, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reserved: false, reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  assert.equal(app.requests.length, before + 1);
+});
+
+test('an uncertain next response reuses its request ID on deliberate retry and ignores late success', async () => {
+  for (const outcome of ['network', 'timeout', 'proxy502', 'proxy503', 'proxy504', 'internal']) {
+    const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click'); const first = app.requests.at(-1), firstBody = JSON.parse(first.data);
+    if (outcome === 'network') first.onerror();
+    else if (outcome === 'timeout') first.ontimeout();
+    else app.response(first, { error: { message: 'Gateway timeout.', ...(outcome === 'internal' ? { code: 'INTERNAL_ERROR' } : {}) } }, outcome === 'internal' ? 500 : Number(outcome.slice(-3)));
+    await flush(); app.button('NWA').emit('click');
+    const retry = app.requests.at(-1);
+    assert.notEqual(first, retry); assert.equal(JSON.parse(retry.data).requestId, firstBody.requestId);
+    app.response(first, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+    assert.deepEqual(app.navigations, []);
+    app.response(retry, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+    assert.equal(app.navigations.length, 1);
+  }
+});
+
+test('definitive backend selection failures use a fresh attempt after recovery', async () => {
+  for (const code of ['TORN_UNAVAILABLE', 'FACTIONS_UNAVAILABLE', 'TARGETS_UNAVAILABLE', 'TARGETS_SCHEMA_MISMATCH',
+    'TARGETS_LIMIT_EXCEEDED', 'FACTIONS_NOT_CONFIGURED', 'SESSION_STORAGE_UNAVAILABLE', 'KEY_STORAGE_UNAVAILABLE',
+    'KEY_REMOVAL_PENDING', 'SESSION_CAPACITY', 'CAPACITY_LIMIT', 'SERVICE_CLOSED']) {
+    const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click'); const first = app.requests.at(-1), firstId = JSON.parse(first.data).requestId;
+    app.response(first, { error: { code, message: 'Temporary backend failure. Try again shortly.' } }, 503); await flush();
+    app.setNow(NOW + 1); app.button('NWA').emit('click');
+    const retry = app.requests.at(-1);
+    assert.notEqual(JSON.parse(retry.data).requestId, firstId, `${code} must not replay its cached terminal failure`);
+    app.response(retry, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+    assert.equal(app.navigations.length, 1, `${code} recovers on the next deliberate click`);
+    assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  }
+});
+
+test('next target selection never falls back on protected errors or navigates after cancellation', async () => {
+  for (const code of ['NO_TARGET_AVAILABLE', 'ATTEMPT_EXPIRED', 'SELECTION_TIMEOUT', 'TARGETS_UNAVAILABLE', 'TARGET_NOT_FOUND']) {
+    const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click'); const count = app.requests.length;
+    app.response(app.requests.at(-1), { error: { code, message: 'Try again shortly.' } }, code === 'SELECTION_TIMEOUT' ? 408 : code === 'TARGET_NOT_FOUND' ? 404 : 409); await flush();
+    assert.equal(app.requests.length, count); assert.deepEqual(app.navigations, []); assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  }
+  const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+  app.closePanel(); app.button('NWA').emit('click'); const next = app.requests.at(-1);
+  app.openPanel();
+  app.response(next, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+  assert.deepEqual(app.navigations, []);
+});
+
+test('next selection validates target IDs, difficulty, freshness, friendly faction and its lease before navigating', async () => {
+  for (const override of [{ id: 0 }, { id: -1 }, { id: 2147483648 }, { reserved: true }, { estimatedStats: 1 },
+    { estimatedStats: 700000 }, { faction: player.faction }, { checkedAt: null }, { status: { state: 'Hospital' } }, { reservationExpiresAt: new Date(NOW).toISOString() }]) {
+    const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click');
+    app.response(app.requests.at(-1), { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString(), ...override } }); await flush();
+    assert.deepEqual(app.navigations, []); assert.match(app.text(), /could not verify/);
+  }
+});
+
+test('server retry delays prevent polling, refresh and finder requests without clearing the session', async () => {
+  for (const source of ['body', 'header']) {
+    const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click');
+    const response = { error: { code: 'RATE_LIMITED', message: 'Slow down.', ...(source === 'body' ? { retryAfterSeconds: 60 } : {}) } };
+    app.requests.at(-1).onload({ status: 429, responseText: JSON.stringify(response), responseHeaders: source === 'header' ? 'Retry-After: 60\r\n' : '' }); await flush();
+    const before = app.requests.length;
+    app.button('NWA').emit('click'); app.button('Refresh list').emit('click');
+    app.setNow(NOW + 59000); app.timers[0]();
+    assert.equal(app.requests.length, before); assert.equal(app.storage.get(app.storageKey).token, SESSION);
+    assert.match(app.text(), /Retry in/);
+    app.setNow(NOW + 60000); app.button('NWA').emit('click');
+    assert.equal(app.requests.length, before + 1);
+  }
+});
+
+test('automatic retries back off after failures and reset after a successful feed', async () => {
+  const app = fixture(); await app.signIn();
+  app.setNow(NOW + 10000); app.timers[0]();
+  app.response(app.requests.at(-1), { error: { code: 'TARGETS_UNAVAILABLE', message: 'Temporary failure.' } }, 503); await flush();
+  app.setNow(NOW + 20000); app.timers[0]();
+  app.response(app.requests.at(-1), { error: { code: 'TARGETS_UNAVAILABLE', message: 'Temporary failure.' } }, 503); await flush();
+  const before = app.requests.length;
+  app.setNow(NOW + 30000); app.timers[0](); assert.equal(app.requests.length, before, 'the second retry waits for jitter beyond 10s');
+  app.setNow(NOW + 35000); app.timers[0](); assert.equal(app.requests.length, before + 1);
+  app.response(app.requests.at(-1), { player, targets: [target], reservations: coordination }); await flush();
+  app.setNow(NOW + 45000); app.timers[0](); assert.equal(app.requests.length, before + 2);
+});
+
+test('a changed target row restores keyboard focus without activating its button or moving the panel', async () => {
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+  const check = app.find(element => element.className === 'check-status'); check.focus();
+  const scroll = app.find(element => element.className === 'scroll'); scroll.scrollTop = 147;
+  app.setNow(NOW + 10000); app.timers[0]();
+  const count = app.requests.length;
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Updated Target', checkedAt: new Date(NOW + 10000).toISOString() }], reservations: coordination }); await flush();
+  assert.notEqual(app.root.activeElement, check);
+  assert.equal(app.root.activeElement.className, 'check-status');
+  assert.equal(scroll.scrollTop, 147);
+  assert.equal(app.requests.length, count); assert.deepEqual(app.navigations, []);
+});
+
+test('replacing a mounted instance cleans its listeners, timers, requests and observers before a late response', async () => {
+  const app = fixture(); await app.signIn([target], { capabilities: { nextTarget: true } });
+  app.button('NWA').emit('click'); const oldRequest = app.requests.at(-1);
+  assert.ok(app.timeouts.size);
+  app.host.setAttribute('data-nwa-version', '0.0.1'); app.runScript(); await flush();
+  assert.equal(app.clearedIntervals.length, 1);
+  assert.equal(app.intersections[0].active, false);
+  const count = app.requests.length; app.timers[0](); assert.equal(app.requests.length, count);
+  app.response(oldRequest, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
+  assert.deepEqual(app.navigations, []);
+  assert.equal(descendants(app.body).filter(node => node.id === 'torn-targetlist-host').length, 1);
+  assert.equal(app.storage.get(app.storageKey).token, SESSION);
 });
 
 test('unchanged feeds reuse cards and controls, and a changed row leaves other cards untouched', async () => {
@@ -1508,7 +1664,7 @@ test('NWA recovers an empty or unknown-stat pool after background estimates beco
   }
 });
 
-test('NWA retries the pool after login succeeded but the initial target feed failed', async () => {
+test('NWA can directly select a target after login succeeded but the initial feed failed', async () => {
   const app = fixture();
   app.openPanel();
   app.find(element => element.type === 'password').value = KEY;
@@ -1519,10 +1675,8 @@ test('NWA retries the pool after login succeeded but the initial target feed fai
   assert.equal(app.storage.get(app.storageKey).token, SESSION);
   app.button('NWA').emit('click');
   assert.equal(app.requests.length, 3);
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
-  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
-  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
-  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/next`);
+  app.response(app.requests.at(-1), { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
   assert.equal(app.navigations.length, 1);
 });
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.8.0
+// @version      0.9.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -365,7 +365,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.8.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -385,6 +385,8 @@ function startTargetList() {
     const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
     if (previousHost && /^\d+\.\d+\.\d+$/.test(mountedVersion)
         && mountedVersion.localeCompare(CONFIG.version, undefined, { numeric: true }) >= 0) return;
+    previousHost?.__nwaDispose?.();
+    if (previousHost && typeof Event === 'function') previousHost.dispatchEvent?.(new Event('nwa:dispose'));
     previousHost?.remove(); mountTargetList(platform, storageWarning);
   }
   const base = TargetListCore.serviceUrl(CONFIG.serviceUrl);
@@ -401,6 +403,23 @@ if (!window.top || window.top === window.self) {
 function mountTargetList(platform, storageWarning = '') {
   const C = TargetListCore;
   const FEED_REFRESH_MS = 10_000;
+  const IDLE_FEED_REFRESH_MS = 30_000;
+  const CARD_BATCH_SIZE = 50;
+  const DEFINITE_SELECTION_FAILURES = new Set(['TORN_UNAVAILABLE', 'FACTIONS_UNAVAILABLE', 'TARGETS_UNAVAILABLE',
+    'TARGETS_SCHEMA_MISMATCH', 'TARGETS_LIMIT_EXCEEDED', 'FACTIONS_NOT_CONFIGURED', 'SESSION_STORAGE_UNAVAILABLE',
+    'KEY_STORAGE_UNAVAILABLE', 'KEY_REMOVAL_PENDING', 'SESSION_CAPACITY', 'CAPACITY_LIMIT', 'SERVICE_CLOSED']);
+  let disposed = false;
+  const lifecycleListeners = [], taskTimers = new Set(), pendingRequests = new Set();
+  const downloadUrls = new Set();
+  function listen(node, type, callback, options) {
+    node?.addEventListener?.(type, callback, options);
+    lifecycleListeners.push(() => node?.removeEventListener?.(type, callback, options));
+  }
+  function later(callback, delay) {
+    const id = setTimeout(() => { taskTimers.delete(id); if (!disposed) callback(); }, delay);
+    taskTimers.add(id); return id;
+  }
+  function cancelLater(id) { clearTimeout(id); taskTimers.delete(id); }
   const COORDINATION_UNAVAILABLE = 'Target coordination is unavailable. Refresh the list or ask an administrator to update the backend.';
   let base;
   try { base = C.serviceUrl(CONFIG.serviceUrl); }
@@ -425,7 +444,8 @@ function mountTargetList(platform, storageWarning = '') {
     minRatio, maxRatio,
     estimateDays: Number.isSafeInteger(preferences?.estimateDays) && preferences.estimateDays >= 1 && preferences.estimateDays <= 365
       ? preferences.estimateDays : C.DEFAULT_ESTIMATE_DAYS,
-    recentTargets: C.recentTargets(preferences?.recentTargets), reservationsSupported: false,
+    recentTargets: C.recentTargets(preferences?.recentTargets), reservationsSupported: false, nextTargetSupported: null,
+    backendNotice: '', retryAttempt: null, lastFindAt: 0, feedFailures: 0, nextFeedAt: 0, hardRetryAt: 0,
     lastTargetId: Number.isSafeInteger(preferences?.lastTargetId) ? preferences.lastTargetId : null,
     finding: false, findGeneration: 0, findAfterLogin: false,
     pendingChecks: new Set(), loading: false, targetGeneration: 0, view: 'targets',
@@ -594,7 +614,8 @@ function mountTargetList(platform, storageWarning = '') {
     cancelFind(); state.findAfterLogin = false;
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
-    state.feedTargets = []; state.feedCursor = null; state.reservationsSupported = false;
+    state.feedTargets = []; state.feedCursor = null; state.reservationsSupported = false; state.nextTargetSupported = null;
+    state.retryAttempt = null; state.backendNotice = ''; state.feedFailures = 0; state.nextFeedAt = 0; state.hardRetryAt = 0;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
     state.backgroundRenderPending = false;
     state.pendingChecks.clear(); state.busy = false; state.loading = false; state.targetGeneration++; state.expiresAt = null;
@@ -615,15 +636,18 @@ function mountTargetList(platform, storageWarning = '') {
   function request(method, path, body, token = state.token, timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
       let settled = false, transport = null;
-      const succeed = value => { if (!settled) { settled = true; clearTimeout(deadline); resolve(value); } };
+      const succeed = value => { if (!settled) { settled = true; cancelLater(deadline); pendingRequests.delete(cancel); resolve(value); } };
       const fail = error => {
         if (!settled) {
-          settled = true; clearTimeout(deadline);
+          settled = true; cancelLater(deadline); pendingRequests.delete(cancel);
           try { transport?.abort?.(); } catch { /* The original failure still settles the request. */ }
           reject(error);
         }
       };
-      const deadline = setTimeout(() => fail(new Error('The target service timed out. Try again shortly.')), timeoutMs);
+      const cancel = () => fail(new Error('The request was cancelled.'));
+      const deadline = later(() => fail(new Error('The target service timed out. Try again shortly.')), timeoutMs);
+      pendingRequests.add(cancel);
+      if (disposed) { cancel(); return; }
       const headers = { Accept: 'application/json' };
       if (body !== undefined) headers['Content-Type'] = 'application/json';
       if (token) headers.Authorization = `Bearer ${token}`;
@@ -641,7 +665,13 @@ function mountTargetList(platform, storageWarning = '') {
           if (response.status < 200 || response.status >= 300 || data?.error) {
             const delay = data?.error?.retryAfterSeconds;
             const error = new Error(`${data?.error?.message || 'The target service could not complete the request.'}${delay ? ` Retry in ${delay}s.` : ''}`);
-            error.status = response.status; error.code = data?.error?.code; fail(error); return;
+            error.status = response.status; error.code = data?.error?.code;
+            const header = response.responseHeaders?.match(/^retry-after:\s*(.+)$/im)?.[1]?.trim();
+            const headerDelay = header && /^\d+$/.test(header) ? Number(header) : Math.max(0, (Date.parse(header) - Date.now()) / 1000);
+            error.retryAfterSeconds = Number.isFinite(Number(delay)) && Number(delay) >= 0 ? Number(delay)
+              : Number.isFinite(headerDelay) ? headerDelay : 0;
+            if (error.retryAfterSeconds > 0) state.hardRetryAt = Math.max(state.hardRetryAt, Date.now() + error.retryAfterSeconds * 1000);
+            fail(error); return;
           }
           succeed(data);
         },
@@ -755,7 +785,10 @@ function mountTargetList(platform, storageWarning = '') {
       exportView.status.textContent = 'File downloads are unavailable here. Use Copy export or select the text.';
     } finally {
       anchor?.remove();
-      if (url) setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* The WebView may already have released it. */ } }, 30000);
+      if (url) {
+        downloadUrls.add(url);
+        later(() => { downloadUrls.delete(url); try { URL.revokeObjectURL(url); } catch { /* The WebView may already have released it. */ } }, 30000);
+      }
     }
   }
   function showExport(format) {
@@ -786,6 +819,22 @@ function mountTargetList(platform, storageWarning = '') {
   let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null;
   let pageNoticeEstimate = null, pageNoticeEstimateDetail = null, pageNoticeDetail = null, pageNoticeDetails = null;
   let pageNoticeObserver = null, pageNoticeTimer = null, pageNoticeAnchor = null, pageNoticeResizeObserver = null;
+  let pageNoticeObservedArea = null;
+  function observeNoticeArea(id) {
+    if (typeof MutationObserver !== 'function') return;
+    const area = id && pageVisible() ? pageNoticeAnchor?.parentElement
+      || document.querySelector?.('#content-wrapper, #mainContainer, main, .content-wrapper, [role="main"]') || document.body : null;
+    if (area === pageNoticeObservedArea) return;
+    pageNoticeObserver?.disconnect(); pageNoticeObservedArea = area;
+    if (!area) return;
+    pageNoticeObserver ||= new MutationObserver(schedulePageNotice);
+    pageNoticeObserver.observe(area, { childList: true, characterData: true, subtree: true });
+    // Direct child changes on ancestors catch React replacing the observed area,
+    // without watching unrelated text or subtree mutations across all of Torn.
+    for (let ancestor = area.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      pageNoticeObserver.observe(ancestor, { childList: true });
+    }
+  }
   function removePageNotice() {
     pageNotice?.remove(); pageNoticeResizeObserver?.disconnect(); pageNoticeAnchor = null;
     pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
@@ -918,13 +967,15 @@ function mountTargetList(platform, storageWarning = '') {
     if (pageNotice.parentNode !== document.body) document.body.append(pageNotice);
   }
   function updatePageNotice() {
-    if (host.isConnected === false) {
-      pageNoticeObserver?.disconnect(); removePageNotice(); return;
+    if (disposed || host.isConnected === false) {
+      dispose(); return;
     }
     const id = C.pageTargetId(window.location?.href);
+    if (!pageVisible()) { observeNoticeArea(null); pageNoticeResizeObserver?.disconnect(); removePageNotice(); return; }
     const target = id && state.player && state.token && Date.parse(state.expiresAt) > Date.now() && authorizedPoolFresh()
       ? state.targets.find(target => target.id === id) : null;
-    if (!target) { removePageNotice(); return; }
+    if (!target) { observeNoticeArea(null); removePageNotice(); return; }
+    observeNoticeArea(id);
     if (!pageNotice) {
       pageNotice = element('div'); pageNotice.id = 'nwa-target-page-notice';
       const noticeRoot = pageNotice.attachShadow({ mode: 'closed' });
@@ -984,11 +1035,11 @@ function mountTargetList(platform, storageWarning = '') {
     if (pageNoticeEstimateDetail.textContent !== estimateDetail) pageNoticeEstimateDetail.textContent = estimateDetail;
     const description = `${estimateDetail}. ${text}`;
     if (pageNoticeSummary.title !== description) { pageNoticeSummary.title = description; pageNoticeSummary.setAttribute('aria-label', `NWA target list. ${description}`); }
-    positionPageNotice(id);
+    positionPageNotice(id); observeNoticeArea(id);
   }
   function schedulePageNotice() {
-    if (pageNoticeTimer !== null) return;
-    pageNoticeTimer = setTimeout(() => { pageNoticeTimer = null; updatePageNotice(); }, 100);
+    if (disposed || !pageVisible() || !C.pageTargetId(window.location?.href) || pageNoticeTimer !== null) return;
+    pageNoticeTimer = later(() => { pageNoticeTimer = null; updatePageNotice(); }, 100);
   }
   function pageVisible() { return document.visibilityState !== 'hidden'; }
   function editingControl() { return ['INPUT', 'TEXTAREA', 'SELECT'].includes(root.activeElement?.tagName); }
@@ -1003,7 +1054,12 @@ function mountTargetList(platform, storageWarning = '') {
     render();
   }
   function loadTargets(force = false, forFind = false, background = false, timeoutMs = 20000) {
-    if (!state.token || state.removingKey || (background && (state.finding || state.pendingChecks.size))) return Promise.resolve(false);
+    if (disposed || !state.token || state.removingKey || (background && (state.finding || state.pendingChecks.size))) return Promise.resolve(false);
+    if (Date.now() < state.hardRetryAt) {
+      if (!background) message(`The target service asked us to wait. Retry in ${Math.ceil((state.hardRetryAt - Date.now()) / 1000)}s.`);
+      return Promise.resolve(false);
+    }
+    if (!force && !forFind && Date.now() < state.nextFeedAt) return Promise.resolve(false);
     if (!forFind && !background) cancelFind();
     if (state.targetLoad && !force) return state.targetLoad.promise;
     const generation = state.generation;
@@ -1023,12 +1079,20 @@ function mountTargetList(platform, storageWarning = '') {
         state.feedTargets = feed.targets; state.feedCursor = feed.cursor;
         state.player = data.player; state.targets = feed.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
         state.reservationsSupported = data.reservations?.supported === true;
+        state.nextTargetSupported = data.capabilities?.nextTarget === true;
+        state.backendNotice = data.capabilities?.schema?.status === 'incompatible' ? 'Backend database update required. Contact the NWA administrator.'
+          : !state.nextTargetSupported ? 'Backend update available for faster target selection.' : '';
+        state.feedFailures = 0; state.nextFeedAt = 0;
         state.poolLoadedAt = Date.now(); state.authorizedPool = true;
         updatePageNotice();
         return true;
       } catch (error) {
         if (generation === state.generation && targetGeneration === state.targetGeneration) {
           if (error.code === 'FEED_SYNC_INVALID') { state.feedTargets = []; state.feedCursor = null; }
+          state.feedFailures = Math.min(6, state.feedFailures + 1);
+          const retryMs = Math.max(Number(error.retryAfterSeconds || 0) * 1000,
+            Math.min(120_000, 5000 * 2 ** (state.feedFailures - 1)));
+          state.nextFeedAt = Date.now() + retryMs + Math.floor(Math.random() * 1000);
           state.authorizedPool = false; updatePageNotice(); handleError(error);
         }
         return false;
@@ -1043,20 +1107,60 @@ function mountTargetList(platform, storageWarning = '') {
     return pending;
   }
   async function findTarget() {
-    if (state.finding || state.busy) return;
+    if (disposed || state.finding || state.busy) return;
     message('');
     if (!state.token || Date.parse(state.expiresAt) <= Date.now()) {
       if (state.token) clearSession();
       state.findAfterLogin = true; toggle(true); render(); return;
     }
-    state.finding = true; updateLauncher(); findNotice('Finding a target…');
+    if (Date.now() < state.hardRetryAt) {
+      findNotice(`The target service asked us to wait. Retry in ${Math.ceil((state.hardRetryAt - Date.now()) / 1000)}s.`); return;
+    }
+    state.finding = true; state.lastFindAt = Date.now(); updateLauncher(); findNotice('Finding a target…');
     const findGeneration = ++state.findGeneration;
     const generation = state.generation;
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + 12000;
     let targetGeneration = state.targetGeneration;
-    const current = () => state.finding && findGeneration === state.findGeneration && generation === state.generation
+    const current = () => !disposed && state.finding && findGeneration === state.findGeneration && generation === state.generation
       && targetGeneration === state.targetGeneration && state.token && Date.parse(state.expiresAt) > Date.now();
     try {
+      if (state.nextTargetSupported !== false) {
+        const selection = { minRatio: state.minRatio, maxRatio: state.maxRatio, estimateDays: state.estimateDays,
+          recentTargetIds: C.recentTargets(state.recentTargets).slice(-50).map(row => row.id), query: state.query.trim().slice(0, 200), timeoutMs: 8000 };
+        const signature = JSON.stringify(selection);
+        if (!state.retryAttempt || state.retryAttempt.signature !== signature) {
+          state.retryAttempt = { signature, requestId: typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID() : `nwa_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}` };
+        }
+        const attempt = state.retryAttempt;
+        try {
+          const data = await request('POST', '/api/targets/next', { ...selection, requestId: attempt.requestId }, state.token, 10000);
+          if (!current()) return;
+          if (!data?.player?.battleStats || !Number.isSafeInteger(data?.target?.id) || data.target.id <= 0 || data.target.id > 2147483647
+              || !(Date.parse(data.target.reservationExpiresAt) > Date.now()) || data.target.reserved
+              || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).suggested
+              || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).ready) {
+            throw new Error('NWA could not verify the reserved target. Try again.');
+          }
+          state.retryAttempt = null; state.nextTargetSupported = true;
+          state.player = data.player; state.reservationsSupported = true;
+          state.targets = state.targets.map(row => row.id === data.target.id ? data.target : row);
+          rememberTarget(data.target.id); findNotice(`Opening ${data.target.name || 'target'}...`);
+          window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${data.target.id}`);
+          return;
+        } catch (error) {
+          if (!current()) return;
+          // These structured backend failures confirm that selection did not
+          // complete. A deliberate retry must start a new attempt after recovery;
+          // transport and unrecognized gateway failures retain their uncertain ID.
+          if (error.status && (error.status < 500 || DEFINITE_SELECTION_FAILURES.has(error.code))) state.retryAttempt = null;
+          if (error.status === 404 && error.code === 'NOT_FOUND') {
+            state.nextTargetSupported = false; state.backendNotice = 'Backend update available for faster target selection.';
+          } else if (error.code === 'NO_TARGET_AVAILABLE') {
+            findNotice('No matching targets are available right now. Adjust your filters or try again shortly.'); return;
+          } else throw error;
+        }
+      }
       if (!state.player || !authorizedPoolFresh()
           || !C.select(state.targets, state.player, { ...state, mode: 'suggested' }).length) {
         let feedTimer;
@@ -1065,9 +1169,9 @@ function mountTargetList(platform, storageWarning = '') {
           const feed = loadTargets(false, true, false, 5000);
           targetGeneration = state.targetGeneration;
           restored = await Promise.race([feed, new Promise((_, reject) => {
-            feedTimer = setTimeout(() => reject(new Error('NWA could not load targets within 8 seconds. Try again shortly.')), Math.max(1, deadline - Date.now()));
+            feedTimer = later(() => reject(new Error('NWA could not load targets in time. Try again shortly.')), Math.max(1, deadline - Date.now()));
           })]);
-        } finally { clearTimeout(feedTimer); }
+        } finally { cancelLater(feedTimer); }
         targetGeneration = state.targetGeneration;
         if (!restored || !current()) {
           if (findGeneration === state.findGeneration && state.error) findNotice(state.error);
@@ -1090,7 +1194,7 @@ function mountTargetList(platform, storageWarning = '') {
         findNotice(`Reserving ${target.name || 'player'}…`);
         let checked;
         try { checked = await request('POST', `/api/targets/${target.id}/reservation`,
-          undefined, state.token, Math.min(3000, remainingMs)); }
+          undefined, state.token, 10000); }
         catch (error) {
           if (!current()) return;
           state.targets = state.targets.map(row => row.id === target.id ? { ...row, checkedAt: null } : row);
@@ -1101,7 +1205,10 @@ function mountTargetList(platform, storageWarning = '') {
             state.targets = state.targets.map(row => row.id === target.id ? { ...row, reserved: true } : row);
             continue;
           }
-          if (!error.status || error.status === 502 || ['TORN_UNAVAILABLE', 'TARGETS_UNAVAILABLE'].includes(error.code)) continue;
+          // A transport failure can hide a successful reservation. Do not start
+          // another reservation after an ambiguous response from an old backend.
+          if (!error.status) throw error;
+          if (error.status === 502 || ['TORN_UNAVAILABLE', 'TARGETS_UNAVAILABLE'].includes(error.code)) continue;
           throw error;
         }
         if (!current()) return;
@@ -1241,8 +1348,10 @@ function mountTargetList(platform, storageWarning = '') {
   let preferencesOpen = false, diagnosticsOpen = false;
   const cardNodes = new Map();
   let orderedRowsKey = null, orderedIds = [], mountedIds = [], emptyCard = null;
+  let visibleCardLimit = CARD_BATCH_SIZE, cardFilterKey = null, lazyCardsObserver = null;
   const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
   function resetPanel() {
+    lazyCardsObserver?.disconnect(); lazyCardsObserver = null;
     clearExport();
     content.replaceChildren(); cardContainer = null; countNode = null; panelUi = null; renderedKind = null;
     suggestionContainer = null; suggestionSignature = null; cardNodes.clear();
@@ -1272,14 +1381,16 @@ function mountTargetList(platform, storageWarning = '') {
     if (root.activeElement !== panelUi.age) panelUi.age.value = String(state.estimateDays);
     panelUi.ageCaution.hidden = state.estimateDays <= 28;
     setText(panelUi.estimateNote, `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
-    const metadata = JSON.stringify([state.warnings, state.generatedAt]);
+    const metadata = JSON.stringify([state.warnings, state.generatedAt, state.backendNotice]);
     if (metadata !== panelUi.metadata) {
       panelUi.metadata = metadata; panelUi.poolMetadata.replaceChildren();
       for (const warning of state.warnings) panelUi.poolMetadata.append(element('p', warning));
+      if (state.backendNotice) panelUi.poolMetadata.append(element('p', state.backendNotice));
     }
     setText(panelUi.poolUpdated, state.generatedAt ? `Pool updated: ${C.ageLabel(Date.parse(state.generatedAt) / 1000)}` : 'Pool update time unknown');
   }
   function render() {
+    if (disposed) return;
     updatePageNotice();
     updateLauncher();
     moreOptions.hidden = !state.player;
@@ -1429,6 +1540,18 @@ function mountTargetList(platform, storageWarning = '') {
     diagnostics.append(panelUi.countSummary, panelUi.countDetail); countNode.append(diagnostics, refresh);
     cardContainer = element('div', null, 'cards'); cardContainer.setAttribute('aria-label', 'Targets');
     content.append(countNode, cardContainer);
+    panelUi.moreCards = element('div', null, 'queuefooter');
+    panelUi.showMore = button('Show more', () => {
+      visibleCardLimit += CARD_BATCH_SIZE; renderCards();
+    });
+    panelUi.moreCards.append(panelUi.showMore); content.append(panelUi.moreCards);
+    if (typeof IntersectionObserver === 'function') {
+      lazyCardsObserver = new IntersectionObserver(entries => {
+        if (!disposed && state.open && pageVisible() && panelUi?.moreCards && !panelUi.moreCards.hidden && entries.some(entry => entry.isIntersecting)) {
+          visibleCardLimit += CARD_BATCH_SIZE; renderCards();
+        }
+      }, { root: scroll, rootMargin: '200px 0px', threshold: 0 });
+    }
     const note = element('div', null, 'footnote');
     panelUi.estimateNote = element('p', `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
     note.append(panelUi.estimateNote,
@@ -1527,7 +1650,14 @@ function mountTargetList(platform, storageWarning = '') {
     return `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
   }
   function renderCards() {
-    if (!state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
+    if (disposed || !state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
+    const activeControl = root.activeElement;
+    let focusedCard = activeControl;
+    while (focusedCard && !focusedCard.getAttribute?.('data-target-id')) focusedCard = focusedCard.parentNode;
+    const focusedId = Number(focusedCard?.getAttribute('data-target-id'));
+    const previousScrollTop = scroll.scrollTop;
+    const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays]);
+    if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
     const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
     const selected = new Map();
@@ -1556,10 +1686,15 @@ function mountTargetList(platform, storageWarning = '') {
     const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
     const shownReady = freshPool && state.reservationsSupported
       ? rows.filter(({ target, assessment }) => assessment.suggested && assessment.ready && !target.reserved).length : 0;
-    setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} shown`);
-    setText(panelUi.countDetail, `${rows.length} shown · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
+    const visibleRows = rows.slice(0, visibleCardLimit), visibleIds = visibleRows.map(row => row.target.id), visibleIdSet = new Set(visibleIds);
+    setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} ${rows.length > visibleRows.length ? 'matches' : 'shown'}`);
+    setText(panelUi.countDetail, `${visibleRows.length} displayed · ${rows.length} matching · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
+    panelUi.moreCards.hidden = visibleRows.length >= rows.length;
+    setText(panelUi.showMore, `Show more (${rows.length - visibleRows.length} remaining)`);
+    lazyCardsObserver?.disconnect();
+    if (!panelUi.moreCards.hidden && pageVisible()) lazyCardsObserver?.observe(panelUi.moreCards);
     cardContainer.setAttribute('aria-busy', String(state.loading));
-    for (const [id, cached] of cardNodes) if (!selected.has(id)) { cached.node.remove(); cardNodes.delete(id); }
+    for (const [id, cached] of cardNodes) if (!visibleIdSet.has(id)) { cached.node.remove(); cardNodes.delete(id); }
     if (!rows.length) {
       const text = state.loading ? 'Loading the target pool for your faction…' : state.targets.length
         ? 'No targets match these filters. Try All targets or a different stat range.'
@@ -1569,7 +1704,7 @@ function mountTargetList(platform, storageWarning = '') {
       mountedIds = []; return;
     }
     emptyCard?.remove(); emptyCard = null;
-    for (const { target, assessment } of rows) {
+    for (const { target, assessment } of visibleRows) {
       const signature = JSON.stringify([target, assessment, freshPool, state.pendingChecks.has(target.id), state.loading,
         state.reservationsSupported, C.ageLabel(target.estimateUpdatedAt, now), C.ageLabel(target.lastAction, now),
         Boolean(target.status?.until > now / 1000), Date.parse(target.reservationExpiresAt) > now]);
@@ -1612,6 +1747,7 @@ function mountTargetList(platform, storageWarning = '') {
       if (C.reason(target)) card.append(element('div', `Reason: ${C.reason(target)}`, 'notes'));
       const actions = element('div', null, 'actions');
       const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id), 'check-status'); check.disabled = state.pendingChecks.has(target.id) || state.loading;
+      cached.controls = { 'check-status': check };
       actions.append(check);
       const guardAttack = event => {
         if (!state.reservationsSupported) {
@@ -1630,22 +1766,34 @@ function mountTargetList(platform, storageWarning = '') {
           if (guardAttack(event)) void checkStatus(target.id, true);
         }, 'attack');
         attack.disabled = state.pendingChecks.has(target.id); actions.append(attack);
+        cached.controls.attack = attack;
       } else if (assessment.suggested && assessment.ready && freshPool && !target.reserved && !state.reservationsSupported) {
         status.append(element('small', 'Target coordination unavailable. Refresh the list.'));
       }
       card.append(actions);
     }
-    if (mountedIds.length !== orderedIds.length || mountedIds.some((id, index) => id !== orderedIds[index])) {
-      for (const id of orderedIds) cardContainer.append(cardNodes.get(id).node);
-      mountedIds = [...orderedIds];
+    if (mountedIds.length !== visibleIds.length || mountedIds.some((id, index) => id !== visibleIds[index])) {
+      for (const id of visibleIds) cardContainer.append(cardNodes.get(id).node);
+      mountedIds = visibleIds;
+    }
+    if (focusedId && activeControl?.tagName === 'BUTTON') {
+      const controls = cardNodes.get(focusedId)?.controls;
+      const nextControl = controls?.[activeControl.className] || controls?.['check-status'];
+      if (nextControl && !nextControl.disabled && root.activeElement !== nextControl) {
+        nextControl.focus?.({ preventScroll: true });
+        if (Number.isFinite(previousScrollTop)) scroll.scrollTop = previousScrollTop;
+      }
     }
   }
 
   function toggle(open) {
+    if (disposed) return;
     state.open = open; panel.hidden = !open; settings.setAttribute('aria-expanded', String(open));
     if (open) { findNotice(''); render(); }
-    else findNotice(finderStatus.textContent || quickNotice.textContent || '');
-    if (open && state.token && !state.player && !state.finding) void loadTargets();
+    else { lazyCardsObserver?.disconnect(); findNotice(finderStatus.textContent || quickNotice.textContent || ''); }
+    if (open && state.token && !state.finding && Date.now() - state.lastPoolAttemptAt >= 1000) {
+      void loadTargets(false, false, Boolean(state.player));
+    }
   }
   const saved = platform.getValue(storageKey, null);
   if (saved?.token && Date.parse(saved.expiresAt) > Date.now()) {
@@ -1659,35 +1807,49 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
   updateViewport();
-  window.visualViewport?.addEventListener('resize', updateViewport);
-  window.visualViewport?.addEventListener('scroll', updateViewport);
-  root.addEventListener('keydown', event => { if (event.key === 'Escape') toggle(false); });
-  root.addEventListener('focusout', () => {
-    setTimeout(() => {
+  listen(window.visualViewport, 'resize', updateViewport);
+  listen(window.visualViewport, 'scroll', updateViewport);
+  listen(root, 'keydown', event => { if (event.key === 'Escape') toggle(false); });
+  listen(root, 'focusout', () => {
+    later(() => {
       if (state.backgroundRenderPending && state.open && !editingControl()) render();
     }, 0);
   });
-  document.addEventListener?.('visibilitychange', () => {
+  listen(document, 'visibilitychange', () => {
     updatePageNotice();
+    if (!pageVisible()) lazyCardsObserver?.disconnect();
     if (pageVisible() && state.token && Date.parse(state.expiresAt) > Date.now() && !state.busy) {
       void loadTargets(false, false, Boolean(state.player));
     }
   });
-  window.addEventListener?.('popstate', updatePageNotice);
-  window.addEventListener?.('hashchange', updatePageNotice);
-  window.addEventListener?.('resize', schedulePageNotice);
-  window.addEventListener?.('scroll', schedulePageNotice, { passive: true, capture: true });
-  window.visualViewport?.addEventListener('resize', schedulePageNotice);
-  window.visualViewport?.addEventListener('scroll', schedulePageNotice);
-  if (typeof MutationObserver === 'function') {
-    pageNoticeObserver = new MutationObserver(schedulePageNotice);
-    pageNoticeObserver.observe(document.body, { childList: true, characterData: true, subtree: true });
+  listen(window, 'popstate', updatePageNotice);
+  listen(window, 'hashchange', updatePageNotice);
+  listen(window, 'resize', schedulePageNotice);
+  listen(window, 'scroll', schedulePageNotice, { passive: true, capture: true });
+  listen(window.visualViewport, 'resize', schedulePageNotice);
+  listen(window.visualViewport, 'scroll', schedulePageNotice);
+  function dispose() {
+    if (disposed) return;
+    disposed = true; state.generation++; state.targetGeneration++; state.findGeneration++; state.suggestionGeneration++;
+    state.finding = false; state.token = null;
+    if (typeof clearInterval === 'function') clearInterval(maintenanceTimer);
+    for (const id of taskTimers) clearTimeout(id);
+    taskTimers.clear();
+    for (const cancel of [...pendingRequests]) cancel();
+    for (const remove of lifecycleListeners) remove();
+    lifecycleListeners.length = 0;
+    pageNoticeObserver?.disconnect(); pageNoticeResizeObserver?.disconnect(); lazyCardsObserver?.disconnect();
+    removePageNotice(); clearExport();
+    for (const url of downloadUrls) { try { URL.revokeObjectURL(url); } catch { /* Already released by the WebView. */ } }
+    downloadUrls.clear();
   }
+  host.__nwaDispose = dispose; listen(host, 'nwa:dispose', dispose);
   // Expire the session and checked attack links even while the panel is idle.
-  setInterval(() => {
+  const maintenanceTimer = setInterval(() => {
+    if (disposed) return;
     updatePageNotice();
     if (state.token && Date.parse(state.expiresAt) <= Date.now()) { clearSession(); message('Session expired. Sign in again.'); render(); }
-    else if (state.open && state.player && !state.pendingChecks.size) {
+    else if (pageVisible() && state.open && state.player && !state.pendingChecks.size) {
       let expired = false;
       state.targets = state.targets.map(target => {
         if (target.checkedAt && !assessTarget(target).live) {
@@ -1697,8 +1859,10 @@ function mountTargetList(platform, storageWarning = '') {
       });
       if (expired) renderCards();
     }
+    const refreshMs = state.open || C.pageTargetId(window.location?.href) || Date.now() - state.lastFindAt < 120_000
+      ? FEED_REFRESH_MS : IDLE_FEED_REFRESH_MS;
     if (state.token && pageVisible() && !state.busy && !state.finding && !state.pendingChecks.size && !state.loading && !state.backgroundLoading
-        && Date.now() - state.lastPoolAttemptAt >= FEED_REFRESH_MS) {
+        && Date.now() >= state.nextFeedAt && Date.now() - state.lastPoolAttemptAt >= refreshMs) {
       void loadTargets(false, false, Boolean(state.player));
     }
   }, 5000);
