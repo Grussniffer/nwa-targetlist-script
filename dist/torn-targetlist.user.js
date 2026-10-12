@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.7.1
+// @version      0.8.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -72,6 +72,14 @@ const TargetListCore = (() => {
   function reason(target) {
     return (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || '';
+  }
+  function estimateSourceLabel(target) {
+    const provider = typeof target?.estimateProvider === 'string' ? target.estimateProvider.trim() : '';
+    const source = typeof target?.estimateSource === 'string' ? target.estimateSource.trim() : '';
+    if (provider) return /^ffscouter$/i.test(provider) ? 'FFScouter' : provider;
+    // Older feeds exposed the FFScouter method as their only source field.
+    // Generic labels such as model, spy and manual do not establish a provider.
+    return /^(?:bss|premium|spies|ffscouter(?::.*)?)$/i.test(source) ? 'FFScouter' : source;
   }
   function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO, estimateDays = DEFAULT_ESTIMATE_DAYS) {
     const ratio = positive(target.estimatedStats) && positive(player.battleStats.total)
@@ -172,7 +180,7 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
 })();
 
 const TargetListExport = (() => {
@@ -197,7 +205,7 @@ const TargetListExport = (() => {
     const playerId = id(value.id);
     const factionId = id(value.faction?.id);
     return [playerId, text(value.name), factionId, text(value.faction?.name), stat(value.estimatedStats),
-      text(value.estimateSource), unixDate(value.estimateUpdatedAt), text(value.reason).trim() || text(value.notes).trim(),
+      TargetListCore.estimateSourceLabel(value), unixDate(value.estimateUpdatedAt), text(value.reason).trim() || text(value.notes).trim(),
       text(value.status?.state), text(value.status?.description), unixDate(value.status?.until), stringDate(value.checkedAt),
       unixDate(value.lastAction), typeof value.reserved === 'boolean' ? String(value.reserved) : '',
       stringDate(value.reservationExpiresAt), playerId ? `https://www.torn.com/profiles.php?XID=${playerId}` : '',
@@ -357,7 +365,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.7.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.8.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -599,7 +607,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function handleError(error) {
     if (error.code === 'REVIEW_NOT_ALLOWED') state.canReview = false;
-    if (['SESSION_EXPIRED', 'UNAUTHORIZED', 'FACTION_NOT_ALLOWED', 'FACTION_CHANGED', 'INVALID_KEY', 'KEY_ACCESS', 'SESSION_REVOKED', 'KEY_REVOKED', 'INVALID_SESSION', 'FORBIDDEN'].includes(error.code) || error.status === 401 || (error.status === 403 && !['FRIENDLY_TARGET', 'REVIEW_NOT_ALLOWED'].includes(error.code))) {
+    if (['SESSION_EXPIRED', 'UNAUTHORIZED', 'FACTION_NOT_ALLOWED', 'FACTION_CHANGED', 'INVALID_KEY', 'KEY_ACCESS', 'SESSION_REVOKED', 'KEY_REVOKED', 'INVALID_SESSION', 'FORBIDDEN'].includes(error.code) || error.status === 401 || (error.status === 403 && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'REVIEW_NOT_ALLOWED'].includes(error.code))) {
       clearSession(); toggle(true); render();
     }
     message(error.message || 'The request failed. Try again shortly.');
@@ -968,7 +976,7 @@ function mountTargetList(platform, storageWarning = '') {
     const estimate = known ? C.compact(target.estimatedStats) : 'Unknown';
     const fresh = known && assessTarget(target).fresh;
     const estimateDetail = known
-      ? `Estimated battle stats: ${estimate} · ${target.estimateSource || 'Source unknown'} · ${C.ageLabel(target.estimateUpdatedAt)}${fresh ? '' : ' · Estimate needs refresh'}`
+      ? `Estimated battle stats: ${estimate} · ${C.estimateSourceLabel(target) || 'Unknown source'} · ${C.ageLabel(target.estimateUpdatedAt)}${fresh ? '' : ' · Estimate needs refresh'}`
       : 'Estimated battle stats: Unknown · No estimate available';
     if (pageNoticeEstimate.textContent !== estimate) pageNoticeEstimate.textContent = estimate;
     if (pageNoticeEstimate.parentElement.getAttribute('data-known') !== String(known)) pageNoticeEstimate.parentElement.setAttribute('data-known', String(known));
@@ -1086,8 +1094,8 @@ function mountTargetList(platform, storageWarning = '') {
         catch (error) {
           if (!current()) return;
           state.targets = state.targets.map(row => row.id === target.id ? { ...row, checkedAt: null } : row);
-          if (['FRIENDLY_TARGET', 'TARGET_NOT_FOUND'].includes(error.code)) {
-            state.targets = state.targets.filter(row => row.id !== target.id); continue;
+          if (['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION'].includes(error.code)) {
+            state.targets = state.targets.filter(row => row.id !== target.id); updatePageNotice(); continue;
           }
           if (['TARGET_RESERVED', 'TARGET_UNAVAILABLE'].includes(error.code)) {
             state.targets = state.targets.map(row => row.id === target.id ? { ...row, reserved: true } : row);
@@ -1152,8 +1160,11 @@ function mountTargetList(platform, storageWarning = '') {
       }
     } catch (error) {
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
-      state.targets = state.targets.map(target => target.id === id ? { ...target, checkedAt: null,
-        ...(error.code === 'TARGET_RESERVED' ? { reserved: true } : {}) } : target);
+      state.targets = ['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION'].includes(error.code)
+        ? state.targets.filter(target => target.id !== id)
+        : state.targets.map(target => target.id === id ? { ...target, checkedAt: null,
+          ...(error.code === 'TARGET_RESERVED' ? { reserved: true } : {}) } : target);
+      updatePageNotice();
       handleError(error);
     } finally {
       if (generation === state.generation) { state.pendingChecks.delete(id); renderCards(); }
@@ -1456,16 +1467,20 @@ function mountTargetList(platform, storageWarning = '') {
     const queueHeader = element('div', null, 'queueheader'); queueHeader.append(element('h3', 'Target suggestions'));
     const refresh = button(state.suggestionsLoading ? 'Loading…' : 'Refresh suggestions', () => void loadSuggestions()); refresh.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); queueHeader.append(refresh); suggestionContainer.append(queueHeader);
     const views = element('div', null, 'tabs'); views.setAttribute('aria-label', 'Suggestion views');
-    for (const [view, label] of [['pending', 'Pending suggestions'], ['mine', 'My suggestions']]) {
+    for (const [view, label] of [['pending', 'Pending suggestions'], ['mine', 'My suggestions'], ['history', 'History']]) {
       const tab = button(label, () => { if (state.suggestionView !== view) void loadSuggestions(view); });
       tab.setAttribute('aria-pressed', String(state.suggestionView === view)); tab.disabled = Boolean(state.suggestionMutation); views.append(tab);
     }
     suggestionContainer.append(views);
-    suggestionContainer.append(element('p', state.canReview
-      ? 'You can approve or reject suggestions as a current faction leader or co-leader. Approving a faction adds its current players to the target pool.'
-      : 'Faction leaders and co-leaders can approve or reject suggestions. Approving a faction adds its current players to the target pool.', 'notice'));
+    suggestionContainer.append(element('p', state.suggestionView === 'history'
+      ? 'Approved and rejected suggestions keep the original reason, who suggested them, and who reviewed them.'
+      : state.canReview
+        ? 'You can approve or reject suggestions as a current faction leader or co-leader. Approving a faction adds its current players to the target pool.'
+        : 'Faction leaders and co-leaders can approve or reject suggestions. Approving a faction adds its current players to the target pool.', 'notice'));
     const queue = element('div', null, 'cards suggestionqueue'); suggestionContainer.append(queue);
-    if (!state.suggestions.length) queue.append(element('div', state.suggestionsLoading ? 'Loading suggestions…' : state.suggestionView === 'mine' ? 'You have not suggested any targets yet.' : 'There are no pending suggestions.', 'empty'));
+    if (!state.suggestions.length) queue.append(element('div', state.suggestionsLoading ? 'Loading suggestions…'
+      : state.suggestionView === 'history' ? 'No reviewed suggestions yet.'
+        : state.suggestionView === 'mine' ? 'You have not suggested any targets yet.' : 'There are no pending suggestions.', 'empty'));
     for (const row of state.suggestions) {
       const card = element('article', null, 'card suggestioncard'); const top = element('div', null, 'cardhead'); const identity = element('div');
       const href = row.type === 'faction' ? `https://www.torn.com/factions.php?step=profile&ID=${row.targetId}` : `https://www.torn.com/profiles.php?XID=${row.targetId}`;
@@ -1473,9 +1488,17 @@ function mountTargetList(platform, storageWarning = '') {
       top.append(identity, element('span', row.status, `badge ${row.status === 'pending' ? 'warn' : row.status === 'rejected' ? 'muted' : ''}`)); card.append(top);
       card.append(element('div', row.comment, 'comment'));
       const actor = row.suggestedBy;
-      card.append(element('div', `Suggested by ${actor.name} [${actor.id}] · ${actor.faction.name} [${actor.faction.id}]`, 'muted'), element('div', new Date(row.createdAt).toLocaleString(), 'muted'));
-      if (row.reviewedBy) card.append(element('div', `${row.status === 'approved' ? 'Approved' : 'Rejected'} by ${row.reviewedBy.name} [${row.reviewedBy.id}]${row.reviewedAt ? ` · ${new Date(row.reviewedAt).toLocaleString()}` : ''}`, 'muted'));
-      if (state.canReview && row.status === 'pending') {
+      card.append(element('div', `Suggested by ${actor.name} [${actor.id}] · ${actor.faction.name} [${actor.faction.id}]`, 'muted'));
+      const submitted = element('div', 'Submitted ', 'muted'); const submittedAt = element('time', new Date(row.createdAt).toLocaleString());
+      submittedAt.setAttribute('datetime', row.createdAt); submitted.append(submittedAt); card.append(submitted);
+      if (row.reviewedBy) {
+        card.append(element('div', `${row.status === 'approved' ? 'Approved' : 'Rejected'} by ${row.reviewedBy.name} [${row.reviewedBy.id}]`, 'muted'));
+        if (row.reviewedAt) {
+          const reviewed = element('div', 'Reviewed ', 'muted'); const reviewedAt = element('time', new Date(row.reviewedAt).toLocaleString());
+          reviewedAt.setAttribute('datetime', row.reviewedAt); reviewed.append(reviewedAt); card.append(reviewed);
+        }
+      }
+      if (state.suggestionView !== 'history' && state.canReview && row.status === 'pending') {
         const actions = element('div', null, 'actions');
         for (const [decision, label] of [['approved', 'Approve'], ['rejected', 'Reject']]) {
           const action = button(label, () => void reviewSuggestion(row.id, decision), decision === 'approved' ? 'primary' : '');
@@ -1566,7 +1589,7 @@ function mountTargetList(platform, storageWarning = '') {
       const stats = element('div', null, 'estimate'); stats.setAttribute('aria-label', 'Estimated battle stats');
       stats.append(element('strong', C.compact(target.estimatedStats)),
         element('small', assessment.ratio === null ? 'Comparison unknown' : `${(assessment.ratio * 100).toFixed(0)}% of your stats`),
-        element('small', `${target.estimateSource || 'No estimate'} · ${C.ageLabel(target.estimateUpdatedAt, now)}`));
+        element('small', `${C.estimateSourceLabel(target) || (target.estimatedStats > 0 ? 'Unknown source' : 'No estimate')} · ${C.ageLabel(target.estimateUpdatedAt, now)}`));
       const status = element('div', null, 'availability');
       const ownLease = !target.reserved && Date.parse(target.reservationExpiresAt) > now;
       const canAttack = assessment.suggested && assessment.ready && freshPool && !target.reserved && state.reservationsSupported;

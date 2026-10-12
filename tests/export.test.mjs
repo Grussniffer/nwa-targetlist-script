@@ -4,8 +4,9 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../src/export.js', import.meta.url), 'utf8');
+const coreSource = await readFile(new URL('../src/core.js', import.meta.url), 'utf8');
 const context = vm.createContext({});
-vm.runInContext(`${source}\nglobalThis.Exporter = TargetListExport;`, context);
+vm.runInContext(`${coreSource}\n${source}\nglobalThis.Exporter = TargetListExport;`, context);
 const { serialize } = context.Exporter;
 const NOW = Date.parse('2026-10-12T12:00:00Z');
 function target(overrides = {}) {
@@ -46,6 +47,26 @@ test('CSV exports all public target fields and the current attack URL', () => {
     '2026-10-12T11:59:59.000Z', '2026-10-12T11:58:00.000Z', 'true', '2026-10-12T12:01:00.000Z',
     'https://www.torn.com/profiles.php?XID=98765', 'https://www.torn.com/page.php?sid=attack&user2ID=98765']);
   assert.doesNotMatch(result.text, /loader\.php/);
+});
+
+test('exports identify FFScouter as the provider without renaming manual or custom sources', () => {
+  for (const [provenance, expected] of [
+    [{ estimateSource: 'bss' }, 'FFScouter'],
+    [{ estimateSource: 'premium' }, 'FFScouter'],
+    [{ estimateSource: 'spies' }, 'FFScouter'],
+    [{ estimateSource: 'FFScouter:model' }, 'FFScouter'],
+    [{ estimateProvider: 'FFScouter', estimateSource: 'model' }, 'FFScouter'],
+    [{ estimateProvider: 'Manual', estimateSource: 'bss' }, 'Manual'],
+    [{ estimateSource: 'Manual' }, 'Manual'],
+    [{ estimateSource: 'Custom model' }, 'Custom model'],
+    [{ estimateSource: 'model' }, 'model'],
+  ]) {
+    const value = target(provenance);
+    const before = JSON.stringify(value);
+    assert.equal(csvRows(serialize('csv', [value]).text)[1][5], expected);
+    assert.ok(serialize('markdown', [value]).text.includes(`| ${expected} |`));
+    assert.equal(JSON.stringify(value), before, 'display/export keeps underlying method intact');
+  }
 });
 
 test('CSV round trips Unicode, commas, double quotes and embedded line breaks', () => {

@@ -131,7 +131,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       estimateUpdatedAt: estimatedStats === null ? null : now - 3600,
       status: { state: 'Unknown', description: 'Not checked', until: null },
       lastAction: now - 86400, checkedAt: null, notes: '', ...overrides });
-    const targets = [makeTarget(101, 'Willow', 300000, { notes: 'Preferred chain target' }),
+    const targets = [makeTarget(101, 'Willow', 300000, { notes: 'Preferred chain target', estimateSource: 'model', estimateProvider: 'FFScouter' }),
       makeTarget(102, 'Granite', 900000), makeTarget(103, 'Mystery', null),
       makeTarget(104, 'OldEstimate', 200000, { estimateUpdatedAt: now - 8 * 86400 })];
     const store = new Map();
@@ -197,7 +197,8 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
       } else if (url.pathname === '/api/suggestions' && request.method === 'GET') {
         const offset = Number(url.searchParams.get('offset') || 0);
         const view = url.searchParams.get('view');
-        const matching = window.__mock.suggestions.filter(row => view === 'mine' ? row.suggestedBy.id === player.id : row.status === 'pending');
+        const matching = window.__mock.suggestions.filter(row => view === 'mine' ? row.suggestedBy.id === player.id
+          : view === 'history' ? ['approved', 'rejected'].includes(row.status) : row.status === 'pending');
         data = { canReview: window.__mock.canReview, suggestions: structuredClone(matching.slice(offset, offset + 50)),
           nextOffset: matching.length > offset + 50 ? offset + 50 : null };
       } else if (url.pathname === '/api/suggestions' && request.method === 'POST') {
@@ -1449,6 +1450,8 @@ try {
   assert.match(await shadow(main, '.header', 'text'), /NWA/);
   assert.match(await shadow(main, '.header', 'text'), /North West Alliance/);
   assert.match(await shadow(main, '.profile', 'text'), /MockChainer \[90001\].*Mock Allowed Faction/s);
+  assert.match((await cardSnapshot(main, 101)).text, /FFScouter/);
+  assert.equal((await cardSnapshot(main, 101)).text.includes('model'), false);
   assert.match(await shadow(main, '.statgrid', 'text'), /Strength400K.*Defense250K.*Speed200K.*Dexterity150K/s);
   assert.match((await cardSnapshot(main, 103)).text, /Stats unknown.*Unknown/s);
   assert.equal((await main.evaluate(() => [...window.__targetlistShadow.querySelectorAll('button.attack')].length)), 0);
@@ -1631,6 +1634,28 @@ try {
   await clickButton(member, 'Load more suggestions');
   await wait(member, () => window.__targetlistShadow.querySelectorAll('.suggestioncard').length === 60);
   assert.equal(await member.evaluate(() => window.__mock.requests.at(-1).search), '?view=mine&offset=50');
+  await member.evaluate(() => {
+    for (const [index, row] of window.__mock.suggestions.entries()) Object.assign(row, {
+      status: index % 2 ? 'rejected' : 'approved',
+      suggestedBy: { id: 99881, name: 'Original Contributor', faction: { id: 66551, name: 'Original NWA Faction' } },
+      reviewedBy: { id: 99882, name: 'Reviewing Leader' }, reviewedAt: new Date(Date.now() - 60000).toISOString(),
+    });
+    window.__mock.suggestions.push({ ...structuredClone(window.__mock.suggestions[0]),
+      id: '00000000-0000-4000-8000-999999999999', targetName: 'Still Pending Player', status: 'pending', reviewedBy: null, reviewedAt: null });
+  });
+  await clickButton(member, 'History');
+  await wait(member, () => window.__targetlistShadow.querySelectorAll('.suggestioncard').length === 50);
+  assert.equal(await member.evaluate(() => window.__mock.requests.at(-1).search), '?view=history&offset=0');
+  await clickButton(member, 'Load more suggestions');
+  await wait(member, () => window.__targetlistShadow.querySelectorAll('.suggestioncard').length === 60);
+  assert.equal(await member.evaluate(() => window.__mock.requests.at(-1).search), '?view=history&offset=50');
+  const historyText = await shadow(member, '.suggestionqueue', 'text');
+  assert.match(historyText, /Suggested by Original Contributor \[99881\].*Original NWA Faction \[66551\]/s);
+  assert.match(historyText, /Submitted .*Approved by Reviewing Leader \[99882\].*Reviewed /s);
+  assert.match(historyText, /Rejected by Reviewing Leader \[99882\]/);
+  assert.equal(historyText.includes('Still Pending Player'), false);
+  assert.equal(await member.evaluate(() => window.__targetlistShadow.querySelectorAll('.suggestionqueue time[datetime]').length), 120);
+  assert.equal(await member.evaluate(() => [...window.__targetlistShadow.querySelectorAll('button')].some(node => ['Approve', 'Reject'].includes(node.textContent))), false);
   await member.setViewportSize({ width: 390, height: 844 });
   assert.equal(await member.evaluate(() => {
     const panel = window.__targetlistShadow.querySelector('.panel').getBoundingClientRect();
@@ -1638,7 +1663,7 @@ try {
     return panel.left >= 0 && panel.right <= innerWidth && scroll.scrollWidth <= scroll.clientWidth + 1;
   }), true);
   await member.close();
-  console.log('PASS pending/history pagination beyond 50 suggestions and desktop/mobile form layout');
+  console.log('PASS pending, personal and shared history pagination beyond 50 suggestions, original attribution and desktop/mobile form layout');
 
   const leader = await mount(); await login(leader);
   await leader.evaluate(() => { window.__mock.canReview = true; });
@@ -1665,6 +1690,10 @@ try {
   await wait(leader, () => window.__targetlistShadow.querySelector('.success')?.textContent.includes('Suggestion rejected') && !window.__targetlistShadow.querySelector('.suggestionform button').disabled);
   await clickButton(leader, 'My suggestions');
   await wait(leader, () => window.__targetlistShadow.querySelectorAll('.suggestioncard').length === 2);
+  assert.match(await shadow(leader, '.suggestionqueue', 'text'), /approved.*Approved by MockChainer.*rejected.*Rejected by MockChainer/s);
+  await clickButton(leader, 'History');
+  await wait(leader, () => !window.__targetlistShadow.querySelector('.queueheader button').disabled);
+  assert.equal(await leader.evaluate(() => window.__mock.requests.at(-1).search), '?view=history&offset=0');
   assert.match(await shadow(leader, '.suggestionqueue', 'text'), /approved.*Approved by MockChainer.*rejected.*Rejected by MockChainer/s);
   await leader.close();
   console.log('PASS leadership approval refreshes targets, rejection, and reviewed history');
@@ -2134,6 +2163,14 @@ try {
       const post = await pda.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions').at(-1));
       assert.deepEqual(JSON.parse(post.data), { type, targetId: type === 'player' ? 22001 : 33001, comment: 'Mock PDA target reason.' });
     }
+    await pda.evaluate(() => Object.assign(window.__mock.suggestions[1], { status: 'approved',
+      suggestedBy: { id: 99881, name: 'PDA Original Contributor', faction: { id: 66551, name: 'PDA Original Faction' } },
+      reviewedBy: { id: 99882, name: 'PDA Reviewing Leader' }, reviewedAt: new Date().toISOString() }));
+    await clickButton(pda, 'History');
+    await wait(pda, () => window.__targetlistShadow.querySelectorAll('.suggestioncard').length === 1);
+    assert.match(await shadow(pda, '.suggestionqueue', 'text'), /Suggested by PDA Original Contributor \[99881\].*PDA Original Faction.*Approved by PDA Reviewing Leader \[99882\]/s);
+    assert.equal(await pda.evaluate(() => window.__mock.pda.calls.some(call => call.name === 'PDA_httpGet'
+      && new URL(call.args[0]).search === '?view=history&offset=0')), true);
     await clickButton(pda, 'Targets');
     await cardAction(pda, 101);
     await wait(pda, () => window.__targetlistShadow.querySelector('.attack')?.tagName === 'BUTTON');

@@ -30,6 +30,24 @@ function target(overrides = {}) {
   };
 }
 
+test('estimate provider labels distinguish FFScouter methods from manual and custom estimates', () => {
+  for (const estimateSource of ['bss', ' BSS ', 'premium', 'spies', 'FFScouter', 'ffscouter:model']) {
+    assert.equal(Core.estimateSourceLabel({ estimateSource }), 'FFScouter');
+  }
+  for (const estimateSource of ['Manual', 'spy', 'model', 'Custom model', 'TornStats']) {
+    assert.equal(Core.estimateSourceLabel({ estimateSource }), estimateSource);
+  }
+  assert.equal(Core.estimateSourceLabel({ estimateProvider: ' ffscouter ', estimateSource: 'model' }), 'FFScouter');
+  assert.equal(Core.estimateSourceLabel({ estimateProvider: 'Manual', estimateSource: 'bss' }), 'Manual');
+  assert.equal(Core.estimateSourceLabel({ estimateProvider: 'Custom tool', estimateSource: 'spies' }), 'Custom tool');
+  for (const value of [null, undefined, {}, { estimateSource: null }, { estimateSource: 123 }, { estimateSource: ' ' }]) {
+    assert.equal(Core.estimateSourceLabel(value), '');
+  }
+  const source = { estimateProvider: 'FFScouter', estimateSource: 'bss' };
+  Core.estimateSourceLabel(source);
+  assert.deepEqual(source, { estimateProvider: 'FFScouter', estimateSource: 'bss' });
+});
+
 test('recommendations apply the chosen ratio and include its exact boundary', () => {
   const atLimit = Core.assess(target({ estimatedStats: 600_000 }), player, 0.6, NOW);
   assert.equal(atLimit.ratio, 0.6);

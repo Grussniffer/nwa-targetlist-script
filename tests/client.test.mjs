@@ -344,6 +344,14 @@ test('a seven-day saved session restores after 30 minutes and on day six without
   }
 });
 
+test('target rows label FFScouter model estimates with the provider name', async () => {
+  const app = fixture();
+  await app.signIn([{ ...target, estimateSource: 'model', estimateProvider: 'FFScouter' }]);
+  const card = app.find(element => element.className === 'card');
+  assert.match(textContent(card), /FFScouter/);
+  assert.equal(textContent(card).includes('model'), false);
+});
+
 test('a seven-day token already at its deadline is cleared on reload before any authorization request', () => {
   const deadline = NOW + 7 * 24 * 60 * 60 * 1000;
   const app = fixture({ token: SESSION, expiresAt: new Date(deadline).toISOString() }, null, null, deadline);
@@ -457,6 +465,23 @@ test('a friendly-target denial blocks the attack while retaining a valid player 
   assert.match(app.text(), /Allowed Player \[12345\]/);
   assert.match(app.text(), /This target is friendly/);
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+});
+
+test('a target that left its nominated faction is removed without ending the session during status or attack checks', async () => {
+  for (const action of ['status', 'attack']) {
+    const app = fixture();
+    const other = { ...target, id: 98766, name: 'Remaining Target', checkedAt: new Date(NOW).toISOString() };
+    await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }, other]);
+    if (action === 'status') app.button('Check status').emit('click');
+    else app.find(element => element.className === 'attack').emit('click');
+    app.response(app.requests.at(-1), { error: { code: 'TARGET_LEFT_FACTION', message: 'This target left its nominated faction.' } }, 403);
+    await flush();
+    assert.equal(app.storage.get(app.storageKey).token, SESSION);
+    assert.equal(app.text().includes('Target Player'), false);
+    assert.match(app.text(), /Remaining Target/);
+    assert.match(app.text(), /left its nominated faction/);
+    assert.deepEqual(app.navigations, []);
+  }
 });
 
 test('attack clicks revalidate live status expiry even before the next display refresh', async () => {
@@ -585,6 +610,23 @@ test('NWA skips unavailable, newly friendly, and removed targets before opening 
   await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${candidates[4].id}`]);
   assert.equal(app.storage.get(app.storageKey).token, SESSION);
+});
+
+test('NWA skips a target that left its nominated faction and opens another eligible target', async () => {
+  const app = fixture();
+  const remaining = { ...target, id: 98766, name: 'Remaining Target', estimatedStats: 550000 };
+  await app.signIn([target, remaining]);
+  app.button('NWA').emit('click');
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${target.id}/reservation`);
+  app.response(app.requests.at(-1), { error: { code: 'TARGET_LEFT_FACTION', message: 'This target left its nominated faction.' } }, 403);
+  await flush();
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets/${remaining.id}/reservation`);
+  app.response(app.requests.at(-1), { id: remaining.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(),
+    reservationExpiresAt: new Date(NOW + 120000).toISOString() });
+  await flush();
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${remaining.id}`]);
+  assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  assert.equal(app.text().includes('Target Player'), false);
 });
 
 test('repeated NWA clicks coalesce while a target check is pending', async () => {
@@ -1906,6 +1948,45 @@ test('pending and own-history queues offer pagination and ignore stale results f
   assert.ok(app.requests.at(-1).url.endsWith('/api/suggestions?view=mine&offset=50'));
 });
 
+test('shared suggestion history preserves original submitters, factions, reasons and review attribution across pages', async () => {
+  const app = fixture(); await app.signIn(); await openSuggestions(app);
+  fillSuggestion(app, { comment: 'Keep my unsent suggestion while browsing history.' });
+  app.button('Refresh suggestions').emit('click'); const stalePending = app.requests.at(-1);
+  app.button('History').emit('click'); const history = app.requests.at(-1);
+  assert.equal(history.url, `${serviceBase}/api/suggestions?view=history&offset=0`);
+  const original = { id: 24680, name: 'Original Suggester', faction: { id: 111, name: 'Original Faction' } };
+  const reviewer = { id: 13579, name: 'Reviewing Leader' };
+  const createdAt = new Date(NOW - 86400000).toISOString();
+  const reviewedAt = new Date(NOW - 3600000).toISOString();
+  const approved = suggestion({ suggestedBy: original, status: 'approved', createdAt, reviewedBy: reviewer, reviewedAt });
+  app.response(history, { canReview: true, suggestions: [approved], nextOffset: 50 });
+  app.response(stalePending, { canReview: true, suggestions: [suggestion({ targetName: 'Late Pending Target' })], nextOffset: null });
+  await flush();
+  assert.match(app.text(), /Suggested by Original Suggester \[24680\].*Original Faction \[111\]/s);
+  assert.match(app.text(), /Approved by Reviewing Leader \[13579\]/);
+  assert.match(app.text(), /Submitted /);
+  assert.match(app.text(), /Reviewed /);
+  assert.equal(app.text().includes('Late Pending Target'), false);
+  assert.equal(app.find(element => element.tagName === 'TEXTAREA').value, 'Keep my unsent suggestion while browsing history.');
+  const timestamps = descendants(app.root).filter(element => element.tagName === 'TIME');
+  assert.deepEqual(timestamps.map(element => element.attributes.get('datetime')), [createdAt, reviewedAt]);
+  assert.equal(descendants(app.root).some(element => element.textContent === 'Approve' || element.textContent === 'Reject'), false);
+  const rejected = suggestion({ id: '00000000-0000-4000-8000-000000000002', type: 'faction', targetId: 67890,
+    targetName: 'Rejected Faction', suggestedBy: original, status: 'rejected', createdAt, reviewedBy: reviewer, reviewedAt });
+  app.button('Load more suggestions').emit('click'); const more = app.requests.at(-1);
+  assert.equal(more.url, `${serviceBase}/api/suggestions?view=history&offset=50`);
+  app.response(more, { canReview: true, suggestions: [approved, rejected], nextOffset: null }); await flush();
+  assert.equal(descendants(app.root).filter(element => element.className === 'card suggestioncard').length, 2);
+  assert.match(app.text(), /Rejected Faction \[67890\]/);
+  assert.match(app.text(), /Rejected by Reviewing Leader \[13579\]/);
+  app.button('Refresh suggestions').emit('click');
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/suggestions?view=history&offset=0`);
+  app.response(app.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+  assert.match(app.text(), /No reviewed suggestions yet/);
+  app.button('Pending suggestions').emit('click');
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/suggestions?view=pending&offset=0`);
+});
+
 test('leader approvals refresh the pool and queue, while rejection updates only the queue', async () => {
   for (const decision of ['approved', 'rejected']) {
     const app = fixture(); await app.signIn();
@@ -1952,11 +2033,12 @@ test('an already-reviewed conflict keeps the session and allows the queue to be 
   assert.equal(app.button('Refresh suggestions').disabled, false);
 });
 
-test('queue content is rendered as plain text, including comments, target names, and submitter names', async () => {
+test('queue content is rendered as plain text, including comments, target names, submitters and reviewers', async () => {
   const app = fixture(); await app.signIn();
   const injected = '<img src=x onerror="throw Error(1)">';
   await openSuggestions(app, { canReview: false, suggestions: [suggestion({ targetName: injected, comment: `<script>alert(1)</script>\n${injected}`,
-    suggestedBy: { ...player, name: injected, faction: { ...player.faction, name: injected } } })], nextOffset: null });
+    suggestedBy: { ...player, name: injected, faction: { ...player.faction, name: injected } }, status: 'approved',
+    reviewedBy: { id: 24680, name: injected }, reviewedAt: new Date(NOW).toISOString() })], nextOffset: null });
   assert.match(app.text(), /<script>alert\(1\)<\/script>/);
   assert.ok(app.text().includes(injected));
   assert.equal(descendants(app.root).some(element => element.tagName === 'IMG' || element.tagName === 'SCRIPT'), false);

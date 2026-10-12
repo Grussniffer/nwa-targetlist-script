@@ -20,7 +20,7 @@ const TargetListExport = (() => {
     const playerId = id(value.id);
     const factionId = id(value.faction?.id);
     return [playerId, text(value.name), factionId, text(value.faction?.name), stat(value.estimatedStats),
-      text(value.estimateSource), unixDate(value.estimateUpdatedAt), text(value.reason).trim() || text(value.notes).trim(),
+      TargetListCore.estimateSourceLabel(value), unixDate(value.estimateUpdatedAt), text(value.reason).trim() || text(value.notes).trim(),
       text(value.status?.state), text(value.status?.description), unixDate(value.status?.until), stringDate(value.checkedAt),
       unixDate(value.lastAction), typeof value.reserved === 'boolean' ? String(value.reserved) : '',
       stringDate(value.reservationExpiresAt), playerId ? `https://www.torn.com/profiles.php?XID=${playerId}` : '',

@@ -266,11 +266,23 @@ test('no usable page anchor leaves no orphan notice or new content row', async (
 
 test('the notice estimate comes from NWA with source and age details without another API request', async () => {
   const page = fixture('https://www.torn.com/page.php?sid=attack&user2ID=900');
-  await page.feed([{ ...target, estimatedStats: 724000000 }]);
+  await page.feed([{ ...target, estimatedStats: 724000000, estimateSource: 'model', estimateProvider: 'FFScouter' }]);
   assert.equal(page.notice().shadow.querySelector('.estimate').textContent, 'Est. 724M');
   const details = page.notice().shadow.querySelector('.estimate-detail').textContent;
   assert.match(details, /FFScouter/i); assert.match(details, /1\s*h|hour/i);
+  assert.equal(details.includes('model'), false);
+  assert.match(page.notice().shadow.querySelector('summary').title, /FFScouter/);
   assert.equal(page.requests.length, 1);
+});
+
+test('a live faction eligibility denial removes the profile notice while preserving the authorized session', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900');
+  await page.feed(); assert.ok(page.notice());
+  page.openSettings(); page.control('Check status').emit('click');
+  page.response(page.requests.at(-1), { error: { code: 'TARGET_LEFT_FACTION', message: 'This target left its nominated faction.' } }, 403);
+  await flush(); page.openSettings(); page.mutation();
+  assert.equal(page.notice(), null);
+  assert.equal(page.storage.get('targetlist.session.https://targetlist.grusmedia.no').token, 'saved-session');
 });
 
 test('unknown and stale estimates remain honest and preserve the approved reason', async () => {

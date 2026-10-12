@@ -51,6 +51,14 @@ const TargetListCore = (() => {
     return (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || '';
   }
+  function estimateSourceLabel(target) {
+    const provider = typeof target?.estimateProvider === 'string' ? target.estimateProvider.trim() : '';
+    const source = typeof target?.estimateSource === 'string' ? target.estimateSource.trim() : '';
+    if (provider) return /^ffscouter$/i.test(provider) ? 'FFScouter' : provider;
+    // Older feeds exposed the FFScouter method as their only source field.
+    // Generic labels such as model, spy and manual do not establish a provider.
+    return /^(?:bss|premium|spies|ffscouter(?::.*)?)$/i.test(source) ? 'FFScouter' : source;
+  }
   function assess(target, player, maxRatio = DEFAULT_MAX_RATIO, now = Date.now(), minRatio = DEFAULT_MIN_RATIO, estimateDays = DEFAULT_ESTIMATE_DAYS) {
     const ratio = positive(target.estimatedStats) && positive(player.battleStats.total)
       ? target.estimatedStats / player.battleStats.total : null;
@@ -150,5 +158,5 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
 })();
