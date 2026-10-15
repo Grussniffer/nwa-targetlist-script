@@ -304,6 +304,179 @@ async function refreshMockFeed(page) {
   await page.waitForFunction(before => window.__mock.feedResponses.length === before + 1, before, { timeout: 5000 });
 }
 
+async function keyboardActivate(page, selector, text = null) {
+  await page.evaluate(({ selector, text }) => {
+    const root = window.__targetlistShadow;
+    const control = [...root.querySelectorAll(selector)].find(node => text === null || node.textContent === text);
+    if (!control) throw new Error(`Missing keyboard control: ${selector} ${text || ''}`);
+    control.scrollIntoView({ block: 'nearest' });
+    control.focus();
+  }, { selector, text });
+  await page.keyboard.press('Enter');
+}
+
+async function checkFocusLifecycle(pageContext, scripts, mode) {
+  const viewport = mode === 'PDA' ? { width: 390, height: 844 } : { width: 1280, height: 960 };
+  const page = await mount(viewport, scripts, pageContext, makePerformanceFeed, { size: 4 });
+  await wait(page, () => window.__mock.feedResponses.length === 1);
+  await keyboardActivate(page, '.settings-toggle');
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow, active = root.activeElement;
+    return root.querySelector('.panel').contains(active) && /^H[1-6]$/.test(active?.tagName);
+  }), true, `${mode}: opening settings by keyboard focuses its heading without opening an editable field`);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.querySelector('.panel').contains(root.activeElement) && root.activeElement?.tagName === 'BUTTON';
+  }), true, `${mode}: Tab from the heading reaches a panel control`);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.querySelector('.panel').hidden && root.activeElement === root.querySelector('.settings-toggle');
+  }), true, `${mode}: Escape returns focus to the settings opener`);
+  await page.keyboard.press('Enter');
+  await keyboardActivate(page, '[aria-label="Close NWA settings"]');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.activeElement === window.__targetlistShadow.querySelector('.settings-toggle')),
+    true, `${mode}: the close button also restores the settings opener`);
+  await page.keyboard.press('Enter');
+
+  for (const section of ['Suggestions', 'Targets', 'Suggestions']) {
+    await keyboardActivate(page, '[aria-label="NWA sections"] button', section);
+    if (section === 'Suggestions') await wait(page, () => !window.__targetlistShadow.querySelector('.queueheader button').disabled);
+    assert.equal(await page.evaluate(section => {
+      const root = window.__targetlistShadow, active = root.activeElement;
+      return active?.textContent === section && active.getAttribute('aria-pressed') === 'true'
+        && root.querySelector('[aria-label="NWA sections"]').contains(active);
+    }, section), true, `${mode}: switching to ${section} retains keyboard focus on that section button`);
+  }
+  for (const view of ['My suggestions', 'History', 'Pending suggestions']) {
+    await keyboardActivate(page, '[aria-label="Suggestion views"] button', view);
+    await wait(page, () => !window.__targetlistShadow.querySelector('.queueheader button').disabled);
+    assert.equal(await page.evaluate(view => {
+      const root = window.__targetlistShadow, active = root.activeElement;
+      return active?.textContent === view && active.getAttribute('aria-pressed') === 'true'
+        && root.querySelector('[aria-label="Suggestion views"]').contains(active);
+    }, view), true, `${mode}: ${view} retains focus through the loading and completed queue renders`);
+  }
+
+  await page.evaluate(() => {
+    const outside = document.createElement('button'); outside.id = 'mock-torn-action'; outside.textContent = 'Torn page action';
+    outside.addEventListener('click', () => { window.__outsideActivations = (window.__outsideActivations || 0) + 1; });
+    document.body.append(outside);
+    window.__mock.holds.push('/api/suggestions');
+  });
+  await keyboardActivate(page, '[aria-label="Suggestion views"] button', 'My suggestions');
+  await wait(page, () => window.__mock.pending.some(request => new URL(request.url).pathname === '/api/suggestions'));
+  await page.evaluate(() => document.getElementById('mock-torn-action').focus());
+  await page.keyboard.press('Enter');
+  await page.evaluate(() => window.__mock.release('/api/suggestions'));
+  await wait(page, () => !window.__targetlistShadow.querySelector('.queueheader button').disabled);
+  assert.equal(await page.evaluate(() => document.activeElement === document.getElementById('mock-torn-action')), true,
+    `${mode}: a late suggestion response does not take focus back from the Torn page`);
+  assert.equal(await page.evaluate(() => window.__outsideActivations), 1, `${mode}: the nonmodal panel leaves outside keyboard actions usable`);
+  assert.equal(await page.evaluate(() => document.body.inert || document.documentElement.inert
+    || window.__targetlistShadow.querySelector('.panel').getAttribute('aria-modal') === 'true'), false,
+  `${mode}: the panel does not claim modal behavior or make the Torn page inert`);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('.panel').hidden), false,
+    `${mode}: Escape on the Torn page is not intercepted by NWA`);
+
+  await keyboardActivate(page, '[aria-label="NWA sections"] button', 'Targets');
+  await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    window.__unchangedFocusedProfile = root.querySelector('[data-target-id="101"] a.name');
+    window.__unchangedFocusedProfile.focus();
+    window.__focusOrderBefore = [...root.querySelectorAll('[data-target-id]')].map(node => node.getAttribute('data-target-id')).join(',');
+    const changed = window.__mock.targets.find(target => target.id === 102);
+    changed.status = { state: 'Hospital', description: 'Another player entered hospital', until: Math.floor(Date.now() / 1000) + 600 };
+    changed.checkedAt = new Date(Date.now()).toISOString();
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    const order = [...root.querySelectorAll('[data-target-id]')].map(node => node.getAttribute('data-target-id')).join(',');
+    return order !== window.__focusOrderBefore && root.activeElement === window.__unchangedFocusedProfile
+      && root.querySelector('[data-target-id="101"] a.name') === window.__unchangedFocusedProfile;
+  }), true, `${mode}: reordering other targets preserves focus on the unchanged, reused profile link`);
+  await page.evaluate(() => {
+    const changed = window.__mock.targets.find(target => target.id === 102);
+    changed.status = { state: 'Okay', description: 'Okay (mock)', until: null };
+    changed.checkedAt = new Date(Date.now()).toISOString();
+  });
+  await refreshMockFeed(page);
+  await page.evaluate(() => {
+    const profile = window.__targetlistShadow.querySelector('[data-target-id="101"] a.name');
+    profile.scrollIntoView({ block: 'nearest' }); profile.focus();
+    window.__mock.targets[0].notes = 'Changed reason while a profile link has keyboard focus.';
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.activeElement === root.querySelector('[data-target-id="101"] a.name');
+  }), true, `${mode}: a changed target row retains focus on its player profile link`);
+  await page.evaluate(() => {
+    const attack = window.__targetlistShadow.querySelector('[data-target-id="101"] button.attack');
+    attack.focus();
+    window.__mock.targets[0].notes = 'Another row update preserves the attack control focus.';
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.activeElement === root.querySelector('[data-target-id="101"] button.attack');
+  }), true, `${mode}: updating a ready target preserves its focused Attack control without activating it`);
+  await page.evaluate(() => {
+    const target = window.__mock.targets[0];
+    target.status = { state: 'Hospital', description: 'In hospital (focus fixture)', until: Math.floor(Date.now() / 1000) + 600 };
+    target.checkedAt = new Date(Date.now()).toISOString();
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.activeElement === root.querySelector('[data-target-id="101"] button.check-status');
+  }), true, `${mode}: an Attack control that disappears moves focus to that target's status check`);
+  await page.evaluate(() => {
+    window.__targetlistShadow.querySelector('[data-target-id="101"] a.name').focus();
+    window.__mock.targets.splice(window.__mock.targets.findIndex(target => target.id === 101), 1);
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.activeElement === root.querySelector('[aria-label="Search targets"]');
+  }), true, `${mode}: delisting the focused player moves focus to the stable target search`);
+  await page.evaluate(() => {
+    document.getElementById('mock-torn-action').focus();
+    window.__mock.targets[0].notes = 'Background refresh while using a native Torn page action.';
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => document.activeElement === document.getElementById('mock-torn-action')), true,
+    `${mode}: background target updates preserve focus outside NWA`);
+  assert.equal(await page.evaluate(() => window.__mock.requests.some(request => request.path.endsWith('/reservation'))), false,
+    `${mode}: restoring action focus never activates a reservation`);
+  await page.evaluate(() => {
+    window.__targetlistShadow.querySelector('[data-target-id="102"] a.name').focus();
+    window.__mock.targets.length = 0;
+  });
+  await refreshMockFeed(page);
+  assert.equal(await page.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.activeElement === root.querySelector('[aria-label="Search targets"]');
+  }), true, `${mode}: an empty target list leaves focus on the stable target search`);
+  await page.close();
+
+  const signedOut = await mount(viewport, scripts, pageContext);
+  await keyboardActivate(signedOut, '.launcher');
+  await wait(signedOut, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
+  assert.equal(await signedOut.evaluate(() => {
+    const root = window.__targetlistShadow;
+    return root.querySelector('.panel').contains(root.activeElement) && /^H[1-6]$/.test(root.activeElement?.tagName);
+  }), true, `${mode}: a signed-out NWA action opens login at its heading without forcing a mobile keyboard`);
+  await keyboardActivate(signedOut, '[aria-label="Close NWA settings"]');
+  assert.equal(await signedOut.evaluate(() => window.__targetlistShadow.activeElement === window.__targetlistShadow.querySelector('.launcher')),
+    true, `${mode}: closing a launcher-opened login restores the NWA launcher`);
+  await signedOut.close();
+  console.log(`PASS ${mode} keyboard opening/closing, nonmodal outside interaction, section/queue focus, target link/action focus and delisting fallback`);
+}
+
 function makePerformanceFeed({ size = 1000, reservation = false } = {}) {
   const mock = window.__mock, template = structuredClone(mock.targets[0]);
   mock.delta = true; mock.reservations = { supported: true, leaseMs: 120000 };
@@ -1032,6 +1205,7 @@ async function assertAlongsideFfscouter(page) {
 }
 
 try {
+  await checkFocusLifecycle(context, [source], 'GM');
   await checkProfessionalLayout(context, [source], 'GM');
   await checkLeaseAvailability(context, [source], 'GM');
   const early = await mount(undefined, [], context);
@@ -2344,6 +2518,7 @@ try {
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
   try {
+    await checkFocusLifecycle(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkProfessionalLayout(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkLeaseAvailability(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkSingleRequestFinder(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');

@@ -52,6 +52,10 @@ class Element {
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   remove() {
+    const root = this.getRootNode();
+    for (let active = root.activeElement; active; active = active.parentNode) {
+      if (active === this) { root.activeElement = null; break; }
+    }
     if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
     this.parentNode = null;
   }
@@ -64,6 +68,11 @@ class Element {
   get lastChild() { return this.children.at(-1); }
   focus() { if (this.getRootNode()) this.getRootNode().activeElement = this; }
   getRootNode() { let node = this; while (node.parentNode) node = node.parentNode; return node; }
+  querySelectorAll(selector) {
+    assert.equal(selector, '[data-focus-key]');
+    return descendants(this).slice(1).filter(node => node.getAttribute('data-focus-key') !== null);
+  }
+  setSelectionRange(start, end, direction) { this.selectionStart = start; this.selectionEnd = end; this.selectionDirection = direction; }
   select() { this.selected = true; }
   click() { return this.emit('click'); }
   emit(type, additions = {}) {
@@ -1557,6 +1566,116 @@ test('a changed target row restores keyboard focus without activating its button
   assert.equal(app.root.activeElement.className, 'check-status');
   assert.equal(scroll.scrollTop, 147);
   assert.equal(app.requests.length, count); assert.deepEqual(app.navigations, []);
+});
+
+test('opening settings focuses its heading without opening a keyboard, and close or Escape returns to the gear', () => {
+  const app = fixture(); const gear = app.settings();
+  for (const action of ['close', 'escape']) {
+    gear.focus(); gear.emit('click');
+    const heading = app.find(node => node.tagName === 'H2' && node.textContent === 'Target finder');
+    assert.equal(app.root.activeElement, heading);
+    assert.equal(heading.tabIndex, -1, 'heading is programmatically focusable without entering normal Tab order');
+    assert.equal(app.find(node => node.className === 'panel').getAttribute('aria-modal'), null, 'Torn remains interactive');
+    if (action === 'close') app.button('×').emit('click');
+    else assert.equal(app.root.emit('keydown', { key: 'Escape' }).defaultPrevented, true);
+    assert.equal(app.root.activeElement, gear);
+    assert.equal(app.find(node => node.className === 'panel').hidden, true);
+  }
+  assert.equal(app.root.emit('keydown', { key: 'Escape' }).defaultPrevented, false, 'closed panel does not intercept Escape');
+});
+
+test('the signed-out launcher restores focus to NWA after the login panel closes', () => {
+  const app = fixture(); const launcher = app.button('NWA'); launcher.focus(); launcher.emit('click');
+  assert.equal(app.root.activeElement.tagName, 'H2');
+  assert.notEqual(app.root.activeElement.type, 'password');
+  app.button('×').emit('click');
+  assert.equal(app.root.activeElement, launcher);
+  assert.deepEqual(app.requests, []);
+});
+
+test('section buttons retain keyboard focus across both directions of panel replacement', async () => {
+  const app = fixture(); await app.signIn();
+  for (const label of ['Suggestions', 'Targets', 'Suggestions', 'Targets']) {
+    const old = app.button(label); old.focus(); old.emit('click');
+    assert.equal(app.root.activeElement, app.button(label));
+    assert.notEqual(app.root.activeElement, old, 'the section is rebuilt');
+    assert.equal(app.root.activeElement.getAttribute('aria-pressed'), 'true');
+    if (label === 'Suggestions') {
+      app.response(app.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+      assert.equal(app.root.activeElement, app.button(label));
+    }
+  }
+});
+
+test('suggestion view focus survives loading and completion without overriding later focus elsewhere', async () => {
+  const app = fixture(); await app.signIn(); await openSuggestions(app);
+  for (const label of ['My suggestions', 'History', 'Pending suggestions']) {
+    app.button(label).focus(); app.button(label).emit('click');
+    assert.equal(app.root.activeElement, app.button(label));
+    assert.equal(app.root.activeElement.getAttribute('aria-pressed'), 'true');
+    app.response(app.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+    assert.equal(app.root.activeElement, app.button(label));
+  }
+  app.button('History').focus(); app.button('History').emit('click');
+  app.root.activeElement = null; // The user has tabbed into the native Torn document.
+  app.response(app.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+  assert.equal(app.root.activeElement, null, 'late completion does not pull focus back into NWA');
+});
+
+test('a suggestion response preserves an editing textarea and its caret', async () => {
+  const app = fixture(); await app.signIn(); await openSuggestions(app);
+  app.button('Refresh suggestions').emit('click');
+  const input = app.find(node => node.tagName === 'TEXTAREA');
+  input.value = 'A reason still being edited'; input.emit('input'); input.focus();
+  input.setSelectionRange(4, 10, 'backward');
+  app.response(app.requests.at(-1), { canReview: false, suggestions: [suggestion()], nextOffset: null }); await flush();
+  const replacement = app.find(node => node.tagName === 'TEXTAREA');
+  assert.equal(app.root.activeElement, replacement);
+  assert.equal(replacement.value, input.value);
+  assert.equal(replacement.selectionStart, 4); assert.equal(replacement.selectionEnd, 10);
+  assert.equal(replacement.selectionDirection, 'backward');
+});
+
+test('changed profile links keep focus and a removed target falls back to search without opening another profile', async () => {
+  const app = fixture(); await app.signIn([target, { ...target, id: 98766, name: 'Other target' }]);
+  const profile = app.find(node => node.getAttribute('data-focus-key') === `target:${target.id}:profile`);
+  profile.focus(); const scroll = app.find(node => node.className === 'scroll'); scroll.scrollTop = 83;
+  app.setNow(NOW + 10000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Updated name' }, { ...target, id: 98766 }], reservations: coordination }); await flush();
+  assert.equal(app.root.activeElement.getAttribute('data-focus-key'), `target:${target.id}:profile`);
+  assert.notEqual(app.root.activeElement, profile);
+  assert.equal(scroll.scrollTop, 83);
+  app.setNow(NOW + 20000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, id: 98766 }], reservations: coordination }); await flush();
+  assert.equal(app.root.activeElement.getAttribute('aria-label'), 'Search targets');
+  assert.equal(scroll.scrollTop, 83);
+  app.find(node => node.getAttribute('data-focus-key') === 'target:98766:profile').focus();
+  app.setNow(NOW + 30000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [], reservations: coordination }); await flush();
+  assert.equal(app.root.activeElement.getAttribute('aria-label'), 'Search targets');
+  assert.deepEqual(app.navigations, []);
+});
+
+test('an unchanged focused row retains focus when reordered and unavailable Attack falls back to Check status', async () => {
+  const checkedAt = new Date(NOW).toISOString();
+  const app = fixture(); await app.signIn([{ ...target, checkedAt }, { ...target, id: 98766, estimatedStats: 550000, checkedAt }]);
+  const profile = app.find(node => node.getAttribute('data-focus-key') === `target:${target.id}:profile`); profile.focus();
+  app.setNow(NOW + 10000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, checkedAt }, { ...target, id: 98766, estimatedStats: 300000, checkedAt }], reservations: coordination }); await flush();
+  assert.equal(app.root.activeElement, profile, 'moving a connected card in the DOM restores its original link');
+  app.find(node => node.getAttribute('data-focus-key') === `target:${target.id}:attack`).focus();
+  app.setNow(NOW + 20000); app.timers[0]();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, checkedAt: new Date(NOW + 20000).toISOString(), status: { state: 'Hospital' } }], reservations: coordination }); await flush();
+  assert.equal(app.root.activeElement.getAttribute('data-focus-key'), `target:${target.id}:check-status`);
+  assert.deepEqual(app.navigations, []);
+});
+
+test('background authorization errors do not steal focus when displaying the login panel', async () => {
+  const app = fixture(); await app.signIn(); app.closePanel(); app.root.activeElement = null;
+  app.setNow(NOW + 30000); app.timers[0]();
+  app.response(app.requests.at(-1), { error: { code: 'SESSION_REVOKED', message: 'Please sign in again.' } }, 401); await flush();
+  assert.equal(app.find(node => node.className === 'panel').hidden, false);
+  assert.equal(app.root.activeElement, null);
 });
 
 test('replacing a mounted instance cleans its listeners, timers, requests and observers before a late response', async () => {

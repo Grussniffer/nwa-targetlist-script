@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.9.0
+// @version      0.9.1
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -365,7 +365,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -542,11 +542,39 @@ function mountTargetList(platform, storageWarning = '') {
     const node = element('a', text, className); node.href = href;
     node.target = '_blank'; node.rel = 'noopener noreferrer'; return node;
   }
+  function focusKey(node, key) { node.setAttribute('data-focus-key', key); return node; }
+  function inside(node, container) {
+    for (; node; node = node.parentNode) if (node === container) return true;
+    return false;
+  }
+  function captureFocus(container) {
+    const node = root.activeElement;
+    if (!inside(node, container)) return null;
+    return { node, key: node.getAttribute?.('data-focus-key'), scrollTop: scroll.scrollTop,
+      start: node.selectionStart, end: node.selectionEnd, direction: node.selectionDirection };
+  }
+  function restoreFocus(snapshot, container = content, fallback = panelHeading) {
+    if (!snapshot || !state.open || disposed) return;
+    const active = root.activeElement;
+    // A synchronous render can remove the active node, but must never redirect
+    // focus that has already moved to another live control.
+    if (active && inside(active, root) && active !== snapshot.node) return;
+    if (active === snapshot.node && inside(snapshot.node, root) && !snapshot.node.disabled) return;
+    const replacement = snapshot.key && [...container.querySelectorAll('[data-focus-key]')]
+      .find(node => node.getAttribute('data-focus-key') === snapshot.key && !node.disabled);
+    const next = replacement || (typeof fallback === 'function' ? fallback() : fallback) || panelHeading;
+    next.focus?.({ preventScroll: true });
+    if (replacement && Number.isInteger(snapshot.start)) {
+      try { replacement.setSelectionRange?.(snapshot.start, snapshot.end, snapshot.direction); } catch { /* Not all inputs support a caret. */ }
+    }
+    if (Number.isFinite(snapshot.scrollTop)) scroll.scrollTop = snapshot.scrollTop;
+  }
   const panel = element('section', null, 'panel'); panel.hidden = true;
   panel.id = 'nwa-panel'; panel.setAttribute('aria-label', 'North West Alliance target finder');
   const header = element('div', null, 'header');
   const title = element('div', null, 'brand');
-  const brandText = element('div'); brandText.append(element('h2', 'Target finder'), element('div', 'North West Alliance', 'eyebrow'));
+  const panelHeading = element('h2', 'Target finder'); panelHeading.tabIndex = -1;
+  const brandText = element('div'); brandText.append(panelHeading, element('div', 'North West Alliance', 'eyebrow'));
   title.append(element('span', 'NWA', 'brand-mark'), brandText);
   const headerActions = element('div', null, 'header-actions');
   const moreOptions = button('⋯', () => {
@@ -565,7 +593,7 @@ function mountTargetList(platform, storageWarning = '') {
   const dock = element('div', null, 'dock');
   const launcher = button('NWA', () => void findTarget(), 'launcher');
   launcher.setAttribute('aria-label', 'NWA — find a target'); launcher.title = 'North West Alliance — find a target';
-  const settings = button('', () => { state.findAfterLogin = false; cancelFind(); toggle(!state.open); }, 'settings-toggle');
+  const settings = button('', () => { state.findAfterLogin = false; cancelFind(); toggle(!state.open, settings); }, 'settings-toggle');
   const gear = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   gear.setAttribute('viewBox', '0 0 24 24'); gear.setAttribute('aria-hidden', 'true'); gear.setAttribute('focusable', 'false');
   gear.setAttribute('fill', 'none'); gear.setAttribute('stroke', '#fff'); gear.setAttribute('stroke-width', '1.8');
@@ -579,6 +607,7 @@ function mountTargetList(platform, storageWarning = '') {
   settings.setAttribute('aria-expanded', 'false'); settings.title = 'NWA settings';
   const quickNotice = element('div', null, 'quick-notice'); quickNotice.setAttribute('role', 'status'); quickNotice.hidden = true;
   dock.append(launcher, settings, quickNotice); root.append(panel, dock);
+  let panelOpener = settings;
 
   function message(text) { state.error = text; errorBox.textContent = text; errorBox.hidden = !text; }
   function findNotice(text) {
@@ -1111,7 +1140,7 @@ function mountTargetList(platform, storageWarning = '') {
     message('');
     if (!state.token || Date.parse(state.expiresAt) <= Date.now()) {
       if (state.token) clearSession();
-      state.findAfterLogin = true; toggle(true); render(); return;
+      state.findAfterLogin = true; toggle(true, launcher); render(); return;
     }
     if (Date.now() < state.hardRetryAt) {
       findNotice(`The target service asked us to wait. Retry in ${Math.ceil((state.hardRetryAt - Date.now()) / 1000)}s.`); return;
@@ -1390,6 +1419,11 @@ function mountTargetList(platform, storageWarning = '') {
     setText(panelUi.poolUpdated, state.generatedAt ? `Pool updated: ${C.ageLabel(Date.parse(state.generatedAt) / 1000)}` : 'Pool update time unknown');
   }
   function render() {
+    const focus = captureFocus(content);
+    renderPanel();
+    restoreFocus(focus);
+  }
+  function renderPanel() {
     if (disposed) return;
     updatePageNotice();
     updateLauncher();
@@ -1441,7 +1475,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.view = view; render();
         if (view === 'suggestions') void loadSuggestions();
       });
-      tab.setAttribute('aria-pressed', String(state.view === view)); tabs.append(tab);
+      focusKey(tab, `section:${view}`); tab.setAttribute('aria-pressed', String(state.view === view)); tabs.append(tab);
     }
     content.append(tabs);
     const preferencesPanel = element('details', null, 'preferences'); preferencesPanel.open = preferencesOpen;
@@ -1465,6 +1499,7 @@ function mountTargetList(platform, storageWarning = '') {
     }
     const toolbar = element('div', null, 'toolbar');
     const query = element('input'); query.type = 'search'; query.placeholder = 'Search targets'; query.value = state.query;
+    panelUi.query = query;
     query.title = 'Search player, faction or reason';
     query.setAttribute('aria-label', 'Search targets'); query.addEventListener('input', () => { state.query = query.value; cancelFind(); renderCards(); });
     const mode = element('select'); mode.setAttribute('aria-label', 'Target view');
@@ -1565,6 +1600,11 @@ function mountTargetList(platform, storageWarning = '') {
   }
 
   function renderSuggestions() {
+    const focus = captureFocus(suggestionContainer);
+    renderSuggestionContent();
+    restoreFocus(focus, suggestionContainer);
+  }
+  function renderSuggestionContent() {
     if (!state.open || !suggestionContainer) return;
     const signature = JSON.stringify([state.suggestions, state.canReview, state.suggestionView, state.suggestionsLoading,
       state.suggestionMutation, state.suggestionNotice, state.nextSuggestionOffset]);
@@ -1573,26 +1613,26 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionContainer.append(element('p', 'Suggest a player or faction for the shared target pool. Every suggestion needs a reason.', 'notice'));
     const form = element('form', null, 'suggestionform');
     const fields = element('div', null, 'suggestionfields');
-    const typeLabel = element('label', 'Target type'); const type = element('select'); type.setAttribute('aria-label', 'Suggestion type');
+    const typeLabel = element('label', 'Target type'); const type = focusKey(element('select'), 'suggestion:type'); type.setAttribute('aria-label', 'Suggestion type');
     for (const [value, label] of [['player', 'Player'], ['faction', 'Faction']]) { const option = element('option', label); option.value = value; type.append(option); }
     type.value = state.suggestionDraft.type; type.disabled = Boolean(state.suggestionMutation);
     type.addEventListener('change', () => { if (!state.suggestionMutation) state.suggestionDraft.type = type.value; }); typeLabel.append(type);
-    const idLabel = element('label', 'Player or faction ID'); const id = element('input'); id.type = 'number'; id.min = '1'; id.max = '2147483647'; id.step = '1'; id.required = true;
+    const idLabel = element('label', 'Player or faction ID'); const id = focusKey(element('input'), 'suggestion:id'); id.type = 'number'; id.min = '1'; id.max = '2147483647'; id.step = '1'; id.required = true;
     id.placeholder = 'Torn ID'; id.setAttribute('aria-label', 'Player or faction ID'); id.value = state.suggestionDraft.targetId; id.disabled = Boolean(state.suggestionMutation);
     id.addEventListener('input', () => { if (!state.suggestionMutation) state.suggestionDraft.targetId = id.value; }); idLabel.append(id); fields.append(typeLabel, idLabel);
-    const commentLabel = element('label', 'Reason / comment (required)'); const comment = element('textarea'); comment.required = true; comment.maxLength = 2000; comment.rows = 3;
+    const commentLabel = element('label', 'Reason / comment (required)'); const comment = focusKey(element('textarea'), 'suggestion:comment'); comment.required = true; comment.maxLength = 2000; comment.rows = 3;
     comment.placeholder = 'Why should this target be added?'; comment.setAttribute('aria-label', 'Reason for suggesting this target'); comment.value = state.suggestionDraft.comment; comment.disabled = Boolean(state.suggestionMutation);
     comment.addEventListener('input', () => { if (!state.suggestionMutation) state.suggestionDraft.comment = comment.value; }); commentLabel.append(comment, element('small', 'Up to 1,000 characters. Your name and faction are shown with the suggestion.'));
-    const submit = element('button', state.suggestionMutation === 'submit' ? 'Submitting…' : 'Submit suggestion', 'primary'); submit.type = 'submit'; submit.disabled = Boolean(state.suggestionMutation);
+    const submit = focusKey(element('button', state.suggestionMutation === 'submit' ? 'Submitting…' : 'Submit suggestion', 'primary'), 'suggestion:submit'); submit.type = 'submit'; submit.disabled = Boolean(state.suggestionMutation);
     form.addEventListener('submit', event => { event.preventDefault(); void submitSuggestion(); });
     form.append(fields, commentLabel, submit); suggestionContainer.append(form);
     if (state.suggestionNotice) { const notice = element('div', state.suggestionNotice, 'success'); notice.setAttribute('role', 'status'); suggestionContainer.append(notice); }
     const queueHeader = element('div', null, 'queueheader'); queueHeader.append(element('h3', 'Target suggestions'));
-    const refresh = button(state.suggestionsLoading ? 'Loading…' : 'Refresh suggestions', () => void loadSuggestions()); refresh.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); queueHeader.append(refresh); suggestionContainer.append(queueHeader);
+    const refresh = focusKey(button(state.suggestionsLoading ? 'Loading…' : 'Refresh suggestions', () => void loadSuggestions()), 'suggestion:refresh'); refresh.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); queueHeader.append(refresh); suggestionContainer.append(queueHeader);
     const views = element('div', null, 'tabs'); views.setAttribute('aria-label', 'Suggestion views');
     for (const [view, label] of [['pending', 'Pending suggestions'], ['mine', 'My suggestions'], ['history', 'History']]) {
       const tab = button(label, () => { if (state.suggestionView !== view) void loadSuggestions(view); });
-      tab.setAttribute('aria-pressed', String(state.suggestionView === view)); tab.disabled = Boolean(state.suggestionMutation); views.append(tab);
+      focusKey(tab, `suggestion-view:${view}`); tab.setAttribute('aria-pressed', String(state.suggestionView === view)); tab.disabled = Boolean(state.suggestionMutation); views.append(tab);
     }
     suggestionContainer.append(views);
     suggestionContainer.append(element('p', state.suggestionView === 'history'
@@ -1607,7 +1647,7 @@ function mountTargetList(platform, storageWarning = '') {
     for (const row of state.suggestions) {
       const card = element('article', null, 'card suggestioncard'); const top = element('div', null, 'cardhead'); const identity = element('div');
       const href = row.type === 'faction' ? `https://www.torn.com/factions.php?step=profile&ID=${row.targetId}` : `https://www.torn.com/profiles.php?XID=${row.targetId}`;
-      identity.append(link(`${row.targetName || (row.type === 'faction' ? 'Faction' : 'Player')} [${row.targetId}] ↗`, href, 'name'), element('div', row.type === 'faction' ? 'Faction · current players added on approval' : 'Player', 'muted'));
+      identity.append(focusKey(link(`${row.targetName || (row.type === 'faction' ? 'Faction' : 'Player')} [${row.targetId}] ↗`, href, 'name'), `suggestion:${row.id}:profile`), element('div', row.type === 'faction' ? 'Faction · current players added on approval' : 'Player', 'muted'));
       top.append(identity, element('span', row.status, `badge ${row.status === 'pending' ? 'warn' : row.status === 'rejected' ? 'muted' : ''}`)); card.append(top);
       card.append(element('div', row.comment, 'comment'));
       const actor = row.suggestedBy;
@@ -1624,7 +1664,7 @@ function mountTargetList(platform, storageWarning = '') {
       if (state.suggestionView !== 'history' && state.canReview && row.status === 'pending') {
         const actions = element('div', null, 'actions');
         for (const [decision, label] of [['approved', 'Approve'], ['rejected', 'Reject']]) {
-          const action = button(label, () => void reviewSuggestion(row.id, decision), decision === 'approved' ? 'primary' : '');
+          const action = focusKey(button(label, () => void reviewSuggestion(row.id, decision), decision === 'approved' ? 'primary' : ''), `suggestion:${row.id}:${decision}`);
           action.disabled = Boolean(state.suggestionMutation) || state.suggestionsLoading; actions.append(action);
         }
         card.append(actions);
@@ -1632,7 +1672,7 @@ function mountTargetList(platform, storageWarning = '') {
       queue.append(card);
     }
     if (state.nextSuggestionOffset !== null) {
-      const more = button(state.suggestionsLoading ? 'Loading…' : 'Load more suggestions', () => void loadSuggestions(state.suggestionView, true));
+      const more = focusKey(button(state.suggestionsLoading ? 'Loading…' : 'Load more suggestions', () => void loadSuggestions(state.suggestionView, true)), 'suggestion:more');
       more.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); const footer = element('div', null, 'queuefooter'); footer.append(more); suggestionContainer.append(footer);
     }
   }
@@ -1651,11 +1691,18 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function renderCards() {
     if (disposed || !state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
-    const activeControl = root.activeElement;
-    let focusedCard = activeControl;
+    const focus = captureFocus(cardContainer);
+    let focusedCard = focus?.node;
     while (focusedCard && !focusedCard.getAttribute?.('data-target-id')) focusedCard = focusedCard.parentNode;
     const focusedId = Number(focusedCard?.getAttribute('data-target-id'));
-    const previousScrollTop = scroll.scrollTop;
+    renderTargetCards();
+    restoreFocus(focus, cardContainer, () => {
+      const sameCard = cardNodes.get(focusedId)?.controls;
+      if (sameCard) return !sameCard['check-status'].disabled ? sameCard['check-status'] : sameCard.profile;
+      return panelUi.query || panelHeading;
+    });
+  }
+  function renderTargetCards() {
     const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays]);
     if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
@@ -1717,7 +1764,8 @@ function mountTargetList(platform, storageWarning = '') {
       cached.signature = signature;
       const card = cached.node; card.replaceChildren();
       const top = element('div', null, 'cardhead'); const name = element('div');
-      name.append(link(`${target.name || 'Player'} [${target.id}] ↗`, `https://www.torn.com/profiles.php?XID=${target.id}`, 'name'),
+      const profileLink = focusKey(link(`${target.name || 'Player'} [${target.id}] ↗`, `https://www.torn.com/profiles.php?XID=${target.id}`, 'name'), `target:${target.id}:profile`);
+      name.append(profileLink,
         element('div', `${target.faction?.name || 'Faction unknown'}${target.level ? ` · Level ${target.level}` : ''}`, 'muted'));
       top.append(name); card.append(top);
       const metrics = element('div', null, 'metrics');
@@ -1747,7 +1795,8 @@ function mountTargetList(platform, storageWarning = '') {
       if (C.reason(target)) card.append(element('div', `Reason: ${C.reason(target)}`, 'notes'));
       const actions = element('div', null, 'actions');
       const check = button(state.pendingChecks.has(target.id) ? 'Checking…' : 'Check status', () => void checkStatus(target.id), 'check-status'); check.disabled = state.pendingChecks.has(target.id) || state.loading;
-      cached.controls = { 'check-status': check };
+      focusKey(check, `target:${target.id}:check-status`);
+      cached.controls = { 'check-status': check, profile: profileLink };
       actions.append(check);
       const guardAttack = event => {
         if (!state.reservationsSupported) {
@@ -1766,6 +1815,7 @@ function mountTargetList(platform, storageWarning = '') {
           if (guardAttack(event)) void checkStatus(target.id, true);
         }, 'attack');
         attack.disabled = state.pendingChecks.has(target.id); actions.append(attack);
+        focusKey(attack, `target:${target.id}:attack`);
         cached.controls.attack = attack;
       } else if (assessment.suggested && assessment.ready && freshPool && !target.reserved && !state.reservationsSupported) {
         status.append(element('small', 'Target coordination unavailable. Refresh the list.'));
@@ -1776,21 +1826,22 @@ function mountTargetList(platform, storageWarning = '') {
       for (const id of visibleIds) cardContainer.append(cardNodes.get(id).node);
       mountedIds = visibleIds;
     }
-    if (focusedId && activeControl?.tagName === 'BUTTON') {
-      const controls = cardNodes.get(focusedId)?.controls;
-      const nextControl = controls?.[activeControl.className] || controls?.['check-status'];
-      if (nextControl && !nextControl.disabled && root.activeElement !== nextControl) {
-        nextControl.focus?.({ preventScroll: true });
-        if (Number.isFinite(previousScrollTop)) scroll.scrollTop = previousScrollTop;
-      }
-    }
   }
 
-  function toggle(open) {
+  function toggle(open, opener = null) {
     if (disposed) return;
+    const wasOpen = state.open;
+    if (open && !wasOpen) panelOpener = opener || settings;
     state.open = open; panel.hidden = !open; settings.setAttribute('aria-expanded', String(open));
-    if (open) { findNotice(''); render(); }
-    else { lazyCardsObserver?.disconnect(); findNotice(finderStatus.textContent || quickNotice.textContent || ''); }
+    if (open) {
+      findNotice(''); render();
+      // A heading starts keyboard navigation inside the nonmodal panel without
+      // opening the phone keyboard. Automatic error displays leave focus alone.
+      if (!wasOpen && opener) panelHeading.focus?.({ preventScroll: true });
+    } else {
+      lazyCardsObserver?.disconnect(); findNotice(finderStatus.textContent || quickNotice.textContent || '');
+      if (wasOpen) (panelOpener.disabled ? settings : panelOpener).focus?.({ preventScroll: true });
+    }
     if (open && state.token && !state.finding && Date.now() - state.lastPoolAttemptAt >= 1000) {
       void loadTargets(false, false, Boolean(state.player));
     }
@@ -1809,7 +1860,7 @@ function mountTargetList(platform, storageWarning = '') {
   updateViewport();
   listen(window.visualViewport, 'resize', updateViewport);
   listen(window.visualViewport, 'scroll', updateViewport);
-  listen(root, 'keydown', event => { if (event.key === 'Escape') toggle(false); });
+  listen(root, 'keydown', event => { if (event.key === 'Escape' && state.open) { event.preventDefault(); toggle(false); } });
   listen(root, 'focusout', () => {
     later(() => {
       if (state.backgroundRenderPending && state.open && !editingControl()) render();

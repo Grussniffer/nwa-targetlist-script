@@ -41,6 +41,8 @@ NWA prepares targets in the background. Click **NWA** to find an available targe
 
 The small **⚙** underneath opens the compact target list and suggestions. **Find target** in the panel works like the green NWA button. Search and **Min / Max** stay above the list; each row shows the player's estimated stats, percentage of your total, availability and attack controls. On Torn PDA, the panel opens nearly full width.
 
+Keyboard users can open settings with **Enter**, move through controls with **Tab**, and press **Escape** to close settings and return to the button that opened it. Focus stays in place when sections change or target rows update.
+
 Large lists load more rows as you scroll, with **Show more** available when needed. Search, counts and exports still cover the complete matching list. The panel opens immediately; background refreshing slows while idle and resumes promptly when you use NWA. Temporary connection failures retry with a delay without clearing your login.
 
 Set **Min** and **Max** as percentages of your own total. The default is **10–60%**, with the equivalent stat totals shown underneath. Your range is saved between pages. Set **Min** to **0%** to include weaker targets.
