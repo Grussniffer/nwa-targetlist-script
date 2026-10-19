@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.2' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -274,6 +274,7 @@ function mountTargetList(platform, storageWarning = '') {
     return platform.setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
   }
   function clearSession() {
+    const clearedToken = state.token;
     cancelFind(); state.findAfterLogin = false;
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
@@ -286,13 +287,37 @@ function mountTargetList(platform, storageWarning = '') {
     state.view = 'targets'; state.suggestionView = 'pending'; state.suggestions = []; state.nextSuggestionOffset = null;
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
-    persist(() => platform.deleteValue(storageKey));
+    persist(() => {
+      // GM storage is shared between Torn tabs. This tab can clear only its
+      // own token, never a newer login written by another tab.
+      if (platform.getValue(storageKey, null)?.token === clearedToken) return platform.deleteValue(storageKey);
+    });
     updatePageNotice();
+  }
+  function restoreNewerSession() {
+    let saved;
+    try { saved = platform.getValue(storageKey, null); } catch { return false; }
+    if (!saved || typeof saved.token !== 'string' || !saved.token || saved.token === state.token
+      || !(Date.parse(saved.expiresAt) > Date.now())) return false;
+    clearSession();
+    state.token = saved.token; state.expiresAt = saved.expiresAt;
+    // Restore through the backend before showing protected data or allowing a hit.
+    void loadTargets();
+    return true;
   }
   function handleError(error) {
     if (error.code === 'REVIEW_NOT_ALLOWED') state.canReview = false;
-    if (['SESSION_EXPIRED', 'UNAUTHORIZED', 'FACTION_NOT_ALLOWED', 'FACTION_CHANGED', 'INVALID_KEY', 'KEY_ACCESS', 'SESSION_REVOKED', 'KEY_REVOKED', 'INVALID_SESSION', 'FORBIDDEN'].includes(error.code) || error.status === 401 || (error.status === 403 && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'REVIEW_NOT_ALLOWED'].includes(error.code))) {
+    const authStatus = error.status === 401 || error.status === 403;
+    const confirmed = ['SESSION_REQUIRED', 'SESSION_EXPIRED', 'FACTION_NOT_ALLOWED', 'FACTION_CHANGED',
+      'KEY_REJECTED', 'LIMITED_KEY_REQUIRED', 'KEY_PERMISSIONS_REQUIRED', 'INVALID_KEY', 'KEY_ACCESS',
+      'SESSION_REVOKED', 'KEY_REVOKED', 'INVALID_SESSION'].includes(error.code);
+    if (authStatus && confirmed) {
+      if (restoreNewerSession()) return;
       clearSession(); toggle(true); render();
+    } else if (authStatus && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'REVIEW_NOT_ALLOWED'].includes(error.code)) {
+      // An ambiguous proxy/service denial cannot prove that the saved token
+      // expired. Hide protected data but keep the credential for a later retry.
+      state.authorizedPool = false; state.targets = []; clearExport(); updatePageNotice(); render();
     }
     message(error.message || 'The request failed. Try again shortly.');
   }
@@ -773,6 +798,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (disposed || state.finding || state.busy) return;
     message('');
     if (!state.token || Date.parse(state.expiresAt) <= Date.now()) {
+      if (state.token && restoreNewerSession()) return;
       if (state.token) clearSession();
       state.findAfterLogin = true; toggle(true, launcher); render(); return;
     }
@@ -900,7 +926,7 @@ function mountTargetList(platform, storageWarning = '') {
       if (findGeneration === state.findGeneration) {
         state.finding = false;
         if (state.token && Date.parse(state.expiresAt) <= Date.now()) {
-          clearSession(); message('Session expired. Sign in again.'); findNotice('Session expired. Open NWA settings to sign in again.');
+          if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); findNotice('Session expired. Open NWA settings to sign in again.'); }
         }
         render();
       }
@@ -1021,6 +1047,12 @@ function mountTargetList(platform, storageWarning = '') {
     orderedRowsKey = null; orderedIds = []; mountedIds = []; emptyCard = null;
   }
   function updatePanelControls() {
+    if (!state.player && state.token) {
+      panelUi.retry.disabled = state.busy || state.loading || state.removingKey;
+      panelUi.signOut.disabled = state.busy || state.loading || state.removingKey;
+      setText(panelUi.retry, state.loading ? 'Restoring session…' : 'Retry saved login');
+      return;
+    }
     if (!state.player) {
       panelUi.input.disabled = state.busy || state.loading;
       panelUi.submit.disabled = state.busy || state.loading;
@@ -1065,13 +1097,22 @@ function mountTargetList(platform, storageWarning = '') {
     if (!state.player && renderedKind?.startsWith('member:')) resetPanel();
     if (!state.open) { state.backgroundRenderPending = true; return; }
     state.backgroundRenderPending = false;
-    const kind = state.player ? `member:${state.player.id}:${state.view}` : 'login';
+    const kind = state.player ? `member:${state.player.id}:${state.view}` : state.token ? 'saved-login' : 'login';
     if (renderedKind === kind) {
       updatePanelControls();
       if (state.player) { if (state.view === 'targets') renderCards(); else renderSuggestions(); }
       return;
     }
     resetPanel(); renderedKind = kind;
+    if (!state.player && state.token) {
+      const intro = element('p', 'Your login is saved on this device. NWA will reconnect without asking for your key again.');
+      const retry = button(state.loading ? 'Restoring session…' : 'Retry saved login', () => void loadTargets(true));
+      retry.disabled = state.busy || state.loading || state.removingKey;
+      const signOut = button('Sign out and remove key', () => void logout());
+      signOut.disabled = state.busy || state.loading || state.removingKey;
+      panelUi = { retry, signOut }; content.append(intro, retry, signOut);
+      return;
+    }
     if (!state.player) {
       const intro = element('p', 'Sign in to find your next NWA chain target.');
       const form = element('form', null, 'login');
@@ -1533,7 +1574,9 @@ function mountTargetList(platform, storageWarning = '') {
   const maintenanceTimer = setInterval(() => {
     if (disposed) return;
     updatePageNotice();
-    if (state.token && Date.parse(state.expiresAt) <= Date.now()) { clearSession(); message('Session expired. Sign in again.'); render(); }
+    if (state.token && Date.parse(state.expiresAt) <= Date.now()) {
+      if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); render(); }
+    }
     else if (pageVisible() && state.open && state.player && !state.pendingChecks.size) {
       let expired = false;
       state.targets = state.targets.map(target => {

@@ -2435,3 +2435,67 @@ test('sign out and expiry clear the export text and retained controls cannot exp
     assert.equal(app.storage.has(app.storageKey), false);
   }
 });
+
+
+test('unrecognized HTTP authorization errors block targets without erasing a saved login', async () => {
+  for (const [status, code] of [[401, undefined], [403, 'FORBIDDEN'], [403, 'PROXY_DENIED']]) {
+    const saved = { token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() };
+    const app = fixture(saved);
+    app.response(app.requests[0], { error: { code, message: 'Temporary access failure' } }, status);
+    await flush();
+    assert.equal(app.storage.get(app.storageKey)?.token, SESSION);
+    assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
+    assert.deepEqual(app.navigations, []);
+    assert.match(app.text(), /Temporary access failure/);
+  }
+});
+
+test('an old tab restores a newer saved login instead of deleting it after its own rejection', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() });
+  const newer = { token: 'newer-device-session', expiresAt: new Date(NOW + 7 * 86400000).toISOString() };
+  app.storage.set(app.storageKey, newer);
+  app.response(app.requests[0], { error: { code: 'SESSION_EXPIRED', message: 'Old session expired' } }, 401);
+  await flush();
+  assert.equal(app.storage.get(app.storageKey)?.token, newer.token);
+  assert.equal(app.requests.length, 2);
+  assert.equal(app.requests[1].headers.Authorization, 'Bearer ' + newer.token);
+  assert.equal(app.requests[1].method, 'GET'); assert.equal(app.requests[1].data, undefined);
+  assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
+  app.response(app.requests[1], { player, targets: [target], warnings: [], reservations: coordination }); await flush();
+  app.openPanel(); assert.match(app.text(), /Allowed Player/);
+});
+
+test('expiry in an older tab preserves and verifies a newer login saved by another tab', async () => {
+  const app = fixture(); await app.signIn();
+  const newer = { token: 'newer-tab-session', expiresAt: new Date(NOW + 7 * 86400000).toISOString() };
+  app.storage.set(app.storageKey, newer); app.setNow(NOW + 3600000);
+  for (const tick of app.timers) tick(); await flush();
+  assert.equal(app.storage.get(app.storageKey)?.token, newer.token);
+  assert.equal(app.requests.at(-1).headers.Authorization, 'Bearer ' + newer.token);
+  assert.deepEqual(app.navigations, []);
+});
+
+
+test('a temporary restoration failure offers saved-login retry without asking for the API key again', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() });
+  app.openPanel();
+  app.response(app.requests[0], { error: { code: 'KEY_STORAGE_UNAVAILABLE', message: 'Storage is temporarily unavailable.' } }, 503);
+  await flush();
+  assert.equal(descendants(app.root).some(element => element.type === 'password'), false);
+  assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  app.button('Retry saved login').emit('click');
+  assert.equal(app.requests.at(-1).headers.Authorization, 'Bearer ' + SESSION);
+  assert.equal(app.requests.at(-1).method, 'GET');
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], reservations: coordination }); await flush();
+  assert.match(app.text(), /Allowed Player/);
+});
+
+
+test('a rejected replacement session stops recovery and requires a new sign-in', async () => {
+  const app = fixture({ token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() });
+  app.storage.set(app.storageKey, { token: 'also-invalid-session', expiresAt: new Date(NOW + 86400000).toISOString() });
+  app.response(app.requests[0], { error: { code: 'SESSION_EXPIRED', message: 'Old session expired' } }, 401); await flush();
+  app.response(app.requests[1], { error: { code: 'SESSION_EXPIRED', message: 'Saved session expired' } }, 401); await flush();
+  assert.equal(app.requests.length, 2); assert.equal(app.storage.has(app.storageKey), false);
+  assert.match(app.text(), /Torn Limited API key/); assert.deepEqual(app.navigations, []);
+});
