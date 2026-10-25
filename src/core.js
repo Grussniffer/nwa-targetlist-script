@@ -114,6 +114,24 @@ const TargetListCore = (() => {
     return pool.sort((a, b) => Number(b.assessment.ready) - Number(a.assessment.ready)).map(row => row.target);
   }
 
+  function applyPendingSuggestions(data, previous = null) {
+    if (data === undefined) return { status: 'unsupported', revision: null, playerIds: [] };
+    if (data?.unavailable === true) return { status: 'unavailable', revision: null, playerIds: [] };
+    const invalid = () => { throw new Error('Pending suggestion status could not be checked.'); };
+    if (!data || typeof data !== 'object' || !/^[a-f0-9]{64}$/.test(data.revision)) invalid();
+    if (data.unchanged === true) {
+      if (previous?.status !== 'ready' || previous.revision !== data.revision || data.playerIds !== undefined) invalid();
+      return previous;
+    }
+    if (!Array.isArray(data.playerIds) || data.playerIds.length > 5000) invalid();
+    let last = 0;
+    for (const id of data.playerIds) {
+      if (!Number.isSafeInteger(id) || id <= last || id > 2147483647) invalid();
+      last = id;
+    }
+    return { status: 'ready', revision: data.revision, playerIds: data.playerIds };
+  }
+
   function applyFeed(data, previousTargets = [], cursor = null) {
     const invalid = () => {
       const error = new Error('The target list update was incomplete. Refresh the list to try again.');
@@ -158,5 +176,5 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
 })();

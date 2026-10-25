@@ -89,3 +89,17 @@ test('a delta without a matching prior request baseline cannot authorize a pool'
     assert.throws(() => applyFeed(delta(), [], cursor), { code: 'FEED_SYNC_INVALID' });
   }
 });
+
+
+test('pending-player snapshots distinguish empty, unchanged, unavailable and older backends', () => {
+  const revision = 'a'.repeat(64);
+  const first = context.Core.applyPendingSuggestions({ revision, playerIds: [2, 9] });
+  assert.deepEqual(Array.from(first.playerIds), [2, 9]); assert.equal(first.status, 'ready');
+  assert.equal(context.Core.applyPendingSuggestions({ revision, unchanged: true }, first), first);
+  assert.equal(context.Core.applyPendingSuggestions({ revision, playerIds: [] }).status, 'ready');
+  assert.equal(context.Core.applyPendingSuggestions({ unavailable: true }).status, 'unavailable');
+  assert.equal(context.Core.applyPendingSuggestions(undefined).status, 'unsupported');
+  for (const data of [{ revision, unchanged: true }, { revision, playerIds: [9, 2] }, { revision, playerIds: [2, 2] }, { revision, playerIds: [0] }, { revision: 'bad', playerIds: [] }]) {
+    assert.throws(() => context.Core.applyPendingSuggestions(data));
+  }
+});

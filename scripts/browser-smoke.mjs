@@ -178,6 +178,16 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           } else data.targets = snapshot;
           window.__mock.feedSnapshots.set(cursor, snapshot);
         } else data.targets = snapshot;
+        if (window.__mock.pendingPlayers !== undefined) {
+          data.capabilities = { ...data.capabilities, pendingSuggestions: true };
+          if (window.__mock.pendingPlayers === null) data.pendingSuggestions = { unavailable: true };
+          else {
+            const playerIds = [...new Set(window.__mock.pendingPlayers)].sort((a, b) => a - b), key = JSON.stringify(playerIds);
+            if (key !== window.__mock.pendingKey) { window.__mock.pendingKey = key; window.__mock.pendingSequence = (window.__mock.pendingSequence || 0) + 1; }
+            const revision = window.__mock.pendingSequence.toString(16).padStart(64, '0');
+            data.pendingSuggestions = url.searchParams.get('suggestionsCursor') === revision ? { revision, unchanged: true } : { revision, playerIds };
+          }
+        }
         if (window.__mock.reservations) data.reservations = window.__mock.reservations;
         if (window.__mock.nextTarget) data.capabilities = { nextTarget: true, requestDeadlineMs: 8000, schema: { status: 'ready', failedChecks: [] } };
       } else if (url.pathname === '/api/targets/next' && request.method === 'POST') {
@@ -2052,6 +2062,52 @@ try {
     }
   } finally { await quickMobile.close(); }
   console.log('PASS compact profile/attack quick suggestions on desktop, 390px touch and 320px native PDA: mandatory reason, focus, no layout shift, one POST, pending feedback and Escape');
+
+  for (const mode of [{ label: 'desktop-profile', width: 1280, pda: false }, { label: 'pda-attack', width: 320, pda: true }]) {
+    const shared = await mount({ width: mode.width, height: 900 }, mode.pda ? [pdaRuntimeSource, source] : [source], context, attack => {
+      const content = document.createElement('main'); content.id = 'content-wrapper';
+      content.style.cssText = 'margin:160px 16px 0;width:calc(100% - 32px);padding:0';
+      content.innerHTML = '<h1>' + (attack ? 'Attacking' : 'Player [999]') + '</h1><p>Pending player fixture.</p>';
+      document.body.append(content); window.__sharedFlow = content.getBoundingClientRect().height;
+      window.__mock.pendingPlayers = [999];
+    }, mode.pda, mode.pda ? 'https://www.torn.com/page.php?sid=attack&user2ID=999' : 'https://www.torn.com/profiles.php?XID=999');
+    await login(shared); await shadow(shared, '[aria-label="Close NWA settings"]', 'click');
+    await wait(shared, () => window.__playerNoticeShadow?.querySelector('summary').textContent.includes('Pending'));
+    const point = await shared.evaluate(() => { const r = window.__playerNoticeShadow.querySelector('summary').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; });
+    await shared.mouse.click(point.x, point.y);
+    await wait(shared, () => window.__playerNoticeShadow.querySelector('details').open);
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('form').hidden), true);
+    assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.quick-feedback').textContent), /already has a pending suggestion/);
+    assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('summary').getAttribute('aria-label')), /Pending NWA suggestion/);
+    const geometry = await shared.evaluate(() => ({ badge: document.getElementById('nwa-target-page-notice').getBoundingClientRect().height,
+      before: window.__sharedFlow, after: document.getElementById('content-wrapper').getBoundingClientRect().height,
+      width: innerWidth, documentWidth: document.documentElement.scrollWidth }));
+    assert(geometry.badge <= 23); assert.equal(geometry.before, geometry.after); assert.equal(geometry.width, geometry.documentWidth);
+    await shared.screenshot({ path: path.join(artifacts, 'browser-shared-pending-' + mode.label + '.png'), fullPage: true });
+    await refreshMockFeed(shared);
+    assert.equal(await shared.evaluate(() => window.__mock.feedResponses.at(-1).data.pendingSuggestions.unchanged), true);
+    assert.match(await shared.evaluate(() => window.__mock.feedResponses.at(-1).search), /suggestionsCursor=/);
+    await shared.evaluate(() => { window.__mock.pendingPlayers = null; }); await refreshMockFeed(shared);
+    await wait(shared, () => window.__playerNoticeShadow.querySelector('summary').textContent.includes('Check pending'));
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('form').hidden), true);
+    assert.equal(await shared.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 4);
+    await shared.evaluate(() => { window.__mock.pendingPlayers = []; }); await refreshMockFeed(shared);
+    await wait(shared, () => !window.__playerNoticeShadow.querySelector('form').hidden);
+    assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('summary').textContent), /Suggest to NWA/);
+    await shared.evaluate(() => { window.__playerNoticeShadow.querySelector('textarea').focus(); window.__mock.pendingPlayers = [999]; });
+    await refreshMockFeed(shared);
+    await wait(shared, () => window.__playerNoticeShadow.querySelector('form').hidden);
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.activeElement === window.__playerNoticeShadow.querySelector('summary')), true,
+      'a newly pending suggestion moves focus from the hidden form to its summary');
+    await shared.evaluate(() => { window.__mock.pendingPlayers = []; window.__mock.targets.push({ ...window.__mock.targets[0], id: 999, name: 'Approved player', reason: 'Saved approved reason' }); });
+    await refreshMockFeed(shared);
+    await wait(shared, () => document.getElementById('nwa-target-page-notice').getAttribute('data-mode') === 'listed');
+    assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /Saved approved reason/);
+    assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path.startsWith('/api/suggestions')).length), 0,
+      'shared pending hints use only the existing target feed');
+    await shared.close();
+  }
+  console.log('PASS shared pending suggestions on desktop profiles/native PDA attacks: compact badge, revision-only refresh, unknown-state handling, rejection, approval, keyboard focus and no extra queue requests');
 
   const longNoticeReason = ('Preferred chain target. Repeated attacks against alliance members; inactive for several weeks. '
     + 'Review the saved faction note and check availability before attacking. '.repeat(10)).trim();

@@ -142,7 +142,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   function shortTimeouts() { for (const [id, entry] of [...timeouts]) if (entry.delay < 1000) { timeouts.delete(id); entry.callback(); } }
   function mutation() { for (const observer of observers) if (observer.active) observer.callback([{ target: content || body }]); shortTimeouts(); }
   function response(request, data, status = 200) { assert.ok(request, 'an expected request exists'); request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url }); }
-  async function feed(targets = [target]) { response(requests.at(-1), { player, targets, warnings: [], generatedAt: new Date(now).toISOString() }); await flush(); shortTimeouts(); }
+  async function feed(targets = [target], pendingSuggestions) { response(requests.at(-1), { player, targets, pendingSuggestions, warnings: [], generatedAt: new Date(now).toISOString() }); await flush(); shortTimeouts(); }
   function control(label) { const root = document.getElementById('torn-targetlist-host').shadow; const button = all(root).find(node => node.tagName === 'BUTTON' && node.textContent === label); assert.ok(button, `button ${label} exists`); return button; }
   function notice() { return document.getElementById('nwa-target-page-notice'); }
   function noticeText() { return notice()?.shadow?.textContent || notice()?.textContent || ''; }
@@ -440,4 +440,49 @@ test('quick suggestions leave an unfinished main-panel draft unchanged', async (
   main = root.querySelector('.suggestionform');
   assert.equal(main.querySelector('input').value, '777');
   assert.equal(main.querySelector('textarea').value, 'Unfinished reason for another player');
+});
+
+
+test('another member pending suggestion is visible on profile and attack pages and prevents submission', async () => {
+  for (const url of ['https://www.torn.com/profiles.php?XID=900', 'https://www.torn.com/page.php?sid=attack&user2ID=900']) {
+    const page = fixture(url); await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] });
+    assert.match(page.notice().shadow.querySelector('summary').textContent, /Pending/);
+    assert.equal(page.notice().shadow.querySelector('form').hidden, true);
+    assert.match(page.noticeText(), /already has a pending suggestion/);
+    const form = page.notice().shadow.querySelector('form'); form.querySelector('textarea').value = 'Duplicate attempt'; form.emit('submit');
+    await flush(); assert.equal(page.requests.length, 1);
+    page.tick(NOW + 10000);
+    assert.match(page.requests.at(-1).url, /suggestionsCursor=/);
+    await page.feed([], { revision: 'b'.repeat(64), playerIds: [] });
+    assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
+    assert.equal(page.notice().shadow.querySelector('form').hidden, false);
+  }
+});
+
+test('unknown or malformed shared pending status hides the quick form without hiding listed targets', async () => {
+  for (const pendingSuggestions of [{ unavailable: true }, { revision: 'a'.repeat(64), unchanged: true }]) {
+    const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed([], pendingSuggestions);
+    assert.equal(page.notice().shadow.querySelector('form').hidden, true);
+    assert.match(page.noticeText(), /could not be checked/);
+    const listed = fixture('https://www.torn.com/profiles.php?XID=900'); await listed.feed([target], pendingSuggestions);
+    assert.equal(listed.notice().getAttribute('data-mode'), 'listed');
+  }
+});
+
+
+test('an old pending heartbeat cannot erase a just-submitted local suggestion', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900');
+  await page.feed([], { revision: 'a'.repeat(64), playerIds: [] });
+  page.tick(NOW + 10000); const oldFeed = page.requests.at(-1);
+  const form = page.notice().shadow.querySelector('form'); form.querySelector('textarea').value = 'New suggestion'; form.emit('submit');
+  page.response(page.requests.at(-1), { suggestion: { status: 'pending' } }, 201); await flush();
+  page.response(oldFeed, { player, targets: [], pendingSuggestions: { revision: 'a'.repeat(64), unchanged: true }, warnings: [] }); await flush();
+  assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggested/);
+  page.tick(NOW + 20000);
+  assert.equal(page.requests.at(-1).url.includes('suggestionsCursor='), false, 'the next feed asks for a complete pending snapshot');
+  await page.feed([], { revision: 'b'.repeat(64), playerIds: [900] });
+  assert.match(page.notice().shadow.querySelector('summary').textContent, /Pending/);
+  page.tick(NOW + 30000); await page.feed([], { revision: 'c'.repeat(64), playerIds: [] });
+  assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
+  assert.equal(page.notice().shadow.querySelector('.quick-feedback').textContent, '');
 });

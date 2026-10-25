@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.10.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.11.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -85,6 +85,7 @@ function mountTargetList(platform, storageWarning = '') {
     pendingChecks: new Set(), loading: false, targetGeneration: 0, view: 'targets',
     suggestionView: 'pending', suggestions: [], nextSuggestionOffset: null, canReview: false,
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '',
+    pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
   let exportSnapshot = null, exportView = null;
@@ -276,6 +277,7 @@ function mountTargetList(platform, storageWarning = '') {
   function clearSession() {
     const clearedToken = state.token;
     pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' };
+    state.pendingSuggestionEpoch++; state.pendingSuggestions = { status: 'unsupported', revision: null, playerIds: [] }; state.pendingPlayerIds.clear();
     cancelFind(); state.findAfterLogin = false;
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
@@ -753,23 +755,29 @@ function mountTargetList(platform, storageWarning = '') {
       pageNoticeDetails.addEventListener('toggle', () => {
         if (!pageNoticeDetails?.open) return;
         positionPageNotice(C.pageTargetId(window.location?.href));
-        if (pageNoticeMode === 'suggest' && !pageNoticeComment.disabled) pageNoticeComment.focus?.({ preventScroll: true });
+        if (pageNoticeMode === 'suggest' && !pageNoticeForm.hidden && !pageNoticeComment.disabled) pageNoticeComment.focus?.({ preventScroll: true });
       });
       noticeRoot.addEventListener('keydown', event => {
         if (event.key === 'Escape') { pageNoticeDetails.open = false; pageNoticeSummary.focus(); }
       });
     }
     if (!target) {
-      const pending = pageSuggestedIds.has(id);
-      const title = pending ? 'NWA · Suggested' : 'Suggest to NWA';
+      const sharedPending = state.pendingPlayerIds.has(id), pending = sharedPending || pageSuggestedIds.has(id);
+      const unavailable = state.pendingSuggestions.status === 'unavailable';
+      const title = sharedPending ? 'NWA · Pending' : pending ? 'NWA · Suggested' : unavailable ? 'NWA · Check pending' : 'Suggest to NWA';
       if (pageNoticeTitle.textContent !== title) pageNoticeTitle.textContent = title;
-      pageNoticeSummary.setAttribute('aria-label', (pending ? 'Suggestion submitted for player ' : 'Suggest player ') + id + ' to the NWA target list');
+      pageNoticeSummary.setAttribute('aria-label', (sharedPending ? 'Pending NWA suggestion for player ' : pending ? 'Suggestion submitted for player ' : unavailable ? 'Pending suggestion status unavailable for player ' : 'Suggest player ') + id);
       if (pageNoticeQuickHeading.textContent !== 'Suggest player [' + id + ']') pageNoticeQuickHeading.textContent = 'Suggest player [' + id + ']';
-      pageNoticeForm.hidden = pending;
+      const losingFocus = !pageNoticeForm.hidden && (pending || unavailable) && pageNoticeForm.contains(pageNoticeForm.getRootNode?.()?.activeElement);
+      pageNoticeForm.hidden = pending || unavailable;
+      if (losingFocus) pageNoticeSummary.focus?.({ preventScroll: true });
       const busy = Boolean(state.suggestionMutation || state.removingKey);
       pageNoticeComment.disabled = busy; pageNoticeSubmit.disabled = busy;
       if (pageNoticeSubmit.textContent !== (busy ? 'Submitting…' : 'Send suggestion')) pageNoticeSubmit.textContent = busy ? 'Submitting…' : 'Send suggestion';
-      const feedback = pageSuggestion.message || (pending ? 'Suggestion submitted. A faction leader or co-leader can review it.' : '');
+      const feedback = pending ? (sharedPending ? 'This player already has a pending suggestion. Awaiting review by a faction leader or co-leader.'
+        : 'Suggestion submitted. A faction leader or co-leader can review it.')
+        : unavailable ? 'Pending suggestions could not be checked. Refresh NWA or wait for the next update before suggesting this player.'
+        : pageSuggestion.message || (state.pendingSuggestions.status === 'unsupported' ? 'Check Suggestions in NWA for existing requests before submitting.' : '');
       if (pageNoticeFeedback.textContent !== feedback) pageNoticeFeedback.textContent = feedback;
       pageNoticeFeedback.hidden = !feedback;
       positionPageNotice(id); observeNoticeArea(id); return;
@@ -824,17 +832,32 @@ function mountTargetList(platform, storageWarning = '') {
     const targetGeneration = ++state.targetGeneration;
     // Keep the server baseline separate from local status checks and expiry updates.
     const previousTargets = state.feedTargets, cursor = state.feedCursor;
+    const pendingEpoch = state.pendingSuggestionEpoch, suggestionsCursor = state.pendingSuggestions.revision;
     state.loading = !background; state.backgroundLoading = background; state.lastPoolAttemptAt = Date.now(); message('');
     // Background sync publishes a complete new pool without hiding usable cached targets.
     if (!background) { state.targets = []; state.authorizedPool = false; updatePageNotice(); }
     if (!background) render();
     const pending = (async () => {
       try {
-        const path = cursor ? `/api/targets?cursor=${encodeURIComponent(cursor)}` : '/api/targets';
+        const query = [cursor ? 'cursor=' + encodeURIComponent(cursor) : '', suggestionsCursor ? 'suggestionsCursor=' + encodeURIComponent(suggestionsCursor) : ''].filter(Boolean).join('&');
+        const path = '/api/targets' + (query ? '?' + query : '');
         const data = await request('GET', path, undefined, state.token, timeoutMs);
         if (generation !== state.generation || targetGeneration !== state.targetGeneration) return false;
         const feed = C.applyFeed(data, previousTargets, cursor);
         state.feedTargets = feed.targets; state.feedCursor = feed.cursor;
+        if (pendingEpoch === state.pendingSuggestionEpoch) {
+          const previouslyPending = state.pendingPlayerIds.has(pageSuggestion.id) || pageSuggestedIds.has(pageSuggestion.id);
+          try {
+            state.pendingSuggestions = C.applyPendingSuggestions(data.pendingSuggestions === undefined && data.capabilities?.pendingSuggestions ? { unavailable: true } : data.pendingSuggestions, state.pendingSuggestions);
+            state.pendingPlayerIds = new Set(state.pendingSuggestions.playerIds);
+            if (state.pendingSuggestions.status === 'ready') {
+              pageSuggestedIds.clear();
+              if (previouslyPending && !state.pendingPlayerIds.has(pageSuggestion.id)) pageSuggestion.message = '';
+            }
+          } catch {
+            state.pendingSuggestions = { status: 'unavailable', revision: null, playerIds: [] }; state.pendingPlayerIds.clear();
+          }
+        }
         state.player = data.player; state.targets = feed.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
         state.reservationsSupported = data.reservations?.supported === true;
         state.nextTargetSupported = data.capabilities?.nextTarget === true;
@@ -1065,7 +1088,7 @@ function mountTargetList(platform, storageWarning = '') {
     const report = text => fromPage ? pageSuggestionMessage(text, Number(draft.targetId)) : message(text);
     if (fromPage && (!pageVisible() || C.pageTargetId(window.location?.href) !== Number(draft.targetId) || !authorizedPoolFresh()
       || Number(draft.targetId) === state.player?.id || state.targets.some(target => target.id === Number(draft.targetId))
-      || pageSuggestedIds.has(Number(draft.targetId)))) return;
+      || pageSuggestedIds.has(Number(draft.targetId)) || state.pendingPlayerIds.has(Number(draft.targetId)) || state.pendingSuggestions.status === 'unavailable')) return;
     const targetId = Number(draft.targetId);
     const comment = draft.comment.trim();
     if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(targetId) || targetId > 2147483647) {
@@ -1081,6 +1104,7 @@ function mountTargetList(platform, storageWarning = '') {
       await request('POST', '/api/suggestions', { type: draft.type, targetId, comment });
       if (generation !== state.generation) return;
       if (!fromPage) state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
+      state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
       if (draft.type === 'player') {
         if (pageSuggestedIds.size >= 200) pageSuggestedIds.delete(pageSuggestedIds.values().next().value);
         pageSuggestedIds.add(targetId);
@@ -1088,7 +1112,15 @@ function mountTargetList(platform, storageWarning = '') {
       state.suggestionNotice = 'Suggestion submitted. A faction leader or co-leader can review it.';
       if (fromPage && pageSuggestion.id === targetId) { pageSuggestion.comment = ''; pageSuggestionMessage(state.suggestionNotice, targetId); }
       if (!fromPage || state.open && state.view === 'suggestions') await loadSuggestions();
-    } catch (error) { if (generation === state.generation) { handleError(error); if (fromPage) pageSuggestionMessage(error.message || 'The suggestion could not be submitted.', targetId); } }
+    } catch (error) {
+      if (generation === state.generation) {
+        handleError(error);
+        if (fromPage) {
+          pageSuggestionMessage(error.message || 'The suggestion could not be submitted.', targetId);
+          if (error.code === 'SUGGESTION_CONFLICT') void loadTargets(true);
+        }
+      }
+    }
     finally {
       if (generation === state.generation) {
         state.suggestionMutation = null; render(); updatePageNotice();
@@ -1105,6 +1137,11 @@ function mountTargetList(platform, storageWarning = '') {
     try {
       const data = await request('POST', `/api/suggestions/${id}/review`, { decision });
       if (generation !== state.generation) return;
+      state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
+      if (data.suggestion?.type === 'player') {
+        state.pendingPlayerIds.delete(data.suggestion.targetId); pageSuggestedIds.delete(data.suggestion.targetId);
+        if (pageSuggestion.id === data.suggestion.targetId) pageSuggestion.message = '';
+      }
       const added = data.addedPlayers || 0;
       state.suggestionNotice = decision === 'approved'
         ? `Suggestion approved. ${added} ${added === 1 ? 'player added' : 'players added'} to the target pool.`
@@ -1117,7 +1154,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.suggestionGeneration++; state.suggestionsLoading = false; state.canReview = false;
       }
       handleError(error);
-    } finally { if (generation === state.generation) { state.suggestionMutation = null; render(); } }
+    } finally { if (generation === state.generation) { state.suggestionMutation = null; render(); updatePageNotice(); } }
   }
 
   let cardContainer, countNode, panelUi = null, renderedKind = null, suggestionContainer = null, suggestionSignature = null;
