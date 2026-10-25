@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.9.2
+// @version      0.10.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -365,7 +365,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.9.2' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.10.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -641,6 +641,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function clearSession() {
     const clearedToken = state.token;
+    pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' };
     cancelFind(); state.findAfterLogin = false;
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
@@ -873,7 +874,14 @@ function mountTargetList(platform, storageWarning = '') {
   let pageNotice = null, pageNoticeReason = null, pageNoticeFullReason = null, pageNoticeSummary = null;
   let pageNoticeEstimate = null, pageNoticeEstimateDetail = null, pageNoticeDetail = null, pageNoticeDetails = null;
   let pageNoticeObserver = null, pageNoticeTimer = null, pageNoticeAnchor = null, pageNoticeResizeObserver = null;
-  let pageNoticeObservedArea = null;
+  let pageNoticeObservedArea = null, pageNoticeMode = null;
+  let pageNoticeForm = null, pageNoticeComment = null, pageNoticeSubmit = null, pageNoticeFeedback = null, pageNoticeTitle = null, pageNoticeQuickHeading = null;
+  let pageSuggestion = { id: null, comment: '', message: '' };
+  const pageSuggestedIds = new Set();
+  function pageSuggestionMessage(text, id) {
+    if (id !== pageSuggestion.id || C.pageTargetId(window.location?.href) !== id) return;
+    pageSuggestion.message = text; updatePageNotice();
+  }
   function observeNoticeArea(id) {
     if (typeof MutationObserver !== 'function') return;
     const area = id && pageVisible() ? pageNoticeAnchor?.parentElement
@@ -891,6 +899,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function removePageNotice() {
     pageNotice?.remove(); pageNoticeResizeObserver?.disconnect(); pageNoticeAnchor = null;
+    pageNoticeMode = null; pageNoticeForm = null; pageNoticeComment = null; pageNoticeSubmit = null; pageNoticeFeedback = null; pageNoticeTitle = null; pageNoticeQuickHeading = null;
     pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
     pageNoticeEstimate = null; pageNoticeEstimateDetail = null; pageNoticeDetail = null; pageNoticeDetails = null;
   }
@@ -1005,13 +1014,13 @@ function mountTargetList(platform, storageWarning = '') {
     const style = (node, property, value) => { if (node.style[property] !== value) node.style[property] = value; };
     const attribute = (name, value) => { if (pageNotice.getAttribute(name) !== value) pageNotice.setAttribute(name, value); };
     attribute('data-placement', match.type); attribute('data-compact', String(match.width < 190));
-    style(pageNotice, 'left', `${match.left}px`); style(pageNotice, 'top', `${match.top}px`); style(pageNotice, 'width', `${match.width}px`);
+    style(pageNotice, 'left', `${match.left}px`); style(pageNotice, 'top', `${match.top}px`); style(pageNotice, 'width', `${pageNoticeMode === 'suggest' ? Math.min(120, match.width) : match.width}px`);
     const detailWidth = Math.min(300, match.viewportWidth - 16);
     const detailLeft = Math.max(match.viewportLeft + 8, Math.min(match.left, match.viewportRight - detailWidth - 8));
     style(pageNoticeDetail, 'width', `${detailWidth}px`); style(pageNoticeDetail, 'left', `${detailLeft - match.left}px`);
     const below = Math.max(0, match.viewportBottom - match.top - 22 - 12);
     const above = Math.max(0, match.top - match.viewportTop - 12);
-    const preferredHeight = Math.min(200, match.viewportHeight * 0.4);
+    const preferredHeight = Math.min(pageNoticeMode === 'suggest' ? 320 : 200, match.viewportHeight * (pageNoticeMode === 'suggest' ? 0.6 : 0.4));
     const upwards = below < preferredHeight && above > below;
     style(pageNoticeDetail, 'top', upwards ? 'auto' : 'calc(100% + 4px)');
     style(pageNoticeDetail, 'bottom', upwards ? 'calc(100% + 4px)' : 'auto');
@@ -1026,17 +1035,24 @@ function mountTargetList(platform, storageWarning = '') {
     }
     const id = C.pageTargetId(window.location?.href);
     if (!pageVisible()) { observeNoticeArea(null); pageNoticeResizeObserver?.disconnect(); removePageNotice(); return; }
-    const target = id && state.player && state.token && Date.parse(state.expiresAt) > Date.now() && authorizedPoolFresh()
-      ? state.targets.find(target => target.id === id) : null;
-    if (!target) { observeNoticeArea(null); removePageNotice(); return; }
+    const authorized = id && id <= 2147483647 && state.player && state.token && Date.parse(state.expiresAt) > Date.now() && authorizedPoolFresh();
+    const target = authorized ? state.targets.find(target => target.id === id) : null;
+    if (!authorized || !target && id === state.player.id) { observeNoticeArea(null); removePageNotice(); return; }
+    const mode = target ? 'listed' : 'suggest';
+    if (pageNoticeMode !== mode) removePageNotice();
+    if (pageSuggestion.id !== id) {
+      removePageNotice();
+      pageSuggestion = { id, comment: '', message: '' };
+    }
     observeNoticeArea(id);
     if (!pageNotice) {
       pageNotice = element('div'); pageNotice.id = 'nwa-target-page-notice';
+      pageNoticeMode = mode; pageNotice.setAttribute('data-mode', mode);
       const noticeRoot = pageNotice.attachShadow({ mode: 'closed' });
       const style = element('style');
       style.textContent = `
         :host{all:initial;position:fixed;z-index:2147483001;display:inline-block;box-sizing:border-box;max-width:340px;min-width:0;margin:0;font:10px/1.2 Arial,Helvetica,sans-serif;color:#d4d4d8}
-        *{box-sizing:border-box}
+        *{box-sizing:border-box}[hidden]{display:none!important}
         .notice{position:relative;max-width:100%;border:1px solid rgba(113,113,122,.65);border-radius:4px;background:rgba(24,24,27,.72)}
         summary{display:flex;align-items:center;gap:5px;height:20px;min-width:0;padding:1px 5px;list-style:none;cursor:pointer}
         summary::-webkit-details-marker{display:none}
@@ -1051,24 +1067,78 @@ function mountTargetList(platform, storageWarning = '') {
         :host([data-compact="true"]) .estimate[data-known="true"] .estimate-value::before{content:'~'}
         .detail{position:absolute;z-index:2147483001;top:calc(100% + 4px);left:0;max-height:min(200px,40vh);overflow:auto;padding:8px;border:1px solid #52525b;border-radius:4px;background:#18181b;color:#e4e4e7;font-size:11px;line-height:1.4;overflow-wrap:anywhere;box-shadow:0 4px 12px #0004}
         p{margin:0}.full-reason,.estimate-detail{margin-top:4px;white-space:pre-wrap}
+        :host([data-mode="suggest"]) .title{font-size:10px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+        .quick-form{display:grid;gap:7px}.quick-form label{display:grid;gap:4px;font-weight:600}
+        textarea{display:block;width:100%;min-height:64px;resize:vertical;max-height:130px;border:1px solid #52525b;border-radius:4px;background:#27272a;color:#f4f4f5;padding:6px;font:12px/1.4 Arial,Helvetica,sans-serif}
+        textarea:focus-visible,button:focus-visible{outline:2px solid #9fbd57;outline-offset:2px}
+        button{min-height:30px;border:1px solid #52525b;border-radius:4px;padding:4px 8px;background:#27272a;color:#f4f4f5;font:12px Arial,Helvetica,sans-serif;cursor:pointer}
+        button[type="submit"]{background:#3f4d22;border-color:#9fbd57}button:disabled{opacity:.6;cursor:wait}
+        .quick-actions{display:flex;gap:6px}.quick-feedback{margin-top:6px;white-space:pre-wrap}.quick-help{color:#a1a1aa;font-size:10px}
       `;
       const notice = element('section', null, 'notice');
-      notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', 'NWA target list notice');
+      notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', target ? 'NWA target list notice' : 'Suggest this player to NWA');
       pageNoticeDetails = element('details'); pageNoticeSummary = element('summary');
-      pageNoticeReason = element('span', null, 'reason');
-      const estimate = element('span', null, 'estimate');
-      pageNoticeEstimate = element('span', null, 'estimate-value');
-      estimate.append(element('span', 'Est. ', 'estimate-label'), pageNoticeEstimate);
-      const chevron = element('span', '⌄', 'chevron'); chevron.setAttribute('aria-hidden', 'true');
-      pageNoticeSummary.append(element('strong', 'NWA', 'title'), estimate, pageNoticeReason, chevron);
-      pageNoticeDetail = element('div', null, 'detail'); pageNoticeFullReason = element('p', null, 'full-reason');
-      pageNoticeEstimateDetail = element('p', null, 'estimate-detail');
-      pageNoticeDetail.append(element('p', 'This player is on the NWA target list.'), pageNoticeEstimateDetail, pageNoticeFullReason);
+      pageNoticeDetail = element('div', null, 'detail');
+      pageNoticeTitle = element('strong', target ? 'NWA' : 'Suggest to NWA', 'title');
+      const chevron = element('span', target ? '⌄' : '+', 'chevron'); chevron.setAttribute('aria-hidden', 'true');
+      if (target) {
+        pageNoticeReason = element('span', null, 'reason');
+        const estimate = element('span', null, 'estimate');
+        pageNoticeEstimate = element('span', null, 'estimate-value');
+        estimate.append(element('span', 'Est. ', 'estimate-label'), pageNoticeEstimate);
+        pageNoticeSummary.append(pageNoticeTitle, estimate, pageNoticeReason, chevron);
+        pageNoticeFullReason = element('p', null, 'full-reason');
+        pageNoticeEstimateDetail = element('p', null, 'estimate-detail');
+        pageNoticeDetail.append(element('p', 'This player is on the NWA target list.'), pageNoticeEstimateDetail, pageNoticeFullReason);
+      } else {
+        pageNoticeSummary.append(pageNoticeTitle, chevron);
+        pageNoticeForm = element('form', null, 'quick-form');
+        pageNoticeQuickHeading = element('p', 'Suggest player [' + id + ']');
+        const label = element('label', 'Reason (required)');
+        pageNoticeComment = element('textarea'); pageNoticeComment.required = true; pageNoticeComment.maxLength = 2000; pageNoticeComment.rows = 3;
+        pageNoticeComment.setAttribute('aria-label', 'Reason for suggesting this player'); pageNoticeComment.placeholder = 'Why should this player be added?'; pageNoticeComment.value = pageSuggestion.comment;
+        const commentInput = pageNoticeComment, pageId = id;
+        pageNoticeComment.addEventListener('input', () => {
+          if (!state.suggestionMutation && pageSuggestion.id === pageId) { pageSuggestion.comment = commentInput.value; pageSuggestion.message = ''; updatePageNotice(); }
+        });
+        label.append(pageNoticeComment);
+        pageNoticeSubmit = element('button', 'Send suggestion'); pageNoticeSubmit.type = 'submit';
+        const cancel = element('button', 'Cancel'); cancel.type = 'button';
+        cancel.addEventListener('click', () => { pageNoticeDetails.open = false; pageNoticeSummary.focus?.(); });
+        const actions = element('div', null, 'quick-actions'); actions.append(pageNoticeSubmit, cancel);
+        pageNoticeForm.append(pageNoticeQuickHeading, label, element('p', 'Up to 1,000 characters. Your name and faction are shown to reviewers.', 'quick-help'), actions);
+        pageNoticeForm.addEventListener('submit', event => {
+          event.preventDefault();
+          void submitSuggestion({ type: 'player', targetId: String(pageId), comment: commentInput.value }, true);
+        });
+        pageNoticeFeedback = element('p', null, 'quick-feedback'); pageNoticeFeedback.setAttribute('role', 'status'); pageNoticeFeedback.setAttribute('aria-live', 'polite');
+        pageNoticeDetail.append(pageNoticeForm, pageNoticeFeedback);
+      }
       pageNoticeDetails.append(pageNoticeSummary, pageNoticeDetail); notice.append(pageNoticeDetails);
       noticeRoot.append(style, notice);
+      pageNoticeDetails.addEventListener('toggle', () => {
+        if (!pageNoticeDetails?.open) return;
+        positionPageNotice(C.pageTargetId(window.location?.href));
+        if (pageNoticeMode === 'suggest' && !pageNoticeComment.disabled) pageNoticeComment.focus?.({ preventScroll: true });
+      });
       noticeRoot.addEventListener('keydown', event => {
         if (event.key === 'Escape') { pageNoticeDetails.open = false; pageNoticeSummary.focus(); }
       });
+    }
+    if (!target) {
+      const pending = pageSuggestedIds.has(id);
+      const title = pending ? 'NWA · Suggested' : 'Suggest to NWA';
+      if (pageNoticeTitle.textContent !== title) pageNoticeTitle.textContent = title;
+      pageNoticeSummary.setAttribute('aria-label', (pending ? 'Suggestion submitted for player ' : 'Suggest player ') + id + ' to the NWA target list');
+      if (pageNoticeQuickHeading.textContent !== 'Suggest player [' + id + ']') pageNoticeQuickHeading.textContent = 'Suggest player [' + id + ']';
+      pageNoticeForm.hidden = pending;
+      const busy = Boolean(state.suggestionMutation || state.removingKey);
+      pageNoticeComment.disabled = busy; pageNoticeSubmit.disabled = busy;
+      if (pageNoticeSubmit.textContent !== (busy ? 'Submitting…' : 'Send suggestion')) pageNoticeSubmit.textContent = busy ? 'Submitting…' : 'Send suggestion';
+      const feedback = pageSuggestion.message || (pending ? 'Suggestion submitted. A faction leader or co-leader can review it.' : '');
+      if (pageNoticeFeedback.textContent !== feedback) pageNoticeFeedback.textContent = feedback;
+      pageNoticeFeedback.hidden = !feedback;
+      positionPageNotice(id); observeNoticeArea(id); return;
     }
     const reason = (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || 'No reason provided.';
@@ -1356,25 +1426,42 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
 
-  async function submitSuggestion() {
+  async function submitSuggestion(draft = state.suggestionDraft, fromPage = false) {
     if (!state.token || state.removingKey || state.suggestionMutation) return;
-    const draft = state.suggestionDraft;
+    const report = text => fromPage ? pageSuggestionMessage(text, Number(draft.targetId)) : message(text);
+    if (fromPage && (!pageVisible() || C.pageTargetId(window.location?.href) !== Number(draft.targetId) || !authorizedPoolFresh()
+      || Number(draft.targetId) === state.player?.id || state.targets.some(target => target.id === Number(draft.targetId))
+      || pageSuggestedIds.has(Number(draft.targetId)))) return;
     const targetId = Number(draft.targetId);
     const comment = draft.comment.trim();
     if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(targetId) || targetId > 2147483647) {
-      message('Enter a valid player or faction ID.'); return;
+      report('Enter a valid player or faction ID.'); return;
     }
-    if (!comment || [...comment].length > 1000) { message('Add a reason for this target, up to 1,000 characters.'); return; }
+    if (!comment || [...comment].length > 1000) { report('Add a reason for this target, up to 1,000 characters.'); return; }
     const generation = state.generation;
-    state.suggestionMutation = 'submit'; state.suggestionNotice = ''; message(''); render();
+    const quickWasFocused = fromPage && pageNoticeForm?.contains(pageNoticeForm.getRootNode?.()?.activeElement);
+    state.suggestionMutation = 'submit'; state.suggestionNotice = ''; message('');
+    if (fromPage) pageSuggestionMessage('', targetId);
+    render(); updatePageNotice();
     try {
       await request('POST', '/api/suggestions', { type: draft.type, targetId, comment });
       if (generation !== state.generation) return;
-      state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
+      if (!fromPage) state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
+      if (draft.type === 'player') {
+        if (pageSuggestedIds.size >= 200) pageSuggestedIds.delete(pageSuggestedIds.values().next().value);
+        pageSuggestedIds.add(targetId);
+      }
       state.suggestionNotice = 'Suggestion submitted. A faction leader or co-leader can review it.';
-      await loadSuggestions();
-    } catch (error) { if (generation === state.generation) handleError(error); }
-    finally { if (generation === state.generation) { state.suggestionMutation = null; render(); } }
+      if (fromPage && pageSuggestion.id === targetId) { pageSuggestion.comment = ''; pageSuggestionMessage(state.suggestionNotice, targetId); }
+      if (!fromPage || state.open && state.view === 'suggestions') await loadSuggestions();
+    } catch (error) { if (generation === state.generation) { handleError(error); if (fromPage) pageSuggestionMessage(error.message || 'The suggestion could not be submitted.', targetId); } }
+    finally {
+      if (generation === state.generation) {
+        state.suggestionMutation = null; render(); updatePageNotice();
+        if (quickWasFocused && pageSuggestion.id === targetId && pageNoticeMode === 'suggest' && pageNoticeDetails?.open
+          && (!document.activeElement || document.activeElement === document.body || document.activeElement === pageNotice)) pageNoticeSummary.focus?.({ preventScroll: true });
+      }
+    }
   }
 
   async function reviewSuggestion(id, decision) {

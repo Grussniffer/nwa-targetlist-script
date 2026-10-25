@@ -1998,6 +1998,61 @@ try {
   }
   console.log('PASS sign out during suggestion queue/submission/review cannot restore content or trigger refreshes');
 
+  const quickMobile = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await quickMobile.route('**/*', route => { networkRequests++; return route.abort(); });
+  try {
+    for (const mode of [
+      { label: 'desktop-profile', width: 1280, mobile: false, pda: false, attack: false },
+      { label: 'mobile-attack', width: 390, mobile: true, pda: false, attack: true },
+      { label: 'pda-profile', width: 320, mobile: true, pda: true, attack: false }
+    ]) {
+      const quick = await mount({ width: mode.width, height: mode.mobile ? 844 : 960 }, mode.pda ? [pdaRuntimeSource, source] : [source],
+        mode.mobile ? quickMobile : context, attack => {
+          const content = document.createElement('main'); content.id = 'content-wrapper';
+          content.style.cssText = 'margin:160px 16px 0;width:calc(100% - 32px);padding:0;border:1px solid transparent';
+          content.innerHTML = '<h1>' + (attack ? 'Attacking' : 'Player [999]') + '</h1><p>Unlisted player fixture.</p>';
+          document.body.append(content);
+          window.__quickFlow = content.getBoundingClientRect().height;
+        }, mode.attack, mode.attack ? 'https://www.torn.com/page.php?sid=attack&user2ID=999' : 'https://www.torn.com/profiles.php?XID=999');
+      await login(quick); await shadow(quick, '[aria-label="Close NWA settings"]', 'click');
+      await wait(quick, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'suggest');
+      const before = await quick.evaluate(() => window.__mock.requests.length);
+      const point = await quick.evaluate(() => {
+        const host = document.getElementById('nwa-target-page-notice'), rect = window.__playerNoticeShadow.querySelector('summary').getBoundingClientRect();
+        if (host.getBoundingClientRect().height > 23) throw new Error('Quick action added a content row.');
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      });
+      if (mode.mobile) await quick.touchscreen.tap(point.x, point.y); else await quick.mouse.click(point.x, point.y);
+      await wait(quick, () => window.__playerNoticeShadow.querySelector('details').open);
+      await wait(quick, () => window.__playerNoticeShadow.activeElement === window.__playerNoticeShadow.querySelector('textarea'));
+      assert.equal(await quick.evaluate(() => window.__playerNoticeShadow.activeElement === window.__playerNoticeShadow.querySelector('textarea')), true);
+      await quick.evaluate(() => window.__playerNoticeShadow.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+      assert.equal(await quick.evaluate(() => window.__mock.requests.length), before, 'blank reasons cannot send a request');
+      assert.match(await quick.evaluate(() => window.__playerNoticeShadow.querySelector('.quick-feedback').textContent), /reason/);
+      await quick.evaluate(() => {
+        const input = window.__playerNoticeShadow.querySelector('textarea'); input.value = '  Repeated attacks on alliance members.  '; input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const geometry = await quick.evaluate(() => {
+        const rect = window.__playerNoticeShadow.querySelector('.detail').getBoundingClientRect();
+        return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: innerWidth, height: innerHeight,
+          contentHeight: document.getElementById('content-wrapper').getBoundingClientRect().height, original: window.__quickFlow, documentWidth: document.documentElement.scrollWidth };
+      });
+      assert(geometry.left >= 0 && geometry.right <= geometry.width && geometry.top >= 0 && geometry.bottom <= geometry.height, JSON.stringify(geometry));
+      assert.equal(geometry.contentHeight, geometry.original); assert.equal(geometry.documentWidth, geometry.width);
+      await quick.screenshot({ path: path.join(artifacts, 'browser-quick-suggest-' + mode.label + '.png'), fullPage: true });
+      await quick.evaluate(() => { const form = window.__playerNoticeShadow.querySelector('form'); form.requestSubmit(); form.requestSubmit(); });
+      await wait(quick, () => window.__playerNoticeShadow.querySelector('summary').textContent.includes('Suggested'));
+      const posts = await quick.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions'));
+      assert.equal(posts.length, 1); assert.deepEqual(JSON.parse(posts[0].data), { type: 'player', targetId: 999, comment: 'Repeated attacks on alliance members.' });
+      assert.equal(await quick.evaluate(() => window.__mock.requests.length), before + 1, 'quick submission does not fetch another pool or queue');
+      assert.equal(await quick.evaluate(() => window.__playerNoticeShadow.querySelector('form').hidden), true);
+      await quick.keyboard.press('Escape');
+      await wait(quick, () => !window.__playerNoticeShadow.querySelector('details').open);
+      await quick.close();
+    }
+  } finally { await quickMobile.close(); }
+  console.log('PASS compact profile/attack quick suggestions on desktop, 390px touch and 320px native PDA: mandatory reason, focus, no layout shift, one POST, pending feedback and Escape');
+
   const longNoticeReason = ('Preferred chain target. Repeated attacks against alliance members; inactive for several weeks. '
     + 'Review the saved faction note and check availability before attacking. '.repeat(10)).trim();
   const profileNotice = await mount(undefined, [source], context, reason => {
@@ -2098,12 +2153,12 @@ try {
     history.pushState({}, '', '/profiles.php?XID=999');
     document.getElementById('content-wrapper').querySelector('h1').textContent = 'An unlisted player';
   });
-  await wait(profileNotice, () => !document.getElementById('nwa-target-page-notice'));
+  await wait(profileNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'suggest');
   await profileNotice.evaluate(() => {
     history.pushState({}, '', '/page.php?sid=attack&user2ID=102');
     document.getElementById('content-wrapper').querySelector('h1').textContent = 'Attack Granite [102]';
   });
-  await wait(profileNotice, () => Boolean(document.getElementById('nwa-target-page-notice')));
+  await wait(profileNotice, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'listed');
   assert.match(await profileNotice.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /No reason provided\./);
   // A listed target is identified independently of the viewer's stat filters.
   assert.equal(await profileNotice.evaluate(() => document.querySelectorAll('#nwa-target-page-notice').length), 1);

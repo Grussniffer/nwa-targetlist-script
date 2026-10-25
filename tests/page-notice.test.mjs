@@ -213,9 +213,10 @@ test('blank and missing reasons use legacy notes or a clear missing-reason fallb
   }
 });
 
-test('unlisted players and signed-out users do not display a target note', async () => {
+test('unlisted players show a suggestion action while signed-out users show no target information', async () => {
   const unlisted = fixture('https://www.torn.com/profiles.php?XID=901'); await unlisted.feed();
-  assert.equal(unlisted.notice(), null);
+  assert.equal(unlisted.notice().getAttribute('data-mode'), 'suggest');
+  assert.equal(unlisted.notice().shadow.querySelector('.full-reason'), null);
   const signedOut = fixture('https://www.torn.com/profiles.php?XID=900', { saved: false });
   signedOut.mutation(); signedOut.tick(); assert.equal(signedOut.notice(), null); assert.equal(signedOut.requests.length, 0);
 });
@@ -227,7 +228,7 @@ test('SPA navigation changes the note for the current player and removes it off 
   assert.match(page.noticeText(), /A second player reason\./);
   assert.equal(page.noticeText().includes(target.notes), false);
   page.changeUrl('https://www.torn.com/profiles.php?XID=902'); page.mutation(); page.tick();
-  assert.equal(page.notice(), null);
+  assert.equal(page.notice().getAttribute('data-mode'), 'suggest');
   page.changeUrl('https://www.torn.com/index.php'); page.mutation(); page.tick(); assert.equal(page.notice(), null);
 });
 
@@ -285,7 +286,8 @@ test('a live faction eligibility denial removes the profile notice while preserv
   page.openSettings(); page.control('Check status').emit('click');
   page.response(page.requests.at(-1), { error: { code: 'TARGET_LEFT_FACTION', message: 'This target left its nominated faction.' } }, 403);
   await flush(); page.openSettings(); page.mutation();
-  assert.equal(page.notice(), null);
+  assert.equal(page.notice().getAttribute('data-mode'), 'suggest');
+  assert.equal(page.notice().shadow.querySelector('.full-reason'), null);
   assert.equal(page.storage.get('targetlist.session.https://targetlist.grusmedia.no').token, 'saved-session');
 });
 
@@ -306,7 +308,7 @@ test('a refreshed authorized target feed updates its reason and removes delisted
   const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed();
   page.tick(NOW + 10000); await page.feed([{ ...target, reason: 'Updated approved reason.' }]);
   assert.match(page.noticeText(), /Updated approved reason\./);
-  page.tick(NOW + 20000); await page.feed([]); assert.equal(page.notice(), null);
+  page.tick(NOW + 20000); await page.feed([]); assert.equal(page.notice().getAttribute('data-mode'), 'suggest');
 });
 
 test('sign-out immediately removes the note and an older feed cannot restore it', async () => {
@@ -339,8 +341,8 @@ test('a failed authorization refresh and an expired cached feed cannot continue 
   }
 });
 
-test('ordinary Torn pages and unlisted profiles do not observe body mutations', async () => {
-  for (const url of ['https://www.torn.com/index.php', 'https://www.torn.com/profiles.php?XID=901']) {
+test('ordinary Torn pages do not observe body mutations', async () => {
+  for (const url of ['https://www.torn.com/index.php']) {
     const page = fixture(url); await page.feed();
     assert.equal(page.observers.some(observer => observer.active), false);
     page.openSettings(); assert.ok(page.control('Find target'), 'settings still open immediately without an observer');
@@ -361,4 +363,81 @@ test('a listed player observes its notice area with shallow ancestor remount det
   await page.feed(); assert.ok(page.notice());
   page.changeUrl('https://www.torn.com/index.php');
   assert.equal(page.observers.some(value => value.active), false); assert.equal(page.notice(), null);
+});
+
+
+test('unlisted profile and attack pages offer a compact quick suggestion with a mandatory reason', async () => {
+  for (const url of ['https://www.torn.com/profiles.php?XID=900', 'https://www.torn.com/page.php?sid=attack&user2ID=900']) {
+    const page = fixture(url); await page.feed([]);
+    assert.ok(page.notice()); assert.equal(page.notice().getAttribute('data-mode'), 'suggest');
+    assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
+    assert.equal(page.requests.length, 1, 'viewing an unlisted player does not perform another lookup');
+    const form = page.notice().shadow.querySelector('form'); form.emit('submit'); await flush();
+    assert.equal(page.requests.length, 1, 'a reason is required');
+    const comment = form.querySelector('textarea'); comment.value = 'Repeated attacks on members.'; comment.emit('input');
+    form.emit('submit'); form.emit('submit'); await flush();
+    assert.equal(page.requests.length, 2, 'only one mutation can be in flight');
+    const request = page.requests.at(-1); assert.equal(request.method, 'POST');
+    assert.ok(request.url.endsWith('/api/suggestions'));
+    assert.deepEqual(JSON.parse(request.data), { type: 'player', targetId: 900, comment: 'Repeated attacks on members.' });
+    page.response(request, { suggestion: { id: 'new-suggestion', status: 'pending' } }, 201); await flush();
+    assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggested/);
+    assert.match(page.noticeText(), /review/);
+    assert.equal(page.requests.length, 2, 'a closed settings panel needs no queue lookup');
+  }
+});
+
+
+test('quick suggestions are absent for self, listed players, missing authorization and stale feeds', async () => {
+  const self = fixture('https://www.torn.com/profiles.php?XID=123'); await self.feed([]); assert.equal(self.notice(), null);
+  const listed = fixture('https://www.torn.com/profiles.php?XID=900'); await listed.feed();
+  assert.equal(listed.notice().shadow.querySelector('form'), null);
+  const stale = fixture('https://www.torn.com/profiles.php?XID=900'); await stale.feed([]);
+  assert.equal(stale.notice().getAttribute('data-mode'), 'suggest');
+  stale.tick(NOW + 120001); assert.equal(stale.notice(), null);
+});
+
+test('quick suggestion failures retain the reason and login, while revocation removes the action', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed([]);
+  let form = page.notice().shadow.querySelector('form');
+  const input = form.querySelector('textarea'); input.value = 'My reason'; input.emit('input'); form.emit('submit');
+  page.response(page.requests.at(-1), { error: { code: 'FRIENDLY_TARGET', message: 'This player belongs to a protected faction.' } }, 403); await flush();
+  assert.equal(page.notice().shadow.querySelector('textarea').value, 'My reason');
+  assert.match(page.notice().shadow.querySelector('.quick-feedback').textContent, /protected faction/);
+  assert.ok(page.storage.get('targetlist.session.https://targetlist.grusmedia.no'));
+  form.emit('submit');
+  page.response(page.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Sign in again.' } }, 401); await flush();
+  assert.equal(page.notice(), null);
+});
+
+test('SPA navigation cannot submit a stale player form or apply an old response to a new draft', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed([]);
+  const form = page.notice().shadow.querySelector('form'); form.querySelector('textarea').value = 'Reason for 900'; form.emit('submit');
+  const mutation = page.requests.at(-1);
+  page.changeUrl('https://www.torn.com/profiles.php?XID=902'); page.mutation(); page.tick();
+  const next = page.notice().shadow.querySelector('textarea'); next.value = 'Reason for 902'; next.emit('input');
+  page.response(mutation, { suggestion: { status: 'pending' } }, 201); await flush();
+  assert.equal(page.notice().shadow.querySelector('textarea').value, 'Reason for 902');
+  assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
+  const before = page.requests.length; form.emit('submit'); await flush(); assert.equal(page.requests.length, before);
+  page.notice().shadow.querySelector('form').emit('submit');
+  assert.equal(JSON.parse(page.requests.at(-1).data).targetId, 902);
+});
+
+
+test('quick suggestions leave an unfinished main-panel draft unchanged', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900'); await page.feed([]);
+  page.openSettings(); page.control('Suggestions').emit('click');
+  page.response(page.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+  const root = page.document.getElementById('torn-targetlist-host').shadow;
+  let main = root.querySelector('.suggestionform');
+  const id = main.querySelector('input'); id.value = '777'; id.emit('input');
+  const draft = main.querySelector('textarea'); draft.value = 'Unfinished reason for another player'; draft.emit('input');
+  const quick = page.notice().shadow.querySelector('form'); quick.querySelector('textarea').value = 'Profile quick reason'; quick.emit('submit');
+  const mutation = page.requests.at(-1); assert.equal(JSON.parse(mutation.data).comment, 'Profile quick reason');
+  page.response(mutation, { suggestion: { status: 'pending' } }, 201); await flush();
+  page.response(page.requests.at(-1), { canReview: false, suggestions: [], nextOffset: null }); await flush();
+  main = root.querySelector('.suggestionform');
+  assert.equal(main.querySelector('input').value, '777');
+  assert.equal(main.querySelector('textarea').value, 'Unfinished reason for another player');
 });
