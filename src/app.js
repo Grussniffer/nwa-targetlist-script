@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.11.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.12.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -85,7 +85,7 @@ function mountTargetList(platform, storageWarning = '') {
     pendingChecks: new Set(), loading: false, targetGeneration: 0, view: 'targets',
     suggestionView: 'pending', suggestions: [], nextSuggestionOffset: null, canReview: false,
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '',
-    pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
+    pendingSuggestionDetailsSupported: false, pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
   let exportSnapshot = null, exportView = null;
@@ -276,7 +276,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function clearSession() {
     const clearedToken = state.token;
-    pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' };
+    pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' }; pagePendingDetails = null; state.pendingSuggestionDetailsSupported = false;
     state.pendingSuggestionEpoch++; state.pendingSuggestions = { status: 'unsupported', revision: null, playerIds: [] }; state.pendingPlayerIds.clear();
     cancelFind(); state.findAfterLogin = false;
     clearExport();
@@ -512,12 +512,47 @@ function mountTargetList(platform, storageWarning = '') {
   let pageNoticeObserver = null, pageNoticeTimer = null, pageNoticeAnchor = null, pageNoticeResizeObserver = null;
   let pageNoticeObservedArea = null, pageNoticeMode = null;
   let pageNoticeForm = null, pageNoticeComment = null, pageNoticeSubmit = null, pageNoticeFeedback = null, pageNoticeTitle = null, pageNoticeQuickHeading = null;
-  let pageSuggestion = { id: null, comment: '', message: '' };
+  let pageSuggestion = { id: null, comment: '', message: '' }, pagePendingDetails = null;
+  let pageNoticePendingInfo = null, pageNoticePendingAuthor = null, pageNoticePendingReason = null, pageNoticePendingMessage = null, pageNoticePendingRetry = null;
   const pageSuggestedIds = new Set();
   function pageSuggestionMessage(text, id) {
     if (id !== pageSuggestion.id || C.pageTargetId(window.location?.href) !== id) return;
     pageSuggestion.message = text; updatePageNotice();
   }
+  function loadPagePendingDetails(id, force = false) {
+    if (!state.pendingSuggestionDetailsSupported || !state.pendingPlayerIds.has(id) || !pageNoticeDetails?.open) return;
+    const previous = pagePendingDetails;
+    if (!force && previous?.id === id && previous.epoch === state.pendingSuggestionEpoch
+      && (previous.status === 'loading' || Date.now() - previous.loadedAt < 60000)) return;
+    const generation = state.generation, entry = { id, epoch: state.pendingSuggestionEpoch, status: 'loading', loadedAt: Date.now() };
+    pagePendingDetails = entry;
+    const current = () => !disposed && pagePendingDetails === entry && generation === state.generation
+      && entry.epoch === state.pendingSuggestionEpoch && C.pageTargetId(window.location?.href) === id && state.pendingPlayerIds.has(id);
+    void (async () => {
+      try {
+        const data = await request('GET', '/api/suggestions/players/' + id + '/pending', undefined, state.token, 5000);
+        if (!current()) return;
+        if (!data || !Object.hasOwn(data, 'suggestion')) throw new Error('Invalid suggestion details.');
+        const row = data.suggestion;
+        if (row === null) { entry.status = 'gone'; void loadTargets(true, false, true); return; }
+        if (row.type !== 'player' || row.status !== 'pending' || row.targetId !== id || typeof row.comment !== 'string'
+          || !row.comment.trim() || row.comment.length > 1000 || !Number.isSafeInteger(row.suggestedBy?.id)
+          || row.suggestedBy.id <= 0 || row.suggestedBy.id > 2147483647 || typeof row.suggestedBy.name !== 'string'
+          || !row.suggestedBy.name.trim() || row.suggestedBy.name.length > 1000) throw new Error('Invalid suggestion details.');
+        entry.status = 'ready'; entry.suggestion = row; entry.loadedAt = Date.now();
+      } catch (error) {
+        if (!current()) return;
+        entry.status = 'error'; entry.loadedAt = Date.now();
+        if (error.status === 401 || error.status === 403) handleError(error);
+      } finally {
+        if (pagePendingDetails === entry) {
+          if (!current()) pagePendingDetails = null;
+          updatePageNotice();
+        }
+      }
+    })();
+  }
+
   function observeNoticeArea(id) {
     if (typeof MutationObserver !== 'function') return;
     const area = id && pageVisible() ? pageNoticeAnchor?.parentElement
@@ -535,6 +570,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function removePageNotice() {
     pageNotice?.remove(); pageNoticeResizeObserver?.disconnect(); pageNoticeAnchor = null;
+    pageNoticePendingInfo = null; pageNoticePendingAuthor = null; pageNoticePendingReason = null; pageNoticePendingMessage = null; pageNoticePendingRetry = null;
     pageNoticeMode = null; pageNoticeForm = null; pageNoticeComment = null; pageNoticeSubmit = null; pageNoticeFeedback = null; pageNoticeTitle = null; pageNoticeQuickHeading = null;
     pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
     pageNoticeEstimate = null; pageNoticeEstimateDetail = null; pageNoticeDetail = null; pageNoticeDetails = null;
@@ -678,7 +714,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (pageNoticeMode !== mode) removePageNotice();
     if (pageSuggestion.id !== id) {
       removePageNotice();
-      pageSuggestion = { id, comment: '', message: '' };
+      pageSuggestion = { id, comment: '', message: '' }; pagePendingDetails = null;
     }
     observeNoticeArea(id);
     if (!pageNotice) {
@@ -704,6 +740,7 @@ function mountTargetList(platform, storageWarning = '') {
         .detail{position:absolute;z-index:2147483001;top:calc(100% + 4px);left:0;max-height:min(200px,40vh);overflow:auto;padding:8px;border:1px solid #52525b;border-radius:4px;background:#18181b;color:#e4e4e7;font-size:11px;line-height:1.4;overflow-wrap:anywhere;box-shadow:0 4px 12px #0004}
         p{margin:0}.full-reason,.estimate-detail{margin-top:4px;white-space:pre-wrap}
         :host([data-mode="suggest"]) .title{font-size:10px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+        .pending-info{display:grid;gap:5px;margin-top:7px}.pending-author{color:#c7d6a7}.pending-reason{white-space:pre-wrap}
         .quick-form{display:grid;gap:7px}.quick-form label{display:grid;gap:4px;font-weight:600}
         textarea{display:block;width:100%;min-height:64px;resize:vertical;max-height:130px;border:1px solid #52525b;border-radius:4px;background:#27272a;color:#f4f4f5;padding:6px;font:12px/1.4 Arial,Helvetica,sans-serif}
         textarea:focus-visible,button:focus-visible{outline:2px solid #9fbd57;outline-offset:2px}
@@ -748,13 +785,20 @@ function mountTargetList(platform, storageWarning = '') {
           void submitSuggestion({ type: 'player', targetId: String(pageId), comment: commentInput.value }, true);
         });
         pageNoticeFeedback = element('p', null, 'quick-feedback'); pageNoticeFeedback.setAttribute('role', 'status'); pageNoticeFeedback.setAttribute('aria-live', 'polite');
-        pageNoticeDetail.append(pageNoticeForm, pageNoticeFeedback);
+        pageNoticePendingInfo = element('div', null, 'pending-info'); pageNoticePendingInfo.hidden = true;
+        pageNoticePendingAuthor = element('a', null, 'pending-author'); pageNoticePendingAuthor.setAttribute('target', '_blank'); pageNoticePendingAuthor.setAttribute('rel', 'noopener noreferrer');
+        pageNoticePendingReason = element('p', null, 'pending-reason');
+        pageNoticePendingMessage = element('p', null, 'pending-message'); pageNoticePendingMessage.setAttribute('role', 'status'); pageNoticePendingMessage.setAttribute('aria-live', 'polite');
+        pageNoticePendingRetry = element('button', 'Retry details'); pageNoticePendingRetry.type = 'button';
+        pageNoticePendingRetry.addEventListener('click', () => { loadPagePendingDetails(pageSuggestion.id, true); updatePageNotice(); });
+        pageNoticePendingInfo.append(pageNoticePendingAuthor, pageNoticePendingReason, pageNoticePendingMessage, pageNoticePendingRetry);
+        pageNoticeDetail.append(pageNoticeForm, pageNoticeFeedback, pageNoticePendingInfo);
       }
       pageNoticeDetails.append(pageNoticeSummary, pageNoticeDetail); notice.append(pageNoticeDetails);
       noticeRoot.append(style, notice);
       pageNoticeDetails.addEventListener('toggle', () => {
         if (!pageNoticeDetails?.open) return;
-        positionPageNotice(C.pageTargetId(window.location?.href));
+        updatePageNotice();
         if (pageNoticeMode === 'suggest' && !pageNoticeForm.hidden && !pageNoticeComment.disabled) pageNoticeComment.focus?.({ preventScroll: true });
       });
       noticeRoot.addEventListener('keydown', event => {
@@ -780,6 +824,25 @@ function mountTargetList(platform, storageWarning = '') {
         : pageSuggestion.message || (state.pendingSuggestions.status === 'unsupported' ? 'Check Suggestions in NWA for existing requests before submitting.' : '');
       if (pageNoticeFeedback.textContent !== feedback) pageNoticeFeedback.textContent = feedback;
       pageNoticeFeedback.hidden = !feedback;
+      pageNoticePendingInfo.hidden = !sharedPending;
+      if (sharedPending) {
+        loadPagePendingDetails(id);
+        const details = pagePendingDetails?.id === id ? pagePendingDetails : null, ready = details?.status === 'ready';
+        pageNoticePendingAuthor.hidden = !ready; pageNoticePendingReason.hidden = !ready;
+        pageNoticePendingRetry.hidden = details?.status !== 'error';
+        const text = !state.pendingSuggestionDetailsSupported ? 'Submitter and reason are not available on this server yet.'
+          : details?.status === 'error' ? 'Could not load suggestion details. Try again.'
+          : details?.status === 'gone' ? 'This suggestion is no longer pending. Updating NWA...'
+          : ready ? '' : 'Loading suggestion details...';
+        if (pageNoticePendingMessage.textContent !== text) pageNoticePendingMessage.textContent = text;
+        pageNoticePendingMessage.hidden = !text;
+        if (ready) {
+          const row = details.suggestion, author = 'Suggested by: ' + row.suggestedBy.name + ' [' + row.suggestedBy.id + ']';
+          if (pageNoticePendingAuthor.textContent !== author) pageNoticePendingAuthor.textContent = author;
+          pageNoticePendingAuthor.setAttribute('href', 'https://www.torn.com/profiles.php?XID=' + row.suggestedBy.id);
+          if (pageNoticePendingReason.textContent !== 'Reason: ' + row.comment) pageNoticePendingReason.textContent = 'Reason: ' + row.comment;
+        }
+      }
       positionPageNotice(id); observeNoticeArea(id); return;
     }
     const reason = (typeof target.reason === 'string' && target.reason.trim())
@@ -850,6 +913,7 @@ function mountTargetList(platform, storageWarning = '') {
           try {
             state.pendingSuggestions = C.applyPendingSuggestions(data.pendingSuggestions === undefined && data.capabilities?.pendingSuggestions ? { unavailable: true } : data.pendingSuggestions, state.pendingSuggestions);
             state.pendingPlayerIds = new Set(state.pendingSuggestions.playerIds);
+            if (pagePendingDetails && !state.pendingPlayerIds.has(pagePendingDetails.id)) pagePendingDetails = null;
             if (state.pendingSuggestions.status === 'ready') {
               pageSuggestedIds.clear();
               if (previouslyPending && !state.pendingPlayerIds.has(pageSuggestion.id)) pageSuggestion.message = '';
@@ -861,6 +925,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.player = data.player; state.targets = feed.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
         state.reservationsSupported = data.reservations?.supported === true;
         state.nextTargetSupported = data.capabilities?.nextTarget === true;
+        state.pendingSuggestionDetailsSupported = data.capabilities?.pendingSuggestionDetails === true;
         state.backendNotice = data.capabilities?.schema?.status === 'incompatible' ? 'Backend database update required. Contact the NWA administrator.'
           : !state.nextTargetSupported ? 'Backend update available for faster target selection.' : '';
         state.feedFailures = 0; state.nextFeedAt = 0;

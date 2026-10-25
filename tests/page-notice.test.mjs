@@ -142,7 +142,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   function shortTimeouts() { for (const [id, entry] of [...timeouts]) if (entry.delay < 1000) { timeouts.delete(id); entry.callback(); } }
   function mutation() { for (const observer of observers) if (observer.active) observer.callback([{ target: content || body }]); shortTimeouts(); }
   function response(request, data, status = 200) { assert.ok(request, 'an expected request exists'); request.onload({ status, responseText: JSON.stringify(data), finalUrl: request.url }); }
-  async function feed(targets = [target], pendingSuggestions) { response(requests.at(-1), { player, targets, pendingSuggestions, warnings: [], generatedAt: new Date(now).toISOString() }); await flush(); shortTimeouts(); }
+  async function feed(targets = [target], pendingSuggestions, capabilities) { response(requests.at(-1), { player, targets, pendingSuggestions, capabilities, warnings: [], generatedAt: new Date(now).toISOString() }); await flush(); shortTimeouts(); }
   function control(label) { const root = document.getElementById('torn-targetlist-host').shadow; const button = all(root).find(node => node.tagName === 'BUTTON' && node.textContent === label); assert.ok(button, `button ${label} exists`); return button; }
   function notice() { return document.getElementById('nwa-target-page-notice'); }
   function noticeText() { return notice()?.shadow?.textContent || notice()?.textContent || ''; }
@@ -485,4 +485,68 @@ test('an old pending heartbeat cannot erase a just-submitted local suggestion', 
   page.tick(NOW + 30000); await page.feed([], { revision: 'c'.repeat(64), playerIds: [] });
   assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
   assert.equal(page.notice().shadow.querySelector('.quick-feedback').textContent, '');
+});
+
+
+const pendingRow = { type: 'player', status: 'pending', targetId: 900, comment: 'Repeated attacks. <b>Keep this literal</b> _reason_', suggestedBy: { id: 77, name: 'Other_Member' } };
+function openPending(page) { const details = page.notice().shadow.querySelector('details'); details.open = true; details.emit('toggle'); return details; }
+
+test('pending notice lazily loads submitter and full plain-text reason and reuses a recent detail response', async () => {
+  for (const url of ['https://www.torn.com/profiles.php?XID=900', 'https://www.torn.com/page.php?sid=attack&user2ID=900']) {
+    const page = fixture(url); await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] }, { pendingSuggestionDetails: true });
+    assert.equal(page.requests.length, 1); const details = openPending(page); assert.equal(page.requests.length, 2);
+    assert.equal(new URL(page.requests.at(-1).url).pathname, '/api/suggestions/players/900/pending');
+    details.emit('toggle'); assert.equal(page.requests.length, 2, 'an in-flight read is shared');
+    page.response(page.requests.at(-1), { suggestion: pendingRow }); await flush();
+    assert.equal(page.notice().shadow.querySelector('.pending-author').textContent, 'Suggested by: Other_Member [77]');
+    assert.equal(page.notice().shadow.querySelector('.pending-author').getAttribute('href'), 'https://www.torn.com/profiles.php?XID=77');
+    assert.equal(page.notice().shadow.querySelector('.pending-reason').textContent, 'Reason: ' + pendingRow.comment);
+    assert.equal(page.notice().shadow.querySelector('.pending-reason').children.length, 0, 'untrusted reasons are never HTML');
+    details.open = false; details.emit('toggle'); details.open = true; details.emit('toggle'); assert.equal(page.requests.length, 2);
+    assert.equal(page.notice().shadow.querySelector('form').hidden, true);
+  }
+});
+
+test('failed or malformed pending detail reads preserve the pending badge and offer an explicit retry', async () => {
+  for (const malformed of [false, true]) {
+    const page = fixture('https://www.torn.com/profiles.php?XID=900');
+    await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] }, { pendingSuggestionDetails: true }); openPending(page);
+    page.response(page.requests.at(-1), malformed ? { suggestion: { ...pendingRow, targetId: 901 } } : { error: { code: 'SUGGESTIONS_UNAVAILABLE', message: 'Unavailable' } }, malformed ? 200 : 503); await flush();
+    assert.match(page.notice().shadow.querySelector('summary').textContent, /Pending/);
+    assert.equal(page.notice().shadow.querySelector('form').hidden, true);
+    const retry = page.notice().shadow.querySelector('.pending-info').querySelector('button'); assert.equal(retry.hidden, false);
+    retry.emit('click'); assert.equal(page.requests.length, 3); page.response(page.requests.at(-1), { suggestion: pendingRow }); await flush();
+    assert.equal(page.notice().shadow.querySelector('.pending-author').hidden, false);
+  }
+});
+
+test('a pending detail response cannot follow the user to another profile or reappear after review', async () => {
+  for (const navigation of [false, true]) {
+    const page = fixture('https://www.torn.com/profiles.php?XID=900');
+    await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] }, { pendingSuggestionDetails: true }); openPending(page); const late = page.requests.at(-1);
+    if (navigation) page.changeUrl('https://www.torn.com/profiles.php?XID=901');
+    else { page.tick(NOW + 10000); await page.feed([], { revision: 'b'.repeat(64), playerIds: [] }, { pendingSuggestionDetails: true }); }
+    page.response(late, { suggestion: pendingRow }); await flush();
+    assert.equal(page.noticeText().includes('Other_Member'), false); assert.equal(page.notice().shadow.querySelector('.pending-info').hidden, true);
+  }
+});
+
+test('a reviewed suggestion detail response refreshes the normal feed without inviting a duplicate', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900');
+  await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] }, { pendingSuggestionDetails: true }); openPending(page);
+  page.response(page.requests.at(-1), { suggestion: null }); await flush();
+  assert.equal(new URL(page.requests.at(-1).url).pathname, '/api/targets'); assert.equal(page.notice().shadow.querySelector('form').hidden, true);
+  await page.feed([], { revision: 'b'.repeat(64), playerIds: [] }, { pendingSuggestionDetails: true });
+  assert.match(page.notice().shadow.querySelector('summary').textContent, /Suggest to NWA/);
+});
+
+
+test('signing out discards pending author details and ignores an in-flight detail response', async () => {
+  const page = fixture('https://www.torn.com/profiles.php?XID=900');
+  await page.feed([], { revision: 'a'.repeat(64), playerIds: [900] }, { pendingSuggestionDetails: true });
+  openPending(page); const late = page.requests.at(-1);
+  page.openSettings(); page.control('Sign out and remove key').emit('click');
+  const removal = page.requests.at(-1); assert.equal(removal.method, 'DELETE');
+  page.response(removal, null, 204); await flush(); page.response(late, { suggestion: pendingRow }); await flush();
+  assert.equal(page.notice(), null); assert.equal(page.body.textContent.includes('Other_Member'), false); assert.equal(page.storage.size, 0);
 });

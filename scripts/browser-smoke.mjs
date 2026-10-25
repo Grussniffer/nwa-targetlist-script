@@ -179,7 +179,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           window.__mock.feedSnapshots.set(cursor, snapshot);
         } else data.targets = snapshot;
         if (window.__mock.pendingPlayers !== undefined) {
-          data.capabilities = { ...data.capabilities, pendingSuggestions: true };
+          data.capabilities = { ...data.capabilities, pendingSuggestions: true, pendingSuggestionDetails: true };
           if (window.__mock.pendingPlayers === null) data.pendingSuggestions = { unavailable: true };
           else {
             const playerIds = [...new Set(window.__mock.pendingPlayers)].sort((a, b) => a - b), key = JSON.stringify(playerIds);
@@ -220,6 +220,10 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         data = { id, faction: { id: 77001, name: 'Mock Target Faction' }, checkedAt: new Date(Date.now()).toISOString(),
           status: { state: id === 102 ? 'Hospital' : 'Okay', description: id === 102 ? 'In hospital (mock)' : 'Okay (mock)',
             until: id === 102 ? Math.floor(Date.now() / 1000) + 1200 : null } };
+      } else if (url.pathname.startsWith('/api/suggestions/players/') && request.method === 'GET') {
+        const targetId = Number(url.pathname.split('/')[4]);
+        data = { suggestion: window.__mock.pendingPlayers?.includes(targetId) ? { type: 'player', status: 'pending', targetId,
+          comment: 'Repeated attacks on alliance members. Full _reason_ with <b>literal text</b>.', suggestedBy: { id: 4242, name: 'Pending_Member' } } : null };
       } else if (url.pathname === '/api/suggestions' && request.method === 'GET') {
         const offset = Number(url.searchParams.get('offset') || 0);
         const view = url.searchParams.get('view');
@@ -2079,6 +2083,13 @@ try {
     assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('form').hidden), true);
     assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.quick-feedback').textContent), /already has a pending suggestion/);
     assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('summary').getAttribute('aria-label')), /Pending NWA suggestion/);
+    await wait(shared, () => !window.__playerNoticeShadow.querySelector('.pending-author').hidden);
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.pending-author').textContent), 'Suggested by: Pending_Member [4242]');
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.pending-author').getAttribute('href')), 'https://www.torn.com/profiles.php?XID=4242');
+    assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.pending-reason').textContent), /Full _reason_ with <b>literal text<\/b>/);
+    assert.equal(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.pending-reason').children.length), 0);
+    assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/suggestions/players/999/pending').length), 1);
+
     const geometry = await shared.evaluate(() => ({ badge: document.getElementById('nwa-target-page-notice').getBoundingClientRect().height,
       before: window.__sharedFlow, after: document.getElementById('content-wrapper').getBoundingClientRect().height,
       width: innerWidth, documentWidth: document.documentElement.scrollWidth }));
@@ -2103,8 +2114,8 @@ try {
     await refreshMockFeed(shared);
     await wait(shared, () => document.getElementById('nwa-target-page-notice').getAttribute('data-mode') === 'listed');
     assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /Saved approved reason/);
-    assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path.startsWith('/api/suggestions')).length), 0,
-      'shared pending hints use only the existing target feed');
+    assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/suggestions').length), 0,
+      'pending details never fetch the full suggestion queue');
     await shared.close();
   }
   console.log('PASS shared pending suggestions on desktop profiles/native PDA attacks: compact badge, revision-only refresh, unknown-state handling, rejection, approval, keyboard focus and no extra queue requests');
