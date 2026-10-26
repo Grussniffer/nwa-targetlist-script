@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.12.0
+// @version      0.13.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -383,7 +383,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.12.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.13.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -468,7 +468,8 @@ function mountTargetList(platform, storageWarning = '') {
     finding: false, findGeneration: 0, findAfterLogin: false,
     pendingChecks: new Set(), loading: false, targetGeneration: 0, view: 'targets',
     suggestionView: 'pending', suggestions: [], nextSuggestionOffset: null, canReview: false,
-    suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '',
+    suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '', removalSupported: false, removalOpen: false,
+    removalDraft: { type: 'player', targetId: '', reason: '', confirm: false },
     pendingSuggestionDetailsSupported: false, pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
@@ -535,7 +536,7 @@ function mountTargetList(platform, storageWarning = '') {
     .footnote{margin-top:14px;font-size:11px;color:var(--muted)}.pool-footer{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:10px;color:var(--muted)}.pool-warnings{color:#efd49a;font-size:11px;overflow-wrap:anywhere}.pool-warnings p{margin:8px 0}
     .tabs{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0;border-bottom:1px solid var(--line)}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:7px 0;background:transparent;color:var(--muted);font-size:12px}.tabs button[aria-pressed=true]{border-bottom-color:var(--accent);color:var(--text)}
     .suggestionform{display:grid;gap:12px;margin:14px 0 20px}.suggestionfields{display:grid;grid-template-columns:140px 1fr;gap:10px}
-    .suggestionform input,.suggestionform select,.suggestionform textarea{display:block;width:100%;margin-top:5px}.suggestionform textarea{resize:vertical;min-height:84px}
+    .suggestionform input,.suggestionform select,.suggestionform textarea{display:block;width:100%;margin-top:5px}.suggestionform textarea{resize:vertical;min-height:84px}.removal-confirm{display:flex;align-items:flex-start;gap:8px}.removalform input[type="checkbox"]{display:inline-block;flex:0 0 auto;width:auto;min-height:0;margin-top:3px}.removal-confirm span{flex:1}
     .success{background:#293e31;color:#c4e8d1;padding:10px 12px;border-radius:7px;margin:12px 0;font-size:12px}
     .comment{white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;font-size:12px;color:var(--text)}.queueheader{display:flex;align-items:center;justify-content:space-between;gap:10px}
     .queueheader h3{font-size:16px}.queuefooter{margin-top:12px}.suggestioncard .actions button{padding:6px 10px}.suggestioncard .name{overflow-wrap:anywhere}
@@ -672,6 +673,7 @@ function mountTargetList(platform, storageWarning = '') {
     state.pendingChecks.clear(); state.busy = false; state.loading = false; state.targetGeneration++; state.expiresAt = null;
     state.removingKey = false;
     state.view = 'targets'; state.suggestionView = 'pending'; state.suggestions = []; state.nextSuggestionOffset = null;
+    state.removalSupported = false; state.removalOpen = false; state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
     persist(() => {
@@ -701,7 +703,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (authStatus && confirmed) {
       if (restoreNewerSession()) return;
       clearSession(); toggle(true); render();
-    } else if (authStatus && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'REVIEW_NOT_ALLOWED'].includes(error.code)) {
+    } else if (authStatus && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'PLAYER_NOT_FOUND', 'REVIEW_NOT_ALLOWED'].includes(error.code)) {
       // An ambiguous proxy/service denial cannot prove that the saved token
       // expired. Hide protected data but keep the credential for a later retry.
       state.authorizedPool = false; state.targets = []; clearExport(); updatePageNotice(); render();
@@ -1310,6 +1312,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.reservationsSupported = data.reservations?.supported === true;
         state.nextTargetSupported = data.capabilities?.nextTarget === true;
         state.pendingSuggestionDetailsSupported = data.capabilities?.pendingSuggestionDetails === true;
+        state.removalSupported = data.capabilities?.targetRemoval === true;
         state.backendNotice = data.capabilities?.schema?.status === 'incompatible' ? 'Backend database update required. Contact the NWA administrator.'
           : !state.nextTargetSupported ? 'Backend update available for faster target selection.' : '';
         state.feedFailures = 0; state.nextFeedAt = 0;
@@ -1577,6 +1580,28 @@ function mountTargetList(platform, storageWarning = '') {
           && (!document.activeElement || document.activeElement === document.body || document.activeElement === pageNotice)) pageNoticeSummary.focus?.({ preventScroll: true });
       }
     }
+  }
+
+  async function removeTargetsFromList() {
+    if (!state.token || !state.canReview || !state.removalSupported || state.suggestionMutation || state.removingKey) return;
+    const draft = state.removalDraft, id = Number(draft.targetId), reason = draft.reason.trim();
+    if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(id)
+      || id > 2147483647 || !reason || [...reason].length > 1000 || !draft.confirm) { message('Choose a player or faction, provide a reason and confirm removal.'); return; }
+    const generation = state.generation; cancelFind(); state.suggestionMutation = 'remove'; message(''); render();
+    try {
+      const result = await request('POST', '/api/targets/remove', { type: draft.type, targetId: id, reason, confirm: true });
+      if (generation !== state.generation) return;
+      if (result.type !== draft.type || result.targetId !== id || !Array.isArray(result.removedIds) || result.removedCount !== result.removedIds.length
+        || new Set(result.removedIds).size !== result.removedIds.length || draft.type === 'player' && result.removedIds.some(value => value !== id)
+        || result.removedIds.length > 5000 || result.removedIds.some(value => !Number.isSafeInteger(value) || value <= 0 || value > 2147483647)) throw new Error('Removal result could not be verified. Refresh the list before trying again.');
+      const removed = new Set(result.removedIds); state.targetGeneration++; state.targets = state.targets.filter(row => !removed.has(row.id));
+      state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
+      state.suggestionNotice = 'Removed ' + result.removedCount + ' player(s) from the shared NWA list.' + (result.warnings?.length ? ' ' + result.warnings.join(' ') : '');
+      render(); updatePageNotice(); await loadTargets(true, false, true);
+    } catch (error) {
+      if (generation !== state.generation) return;
+      state.removalDraft.confirm = false; handleError(error); void loadTargets(true, false, true);
+    } finally { if (generation === state.generation) { state.suggestionMutation = null; render(); } }
   }
 
   async function reviewSuggestion(id, decision) {
@@ -1852,10 +1877,34 @@ function mountTargetList(platform, storageWarning = '') {
     renderSuggestionContent();
     restoreFocus(focus, suggestionContainer);
   }
+  function removalControls() {
+    const details = element('details'); details.open = state.removalOpen;
+    details.append(element('summary', 'Remove targets (leaders only)'));
+    details.addEventListener('toggle', () => { state.removalOpen = details.open; });
+    if (!state.removalSupported) { details.append(element('p', 'Update the NWA backend to enable target removal.', 'notice')); return details; }
+    const form = element('form', null, 'suggestionform removalform'), busy = Boolean(state.suggestionMutation || state.removingKey);
+    const typeLabel = element('label', 'Remove'), type = focusKey(element('select'), 'removal:type');
+    for (const value of ['player', 'faction']) { const option = element('option', value === 'player' ? 'Player' : 'Entire faction'); option.value = value; type.append(option); }
+    type.value = state.removalDraft.type; type.disabled = busy;
+    type.addEventListener('change', () => { state.removalDraft.type = type.value; }); typeLabel.append(type);
+    const idLabel = element('label', 'Player or faction ID'), id = focusKey(element('input'), 'removal:id'); id.type = 'number'; id.min = '1'; id.max = '2147483647'; id.required = true;
+    id.setAttribute('aria-label', 'Remove player or faction ID'); id.value = state.removalDraft.targetId; id.disabled = busy;
+    id.addEventListener('input', () => { state.removalDraft.targetId = id.value; }); idLabel.append(id);
+    const reasonLabel = element('label', 'Removal reason'), reason = focusKey(element('textarea'), 'removal:reason'); reason.required = true; reason.maxLength = 1000; reason.rows = 2;
+    reason.setAttribute('aria-label', 'Reason for removing targets'); reason.value = state.removalDraft.reason; reason.disabled = busy;
+    reason.addEventListener('input', () => { state.removalDraft.reason = reason.value; }); reasonLabel.append(reason);
+    const confirmation = element('label', null, 'removal-confirm'), confirm = focusKey(element('input'), 'removal:confirm'); confirm.type = 'checkbox'; confirm.required = true; confirm.checked = state.removalDraft.confirm; confirm.disabled = busy;
+    confirm.setAttribute('aria-label', 'Confirm shared target removal'); confirm.addEventListener('change', () => { state.removalDraft.confirm = confirm.checked; });
+    confirmation.append(confirm, element('span', 'I confirm removal from the shared NWA list. Faction removal includes individual additions and all players associated with that faction.'));
+    const submit = focusKey(element('button', state.suggestionMutation === 'remove' ? 'Removing...' : 'Remove targets'), 'removal:submit'); submit.type = 'submit'; submit.disabled = busy;
+    form.append(typeLabel, idLabel, reasonLabel, confirmation, submit); form.addEventListener('submit', event => { event.preventDefault(); void removeTargetsFromList(); });
+    details.append(form); return details;
+  }
+
   function renderSuggestionContent() {
     if (!state.open || !suggestionContainer) return;
     const signature = JSON.stringify([state.suggestions, state.canReview, state.suggestionView, state.suggestionsLoading,
-      state.suggestionMutation, state.suggestionNotice, state.nextSuggestionOffset]);
+      state.suggestionMutation, state.suggestionNotice, state.nextSuggestionOffset, state.removalSupported]);
     if (signature === suggestionSignature) return;
     suggestionSignature = signature; suggestionContainer.replaceChildren();
     suggestionContainer.append(element('p', 'Suggest a player or faction for the shared target pool. Every suggestion needs a reason.', 'notice'));
@@ -1874,6 +1923,7 @@ function mountTargetList(platform, storageWarning = '') {
     const submit = focusKey(element('button', state.suggestionMutation === 'submit' ? 'Submitting…' : 'Submit suggestion', 'primary'), 'suggestion:submit'); submit.type = 'submit'; submit.disabled = Boolean(state.suggestionMutation);
     form.addEventListener('submit', event => { event.preventDefault(); void submitSuggestion(); });
     form.append(fields, commentLabel, submit); suggestionContainer.append(form);
+    if (state.canReview) suggestionContainer.append(removalControls());
     if (state.suggestionNotice) { const notice = element('div', state.suggestionNotice, 'success'); notice.setAttribute('role', 'status'); suggestionContainer.append(notice); }
     const queueHeader = element('div', null, 'queueheader'); queueHeader.append(element('h3', 'Target suggestions'));
     const refresh = focusKey(button(state.suggestionsLoading ? 'Loading…' : 'Refresh suggestions', () => void loadSuggestions()), 'suggestion:refresh'); refresh.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); queueHeader.append(refresh); suggestionContainer.append(queueHeader);

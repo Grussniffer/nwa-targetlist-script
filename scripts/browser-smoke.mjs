@@ -190,6 +190,11 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         }
         if (window.__mock.reservations) data.reservations = window.__mock.reservations;
         if (window.__mock.nextTarget) data.capabilities = { nextTarget: true, requestDeadlineMs: 8000, schema: { status: 'ready', failedChecks: [] } };
+        if (window.__mock.removalEnabled) data.capabilities = { ...data.capabilities, targetRemoval: true };
+      } else if (url.pathname === '/api/targets/remove' && request.method === 'POST') {
+        const body = JSON.parse(request.data), removed = targets.filter(row => body.type === 'player' ? row.id === body.targetId : row.faction?.id === body.targetId);
+        const ids = new Set(removed.map(row => row.id)); targets.splice(0, targets.length, ...targets.filter(row => !ids.has(row.id)));
+        data = { type: body.type, targetId: body.targetId, removedIds: [...ids], removedCount: ids.size };
       } else if (url.pathname === '/api/targets/next' && request.method === 'POST') {
         if (!window.__mock.nextTarget) {
           status = 404; data = { error: { code: 'NOT_FOUND', message: 'Endpoint not found.' } };
@@ -2119,6 +2124,33 @@ try {
     await shared.close();
   }
   console.log('PASS shared pending suggestions on desktop profiles/native PDA attacks: compact badge, revision-only refresh, unknown-state handling, rejection, approval, keyboard focus and no extra queue requests');
+
+  for (const mode of [{label:'desktop',width:1280,pda:false},{label:'pda',width:320,pda:true}]) {
+    const removal = await mount({width:mode.width,height:900},mode.pda?[pdaRuntimeSource,source]:[source],context,()=>{window.__mock.canReview=true;window.__mock.removalEnabled=true;});
+    await login(removal);await openSuggestions(removal);
+    await removal.evaluate(()=>{window.__targetlistShadow.querySelector('.removalform').parentElement.open=true;});
+    await shadow(removal,'[aria-label="Remove player or faction ID"]','fill','101');
+    await shadow(removal,'[aria-label="Reason for removing targets"]','fill','Peace agreement');
+    const before=await removal.evaluate(()=>window.__mock.requests.filter(row=>row.path==='/api/targets/remove').length);
+    await removal.evaluate(()=>window.__targetlistShadow.querySelector('.removalform').requestSubmit());
+    assert.equal(await removal.evaluate(()=>window.__mock.requests.filter(row=>row.path==='/api/targets/remove').length),before,'unchecked confirmation cannot remove targets');
+    await removal.evaluate(()=>{const box=window.__targetlistShadow.querySelector('[aria-label="Confirm shared target removal"]');box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}));});
+    await removal.screenshot({path:path.join(artifacts,'browser-remove-target-'+mode.label+'.png'),fullPage:true});
+    await removal.evaluate(()=>window.__targetlistShadow.querySelector('.removalform').requestSubmit());
+    await wait(removal,()=>window.__mock.targets.length===3 && window.__targetlistShadow.querySelector('.removalform button').disabled===false);
+    await clickButton(removal,'Targets');assert.equal(await removal.evaluate(()=>window.__targetlistShadow.querySelectorAll('.card').length),3);
+    await openSuggestions(removal);
+    await removal.evaluate(()=>{const form=window.__targetlistShadow.querySelector('.removalform');const type=form.querySelector('select');type.value='faction';type.dispatchEvent(new Event('change',{bubbles:true}));});
+    await shadow(removal,'[aria-label="Remove player or faction ID"]','fill','77001');
+    await shadow(removal,'[aria-label="Reason for removing targets"]','fill','Remove entire faction');
+    await removal.evaluate(()=>{const box=window.__targetlistShadow.querySelector('[aria-label="Confirm shared target removal"]');box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}));window.__targetlistShadow.querySelector('.removalform').requestSubmit();});
+    await wait(removal,()=>window.__mock.targets.length===0 && window.__targetlistShadow.querySelector('.removalform button').disabled===false);
+    assert.equal(await removal.evaluate(()=>window.__mock.requests.filter(row=>row.path==='/api/targets/remove').length),2);
+    await removal.evaluate(()=>{window.__mock.canReview=false;});await clickButton(removal,'Refresh suggestions');
+    await wait(removal,()=>!window.__targetlistShadow.querySelector('.removalform'));
+    await removal.close();
+  }
+  console.log('PASS leader-only player/faction removal on desktop/native PDA: explicit confirmation, one POST, immediate target changes and role loss');
 
   const longNoticeReason = ('Preferred chain target. Repeated attacks against alliance members; inactive for several weeks. '
     + 'Review the saved faction note and check availability before attacking. '.repeat(10)).trim();
