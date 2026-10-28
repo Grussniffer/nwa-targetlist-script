@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.2' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -133,7 +133,7 @@ function mountTargetList(platform, storageWarning = '') {
     .eyebrow{font-size:11px;color:var(--muted)}
     h2{font-size:16px;line-height:1.4;font-weight:700}.icon{width:32px;height:32px;padding:0;background:transparent;font-size:22px}
     .header-actions{display:flex;gap:6px;align-items:center}.more-options{font-size:18px}
-    .scroll{overflow:auto;min-height:0;padding:14px 16px;overscroll-behavior:contain;scrollbar-gutter:stable}.login{display:grid;gap:13px}.login input{width:100%;margin-top:5px}
+    .scroll{overflow-anchor:none;overflow:auto;min-height:0;padding:14px 16px;overscroll-behavior:contain;scrollbar-gutter:stable}.login{display:grid;gap:13px}.login input{width:100%;margin-top:5px}
     .primary,.actions .attack{background:#85cfa6;color:#162b1e;font-weight:700;border-color:transparent}.primary:hover:not(:disabled),.actions .attack:hover:not(:disabled){background:#9cdeb9}
     .notice{font-size:12px;line-height:1.6;color:var(--muted)}.error{background:#402a2e;color:#ffd6d8;padding:10px 12px;border:1px solid #6a3c43;border-radius:7px;margin-bottom:12px;overflow-wrap:anywhere}
     .finder-status{padding:8px 10px;margin-bottom:12px;border-left:2px solid var(--accent);background:#26342b;color:#c4e8d1;font-size:12px;overflow-wrap:anywhere}
@@ -159,6 +159,7 @@ function mountTargetList(platform, storageWarning = '') {
     .actions{display:flex;align-items:center;gap:8px;margin-top:10px;min-width:0}.cards:not(.suggestionqueue)>.card>.actions{grid-column:4;grid-row:1/3;flex-direction:column;align-items:stretch;margin:0;gap:5px}
     .actions button{font-size:11px;padding:5px 7px}.actions .attack{border-radius:6px}.actions small{font-size:10px;overflow-wrap:anywhere}.actions .check-status{background:transparent;border-color:transparent;color:var(--muted);order:2;padding:3px 0}
     .notes{grid-column:1/4;font-size:11px;color:var(--muted);overflow-wrap:anywhere;line-height:1.5}.empty{padding:24px 14px;text-align:center;background:var(--field);border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12px;margin:10px 0}
+    .personal-preferences{border-top:1px solid var(--line);margin-top:12px;padding-top:4px}.personal-preferences>summary{padding:10px 0;color:var(--accent);font-size:12px}.personal-help{color:var(--muted);font-size:11px;margin:4px 0 8px}
     .preferences{border-top:1px solid var(--line);margin-top:14px;padding-top:4px}.preferences>summary{padding:10px 0;font-size:12px;color:var(--muted)}.preferences-body{padding:4px 0 2px}.preferences h3{font-size:12px;font-weight:650;margin:10px 0 6px}.account{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:12px;margin-top:14px}.account button{font-size:11px}.account .muted{font-size:10px}
     .avoid-settings{display:grid;gap:8px;margin:12px 0}.avoid-settings select{width:100%;max-width:100%}.avoid-settings label{display:grid;gap:5px}.avoid-settings .avoid-active{display:flex;align-items:center;gap:7px}.avoid-settings input[type=number]{width:100%;max-width:130px}.avoided-factions{display:grid;gap:6px}.avoided-faction{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.avoided-faction span{min-width:0;overflow-wrap:anywhere}.avoided-faction button{flex:0 0 auto;min-height:36px}
     .footnote{margin-top:14px;font-size:11px;color:var(--muted)}.pool-footer{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:10px;color:var(--muted)}.pool-warnings{color:#efd49a;font-size:11px;overflow-wrap:anywhere}.pool-warnings p{margin:8px 0}
@@ -257,7 +258,11 @@ function mountTargetList(platform, storageWarning = '') {
   dock.append(launcher, settings, quickNotice); root.append(panel, dock);
   let panelOpener = settings;
 
-  function message(text) { state.error = text; errorBox.textContent = text; errorBox.hidden = !text; }
+  function message(text) {
+    const viewport = captureListViewport();
+    state.error = text; errorBox.textContent = text; errorBox.hidden = !text;
+    restoreListViewport(viewport);
+  }
   function findNotice(text) {
     quickNotice.textContent = text; quickNotice.hidden = !text || state.open;
     finderStatus.textContent = text; finderStatus.hidden = !text || !state.open;
@@ -1461,7 +1466,8 @@ function mountTargetList(platform, storageWarning = '') {
   }
 
   let cardContainer, countNode, panelUi = null, renderedKind = null, suggestionContainer = null, suggestionSignature = null;
-  let preferencesOpen = false, diagnosticsOpen = false;
+  let preferencesOpen = false, personalPreferencesOpen = false, diagnosticsOpen = false;
+  let renderViewportAnchor = null;
   const cardNodes = new Map();
   let orderedRowsKey = null, orderedIds = [], mountedIds = [], emptyCard = null;
   let visibleCardLimit = CARD_BATCH_SIZE, cardFilterKey = null, lazyCardsObserver = null;
@@ -1503,7 +1509,7 @@ function mountTargetList(platform, storageWarning = '') {
       const name = known.get(id) || state.excludedFactionNames[id] || 'Faction ' + id;
       const row = element('div', null, 'avoided-faction');
       const label = element('span', name + (known.has(id) ? '' : ' (not in the current pool)'));
-      const remove = focusKey(button('Remove', () => {
+      const remove = focusKey(button('Stop avoiding', () => {
         state.excludedFactionIds = state.excludedFactionIds.filter(value => value !== id); delete state.excludedFactionNames[id];
         savePreferences(); cancelFind(); message(''); render(); panelUi?.factionSelect?.focus?.({ preventScroll: true });
       }), 'preferences:unavoid:' + id);
@@ -1558,8 +1564,10 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function render() {
     const focus = captureFocus(content);
-    renderPanel();
-    restoreFocus(focus);
+    const viewport = captureListViewport(), previous = renderViewportAnchor;
+    renderViewportAnchor = viewport;
+    try { renderPanel(); restoreFocus(focus); restoreListViewport(viewport); }
+    finally { renderViewportAnchor = previous; }
   }
   function renderPanel() {
     if (disposed) return;
@@ -1701,9 +1709,12 @@ function mountTargetList(platform, storageWarning = '') {
     });
     ageLabel.append(age, element('span', 'days')); ageControls.append(ageLabel,
       button('Clear recent targets', () => { state.recentTargets = []; state.lastTargetId = null; savePreferences(); cancelFind(); message(''); renderCards(); }));
-    preferencesBody.append(element('h3', 'Target preferences'), ageControls);
+    const personalPreferences = element('details', null, 'personal-preferences'); personalPreferences.open = personalPreferencesOpen;
+    personalPreferences.addEventListener('toggle', () => { personalPreferencesOpen = personalPreferences.open; });
+    personalPreferences.append(element('summary', 'My target preferences'),
+      element('p', 'Personal settings for your own targets. Available to every member; they do not change the shared NWA list.', 'personal-help'), ageControls);
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
-    ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; preferencesBody.append(ageCaution);
+    ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; personalPreferences.append(ageCaution);
     const avoidSettings = element('section', null, 'avoid-settings'); avoidSettings.setAttribute('aria-label', 'Personal target exclusions');
     const factionsLabel = element('label', 'Avoid factions'), factions = focusKey(element('select'), 'preferences:excluded-factions');
     factions.setAttribute('aria-label', 'Faction to avoid'); factionsLabel.append(factions);
@@ -1737,7 +1748,7 @@ function mountTargetList(platform, storageWarning = '') {
     setText(summary, state.excludedFactionIds.length + ' faction(s) avoided' + (state.avoidActive ? ' · Skip activity within ' + state.activityMinutes + ' minutes and unknown activity.' : ''));
     avoidSettings.append(factionsLabel, factionAdd, factionList, factionClear, activeLabel, minutesLabel, summary,
       element('small', 'Personal filters only. Choose factions from the full target pool; changes save immediately on this device. Unknown activity is skipped when avoiding active players. Shared NWA membership and profile notices stay visible.'));
-    preferencesBody.append(avoidSettings);
+    personalPreferences.append(avoidSettings); content.append(personalPreferences);
     const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
     const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
     for (const [value, label] of [['all', 'All targets'], ['shown', 'Shown targets']]) {
@@ -1935,21 +1946,51 @@ function mountTargetList(platform, storageWarning = '') {
     }
     return `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
   }
+  function targetFilterKey() {
+    return JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays, state.excludedFactionIds, state.avoidActive, state.activityMinutes]);
+  }
+  function captureListViewport() {
+    if (!state.open || state.view !== 'targets' || !state.player || renderedKind !== `member:${state.player.id}:targets` || !cardContainer || targetFilterKey() !== cardFilterKey || !(scroll.scrollTop > 0)
+      || !scroll.getBoundingClientRect) return null;
+    const viewport = scroll.getBoundingClientRect(), anchors = [];
+    for (const id of mountedIds) {
+      const rect = cardNodes.get(id)?.node.getBoundingClientRect?.();
+      if (!rect || rect.height <= 0 || rect.bottom <= viewport.top) continue;
+      if (!anchors.length && rect.top >= viewport.bottom) break;
+      anchors.push({ id, offset: rect.top - viewport.top });
+      if (anchors.length >= 5) break;
+    }
+    return anchors.length ? { anchors, scrollTop: scroll.scrollTop } : null;
+  }
+  function restoreListViewport(snapshot) {
+    if (!snapshot || !state.open || state.view !== 'targets' || !scroll.getBoundingClientRect) return;
+    const viewport = scroll.getBoundingClientRect();
+    for (const anchor of snapshot.anchors) {
+      const node = cardNodes.get(anchor.id)?.node;
+      if (!node || node.parentNode !== cardContainer) continue;
+      const rect = node.getBoundingClientRect();
+      scroll.scrollTop += rect.top - viewport.top - anchor.offset;
+      return;
+    }
+    scroll.scrollTop = snapshot.scrollTop;
+  }
   function renderCards() {
     if (disposed || !state.open || state.view !== 'targets' || !state.player || !cardContainer) return;
     const focus = captureFocus(cardContainer);
     let focusedCard = focus?.node;
     while (focusedCard && !focusedCard.getAttribute?.('data-target-id')) focusedCard = focusedCard.parentNode;
     const focusedId = Number(focusedCard?.getAttribute('data-target-id'));
-    renderTargetCards();
+    const viewport = renderViewportAnchor || captureListViewport();
+    renderTargetCards(viewport);
     restoreFocus(focus, cardContainer, () => {
       const sameCard = cardNodes.get(focusedId)?.controls;
       if (sameCard) return !sameCard['check-status'].disabled ? sameCard['check-status'] : sameCard.profile;
       return panelUi.query || panelHeading;
     });
+    restoreListViewport(viewport);
   }
-  function renderTargetCards() {
-    const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays, state.excludedFactionIds, state.avoidActive, state.activityMinutes]);
+  function renderTargetCards(viewport) {
+    const filterKey = targetFilterKey();
     if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
     const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
@@ -1980,6 +2021,14 @@ function mountTargetList(platform, storageWarning = '') {
     const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now${excluded ? ' · ' + excluded + ' excluded by your settings' : ''}`;
     const shownReady = freshPool && state.reservationsSupported
       ? rows.filter(({ target, assessment }) => assessment.suggested && assessment.ready && !target.reserved).length : 0;
+    if (viewport) {
+      for (const anchor of viewport.anchors) {
+        const index = orderedIds.indexOf(anchor.id);
+        if (index < 0) continue;
+        if (index >= visibleCardLimit) visibleCardLimit = Math.ceil((index + 1) / CARD_BATCH_SIZE) * CARD_BATCH_SIZE;
+        break;
+      }
+    }
     const visibleRows = rows.slice(0, visibleCardLimit), visibleIds = visibleRows.map(row => row.target.id), visibleIdSet = new Set(visibleIds);
     setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} ${rows.length > visibleRows.length ? 'matches' : 'shown'}`);
     setText(panelUi.countDetail, `${visibleRows.length} displayed · ${rows.length} matching · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
@@ -2070,7 +2119,10 @@ function mountTargetList(platform, storageWarning = '') {
       card.append(actions);
     }
     if (mountedIds.length !== visibleIds.length || mountedIds.some((id, index) => id !== visibleIds[index])) {
-      for (const id of visibleIds) cardContainer.append(cardNodes.get(id).node);
+      for (let index = 0; index < visibleIds.length; index++) {
+        const node = cardNodes.get(visibleIds[index]).node, current = cardContainer.children[index];
+        if (node !== current) cardContainer.insertBefore(node, current || null);
+      }
       mountedIds = visibleIds;
     }
   }

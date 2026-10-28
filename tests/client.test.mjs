@@ -44,6 +44,12 @@ class Element {
       this.children.push(child);
     }
   }
+  insertBefore(child, before) {
+    if (child === before) return child;
+    if (!before) { this.append(child); return child; }
+    child.remove(); const index = this.children.indexOf(before); assert.notEqual(index, -1);
+    child.parentNode = this; this.children.splice(index, 0, child); return child;
+  }
   replaceChildren(...children) {
     this.replaceCount++;
     for (const child of this.children) if (typeof child === 'object') child.parentNode = null;
@@ -991,10 +997,12 @@ test('target rows come before collapsed preferences while search, stat limits an
   assert.equal(visible(app.button('Find target')), true);
   const secondary = [
     app.find(element => element.className === 'statgrid'),
-    app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days'),
     app.find(element => element.attributes.get('aria-label') === 'Export scope'),
     app.button('Export CSV'), app.button('Export Markdown'), app.button('Sign out and remove key'),
   ];
+  const personal = app.find(element => element.className === 'personal-preferences');
+  const age = app.find(element => element.attributes.get('aria-label') === 'Maximum estimate age in days');
+  assert.ok(descendants(personal).includes(age)); assert.equal(visible(age), false);
   for (const control of secondary) {
     assert.ok(descendants(preferences).includes(control), 'secondary control belongs to preferences');
     assert.equal(visible(control), false, 'secondary control starts collapsed');
@@ -2686,4 +2694,39 @@ test('legacy exclusions outside the current pool retain remembered names and rem
   app.button('Refresh list').emit('click');app.response(app.requests.at(-1),{player,targets:[],warnings:[],reservations:coordination});await flush();
   assert.ok(app.find(node=>node.attributes.get('aria-label')==='Stop avoiding Target Faction'));
   assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222,444]);
+});
+
+
+test('personal target preferences are above the list for ordinary members and do not require an admin lookup',async()=>{
+  const app=fixture();await app.signIn(avoidancePool());
+  const personal=app.find(node=>node.className==='personal-preferences'),cards=app.find(node=>node.className==='cards');
+  assert.equal(personal.children[0].textContent,'My target preferences');
+  assert.equal(personal.parentNode,cards.parentNode);assert.ok(personal.parentNode.children.indexOf(personal)<personal.parentNode.children.indexOf(cards));
+  assert.match(textContent(personal),/Available to every member/);
+  assert.equal(descendants(personal).some(node=>node.attributes.get('aria-label')==='Faction to avoid'),true);
+  const before=app.requests.length;personal.open=true;personal.emit('toggle');saveAvoidedFactions(app,'222');await flush();
+  assert.equal(app.requests.length,before);assert.ok(app.find(node=>node.attributes.get('aria-label')==='Stop avoiding Target Faction'));
+  assert.equal(app.requests.some(request=>request.url.includes('/api/suggestions')||request.url.includes('/api/permissions')),false);
+});
+
+test('background priority changes and delisting preserve the reading anchor without focused controls',async()=>{
+  for(const mode of ['priority','removed','removed-demoted']) {
+    const targets=Array.from({length:80},(_,index)=>({...target,id:100+index,name:'Player '+index,checkedAt:new Date(NOW).toISOString()}));
+    const app=fixture();await app.signIn(targets);
+    const scroll=app.find(node=>node.className==='scroll'),container=app.find(node=>node.className==='cards');
+    scroll.scrollTop=1200;scroll.getBoundingClientRect=()=>({top:0,bottom:400,height:400});
+    const nodes=descendants(container).filter(node=>node.className==='card');
+    for(const node of nodes)node.getBoundingClientRect=()=>({top:container.children.indexOf(node)*200-scroll.scrollTop,bottom:container.children.indexOf(node)*200-scroll.scrollTop+200,height:200});
+    const anchor=nodes.find(node=>node.getAttribute('data-target-id')===(mode==='priority'?'106':'107'));
+    const offset=anchor.getBoundingClientRect().top;
+    app.setNow(NOW+1000);app.setVisibility('visible');
+    const next=mode==='priority'?targets.map(row=>row.id===100?{...row,status:{state:'Hospital'}}:row)
+      :targets.filter(row=>row.id!==106).map(row=>mode==='removed-demoted'&&row.id===107?{...row,status:{state:'Hospital'}}:row);
+    app.response(app.requests.at(-1),{player,targets:next,warnings:[],reservations:coordination});await flush();
+    assert.equal(anchor.getBoundingClientRect().top,offset);
+    assert.equal(scroll.scrollTop,mode==='removed-demoted'?15400:1000,'The viewport keeps the first surviving anchor, including a fallback outside the previous lazy window.');
+    const search=app.find(node=>node.type==='search');search.value='Player 79';search.emit('input');
+    assert.equal(descendants(container).filter(node=>node.className==='card').length,1);
+    assert.match(textContent(container),/Player 79/);
+  }
 });

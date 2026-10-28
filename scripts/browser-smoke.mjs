@@ -587,6 +587,90 @@ async function checkSingleRequestFinder(pageContext, scripts, mode) {
   console.log(`PASS ${mode} one-request warm/cold finder, native transport, immediate settings and cancelled late-result navigation`);
 }
 
+
+async function visibleTargetAnchor(page) {
+  return page.evaluate(() => {
+    const root=window.__targetlistShadow,scroll=root.querySelector('.scroll'),clip=scroll.getBoundingClientRect();
+    const first=[...root.querySelectorAll('.card[data-target-id]')].find(card=>{
+      const rect=card.getBoundingClientRect();return rect.bottom>clip.top+1&&rect.top<clip.bottom;
+    });
+    return {id:first?.getAttribute('data-target-id'),offset:first?first.getBoundingClientRect().top-clip.top:null,scrollTop:scroll.scrollTop,
+      focused:root.activeElement?.tagName};
+  });
+}
+async function checkBackgroundScrollAnchoring(pageContext,scripts,mode) {
+  for(const width of mode==='PDA'?[390,320]:[1280]) {
+    const label=mode+' '+width+'px';
+    const page=await mount({width,height:900},scripts,pageContext,makePerformanceFeed);
+    await wait(page,()=>window.__mock.feedResponses.length===1);await shadow(page,'.settings-toggle','click');
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===50);
+    await page.evaluate(()=>{
+      const root=window.__targetlistShadow,scroll=root.querySelector('.scroll'),card=root.querySelector('[data-target-id="10020"]');
+      scroll.scrollTop+=card.getBoundingClientRect().top-scroll.getBoundingClientRect().top+37;
+      root.querySelector('.header h2').focus({preventScroll:true});
+    });
+    const lazyAnchor=await visibleTargetAnchor(page);assert.equal(lazyAnchor.focused,'H2');assert.ok(lazyAnchor.id);
+    await page.evaluate(()=>window.__targetlistShadow.querySelector('.queuefooter button').click());
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===100);
+    const appended=await visibleTargetAnchor(page);
+    assert.equal(appended.id,lazyAnchor.id,label+': appending another lazy batch keeps the first visible target');
+    assert(Math.abs(appended.offset-lazyAnchor.offset)<=2,label+': lazy append keeps the pixel offset');
+    await page.evaluate(()=>{
+      const root=window.__targetlistShadow;
+      while(root.querySelectorAll('.card').length<1000)root.querySelector('.queuefooter button').click();
+      const scroll=root.querySelector('.scroll'),card=root.querySelector('[data-target-id="10500"]');
+      scroll.scrollTop+=card.getBoundingClientRect().top-scroll.getBoundingClientRect().top+37;
+      root.querySelector('.header h2').focus({preventScroll:true});
+    });
+    const before=await visibleTargetAnchor(page);assert.equal(before.focused,'H2');assert.equal(before.id,'10500');
+    await page.evaluate(()=>{
+      const target=window.__mock.targets[0];
+      target.status={state:'Hospital',description:'Changed elsewhere while reading the middle',until:Math.floor(Date.now()/1000)+600};
+      target.checkedAt=new Date(Date.now()).toISOString();
+    });
+    await refreshMockFeed(page);
+    const changed=await visibleTargetAnchor(page);
+    assert.equal(changed.id,before.id,label+': background status reorder keeps the first visible player');
+    assert(Math.abs(changed.offset-before.offset)<=2,label+': background reorder keeps the visible pixel offset '+JSON.stringify({before,changed}));
+    assert.equal(changed.focused,'H2',label+': preserving scroll does not focus an arbitrary card');
+    await refreshMockFeed(page);
+    const unchanged=await visibleTargetAnchor(page);
+    assert.equal(unchanged.id,changed.id);assert(Math.abs(unchanged.offset-changed.offset)<=2,label+': unchanged feed keeps scroll position');
+    await shadow(page,'[aria-label="Search targets"]','fill','Performance target 0501');
+    assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelectorAll('.card').length),1,label+': explicit search still filters the full list');
+    assert.ok(await cardSnapshot(page,10500));
+    await shadow(page,'[aria-label="Search targets"]','fill','');
+    assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelectorAll('.card').length),50,label+': clearing search resets lazy paging normally');
+    const fallback=await page.evaluate(()=>{
+      const root=window.__targetlistShadow,scroll=root.querySelector('.scroll'),first=root.querySelector('[data-target-id="10020"]');
+      scroll.scrollTop+=first.getBoundingClientRect().top-scroll.getBoundingClientRect().top+37;
+      root.querySelector('.header h2').focus({preventScroll:true});
+      const next=root.querySelector('[data-target-id="10021"]');
+      return {id:'10021',offset:next.getBoundingClientRect().top-scroll.getBoundingClientRect().top};
+    });
+    await page.evaluate(()=>{
+      const targets=window.__mock.targets;
+      targets.splice(targets.findIndex(target=>target.id===10020),1);
+      // Demote a later block too, leaving content below the fallback so native
+      // max-scroll clamping does not make its previous pixel offset impossible.
+      for(const target of targets.filter(target=>target.id>=10021&&target.id<=10040))Object.assign(target,{
+        status:{state:'Hospital',description:'Fallback anchor demoted in same feed as first removal',until:Math.floor(Date.now()/1000)+600},
+        checkedAt:new Date(Date.now()).toISOString()});
+    });
+    await refreshMockFeed(page);
+    const retained=await page.evaluate(()=>{
+      const root=window.__targetlistShadow,card=root.querySelector('[data-target-id="10021"]');
+      return {mounted:Boolean(card),offset:card?card.getBoundingClientRect().top-root.querySelector('.scroll').getBoundingClientRect().top:null,
+        removed:Boolean(root.querySelector('[data-target-id="10020"]'))};
+    });
+    assert.equal(retained.mounted,true,label+': fallback anchor survives beyond the lazy window when first anchor is removed');
+    assert.equal(retained.removed,false);
+    assert(Math.abs(retained.offset-fallback.offset)<=2,label+': removed+demoted combined feed retains fallback pixel position '+JSON.stringify({fallback,retained}));
+    await page.close();
+  }
+  console.log('PASS '+mode+' background scroll anchoring: lazy append, 1000-target mid-list status reorder, unchanged feeds, heading focus and explicit search');
+}
+
 async function checkDeltaRendering(pageContext, scripts, mode) {
   const viewport = mode === 'PDA' ? { width: 390, height: 844 } : { width: 1280, height: 960 };
   const page = await mount(viewport, scripts, pageContext, makePerformanceFeed, {}, 'https://www.torn.com/profiles.php?XID=101');
@@ -940,6 +1024,9 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Avoid active players"]').checked),false,
       label+': activity avoidance starts disabled');
     assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Activity cutoff in minutes"]').value),'15');
+    await keyboardActivate(page,'details.personal-preferences > summary');
+    assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('details.personal-preferences').open),true,
+      label+': personal target preferences are exposed directly above the list');
     const before=await page.evaluate(()=>window.__mock.requests.length);
     const options=await page.evaluate(()=>[...window.__targetlistShadow.querySelector('[aria-label="Faction to avoid"]').options]
       .filter(option=>Number(option.value)>0).map(option=>({value:option.value,text:option.textContent})));
@@ -1280,7 +1367,7 @@ async function checkProfessionalLayout(pageContext, scripts, mode) {
     find: initial.find, searchPrimary: initial.searchPrimary, minimumPrimary: initial.minimumPrimary, maximumPrimary: initial.maximumPrimary },
   { preferences: true, collapsed: true, summary: 'Preferences & account', find: 'Find target', searchPrimary: true,
     minimumPrimary: true, maximumPrimary: true }, `${mode}: primary controls stay above targets and secondary controls start collapsed`);
-  assert(initial.firstRowOffset < (mode === 'PDA' ? 410 : 340),
+  assert(initial.firstRowOffset < (mode === 'PDA' ? 450 : 380),
     `${mode}: targets appear without a large settings block above them: ${JSON.stringify(initial)}`);
   assert(initial.firstRowBottom < initial.panelBottom, `${mode}: the first complete target is visible on opening`);
   assert.match(await page.evaluate(() => window.__targetlistShadow.querySelector('.card .name').textContent), /Willow \[101\]/,
@@ -1304,15 +1391,15 @@ async function checkProfessionalLayout(pageContext, scripts, mode) {
   assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences').open), true,
     `${mode}: preferences open using the keyboard`);
   const expanded = await page.evaluate(() => {
-    const root = window.__targetlistShadow, preferences = root.querySelector('details.preferences');
+    const root = window.__targetlistShadow, preferences = root.querySelector('details.preferences'), personal = root.querySelector('details.personal-preferences');
     const age = root.querySelector('[aria-label="Maximum estimate age in days"]');
-    return { ageVisible: age.getClientRects().length > 0,
-      ageSecondary: preferences.contains(age), statsSecondary: preferences.contains(root.querySelector('.statgrid')),
+    return { ageVisible: age.checkVisibility(),
+      agePersonal: personal.contains(age), statsSecondary: preferences.contains(root.querySelector('.statgrid')),
       exportSecondary: preferences.contains(root.querySelector('[aria-label="Export scope"]')),
       accountSecondary: preferences.contains(root.querySelector('[data-action="signout"]')),
       firstCardPreserved: root.querySelector('.card') === window.__professionalFirstCard };
   });
-  assert.deepEqual(expanded, { ageVisible: true, ageSecondary: true, statsSecondary: true,
+  assert.deepEqual(expanded, { ageVisible: false, agePersonal: true, statsSecondary: true,
     exportSecondary: true, accountSecondary: true, firstCardPreserved: true },
   `${mode}: secondary tools reveal without rebuilding targets`);
   await page.evaluate(() => window.__targetlistShadow.querySelector('details.preferences > summary').focus());
@@ -1352,6 +1439,27 @@ async function checkProfessionalLayout(pageContext, scripts, mode) {
       assert(geometry.controls.every(control => control.fontSize === '16px' && control.left >= geometry.left && control.right <= geometry.right),
         `PDA ${width}px: editable controls avoid focus zoom and clipping: ${JSON.stringify(geometry)}`);
     }
+    const preferencesRequests = await page.evaluate(() => window.__mock.requests.length);
+    await keyboardActivate(page, 'details.personal-preferences > summary');
+    const personalAccess = await page.evaluate(() => {
+      const root = window.__targetlistShadow, personal = root.querySelector('details.personal-preferences'), first = root.querySelector('.card');
+      const age = root.querySelector('[aria-label="Maximum estimate age in days"]'), faction = root.querySelector('[aria-label="Faction to avoid"]'), active = root.querySelector('[aria-label="Avoid active players"]');
+      return { open:personal.open, summary:personal.querySelector('summary').textContent,
+        aboveCards:Boolean(personal.compareDocumentPosition(first) & Node.DOCUMENT_POSITION_FOLLOWING),
+        belowBounds:Boolean(root.querySelector('.controls').compareDocumentPosition(personal) & Node.DOCUMENT_POSITION_FOLLOWING),
+        age:personal.contains(age)&&age.checkVisibility(), faction:personal.contains(faction)&&faction.checkVisibility(),
+        activity:personal.contains(active)&&active.checkVisibility(), canReview:window.__mock.canReview,
+        cardPreserved:first===window.__professionalFirstCard,
+        overflow:root.querySelector('.scroll').scrollWidth>root.querySelector('.scroll').clientWidth+1 };
+    });
+    assert.deepEqual(personalAccess,{open:true,summary:'My target preferences',aboveCards:true,belowBounds:true,
+      age:true,faction:true,activity:true,canReview:false,cardPreserved:true,overflow:false},
+      `${mode} ${width}px: personal controls are above all cards and available to ordinary members`);
+    assert.equal(await page.evaluate(() => window.__mock.requests.length),preferencesRequests,
+      `${mode} ${width}px: opening personal preferences makes no permission or API request`);
+    await page.screenshot({path:path.join(artifacts,`browser-personal-preferences-${mode.toLowerCase()}-${width}.png`),fullPage:true});
+    await page.evaluate(()=>window.__targetlistShadow.querySelector('details.personal-preferences > summary').focus());
+    await page.keyboard.press('Space');
     await page.screenshot({ path: path.join(artifacts, `browser-professional-${mode === 'PDA' ? `pda-${width}` : 'desktop'}.png`), fullPage: true });
   }
 
@@ -3034,6 +3142,7 @@ try {
 
   await checkSingleRequestFinder(context, [source], 'GM');
   await checkDeltaRendering(context, [source], 'GM');
+  await checkBackgroundScrollAnchoring(context, [source], 'GM');
   await checkExports(context, [source], 'GM');
   await checkAdminManagement(context, [source], 'GM');
   await checkPageAdminManagement(context, [source], 'GM');
@@ -3046,6 +3155,7 @@ try {
     await checkLeaseAvailability(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkSingleRequestFinder(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkBackgroundScrollAnchoring(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkPageAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
