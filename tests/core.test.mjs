@@ -341,3 +341,23 @@ test('display helpers keep unknown values explicit', () => {
   assert.equal(Core.ageLabel(NOW / 1000 - 7200, NOW), '2h ago');
   assert.equal(Core.ageLabel(NOW / 1000 - 172800, NOW), '2d ago');
 });
+
+
+test('personal faction IDs parse strictly, deduplicate and bound saved input',()=>{
+  assert.equal(JSON.stringify(Core.parseExcludedFactions(' 33, 22\n33; 11, ')),JSON.stringify([11,22,33]));
+  assert.equal(JSON.stringify(Core.parseExcludedFactions('')), '[]');
+  for(const value of ['1e3','0','-2','1.5','2147483648','22,bad',Array.from({length:101},(_,i)=>i+1).join(',')])assert.equal(Core.parseExcludedFactions(value),null);
+});
+
+test('personal exclusions filter factions and recent, unknown or future activity with inclusive cutoff',()=>{
+  const options={minRatio:0.1,maxRatio:0.6,estimateDays:7,excludedFactionIds:[222],avoidActive:true,activityMinutes:15};
+  const safe=target({id:1,faction:{id:333},lastAction:NOW/1000-900});
+  const rows=[safe,target({id:2,lastAction:NOW/1000-3600}),{...safe,id:3,lastAction:NOW/1000-899},
+    {...safe,id:4,lastAction:null},{...safe,id:5,lastAction:NOW/1000+1},{...safe,id:6,lastAction:0}];
+  assert.equal(JSON.stringify(Core.select(rows,player,options,NOW).map(row=>row.target.id)), '[1]');
+  assert.equal(Core.avoidReason(rows[1],options,NOW),'Faction excluded');
+  assert.equal(Core.avoidReason(rows[2],options,NOW),'Recently active');
+  assert.equal(Core.avoidReason(rows[3],options,NOW),'Activity unknown');
+  assert.equal(Core.avoidReason(safe,{...options,activityMinutes:0},NOW),'Invalid activity cutoff');
+  assert.equal(Core.select(rows,player,{...options,excludedFactionIds:[],avoidActive:false},NOW).length,6);
+});

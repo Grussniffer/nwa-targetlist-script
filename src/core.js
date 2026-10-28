@@ -51,6 +51,20 @@ const TargetListCore = (() => {
     return (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || '';
   }
+  function parseExcludedFactions(value) {
+    if (typeof value !== 'string') return null;
+    const tokens = value.trim() ? value.trim().split(/[\s,;]+/).filter(Boolean) : [];
+    if (tokens.length > 100 || tokens.some(token => !/^[1-9]\d*$/.test(token) || !Number.isSafeInteger(Number(token)) || Number(token) > 2147483647)) return null;
+    return [...new Set(tokens.map(Number))].sort((a, b) => a - b);
+  }
+  function avoidReason(target, options, now = Date.now()) {
+    if (Array.isArray(options.excludedFactionIds) && options.excludedFactionIds.includes(target.faction?.id)) return 'Faction excluded';
+    if (!options.avoidActive) return '';
+    const minutes = options.activityMinutes;
+    if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 10080) return 'Invalid activity cutoff';
+    if (!Number.isSafeInteger(target.lastAction) || target.lastAction <= 0 || target.lastAction > now / 1000) return 'Activity unknown';
+    return target.lastAction > now / 1000 - minutes * 60 ? 'Recently active' : '';
+  }
   function estimateSourceLabel(target) {
     const provider = typeof target?.estimateProvider === 'string' ? target.estimateProvider.trim() : '';
     const source = typeof target?.estimateSource === 'string' ? target.estimateSource.trim() : '';
@@ -89,7 +103,8 @@ const TargetListCore = (() => {
 
   function select(targets, player, options, now = Date.now()) {
     const query = (options.query || '').trim().toLowerCase();
-    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
+    return targets.filter(target => !avoidReason(target, options, now))
+      .map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
       .filter(({ target, assessment }) => {
         if (options.mode === 'suggested' && !assessment.suggested) return false;
         return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${reason(target)}`.toLowerCase().includes(query);
@@ -176,5 +191,5 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
 })();

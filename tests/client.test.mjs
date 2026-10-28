@@ -1893,7 +1893,7 @@ test('both stat limits persist separately from the session and filter instant NW
   const maximum = app.find(element => element.attributes.get('aria-label') === 'Maximum target stats as percent of your total');
   maximum.value = '80'; maximum.emit('change');
   minimum.value = '30'; minimum.emit('change');
-  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: null, recentTargets: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: null, recentTargets: [], excludedFactionIds: [], avoidActive: false, activityMinutes: 15 });
   await app.signOut();
   assert.equal(app.storage.has(app.storageKey), false);
   assert.equal(app.storage.get(app.preferencesKey).minRatio, 0.3);
@@ -1912,7 +1912,7 @@ test('both stat limits persist separately from the session and filter instant NW
   assert.deepEqual(reloaded.navigations, []);
   await completeLease(reloaded);
   assert.deepEqual(reloaded.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
-  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.storage.get(reloaded.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: target.id, recentTargets: [{ id: target.id, at: NOW }] });
+  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.storage.get(reloaded.preferencesKey))), { minRatio: 0.3, maxRatio: 0.8, estimateDays: 7, lastTargetId: target.id, recentTargets: [{ id: target.id, at: NOW }], excludedFactionIds: [], avoidActive: false, activityMinutes: 15 });
 });
 
 test('the maximum stat limit is used by NWA after reloading', async () => {
@@ -2602,4 +2602,52 @@ test('Admin discards stale responses on logout and removes controls when leaders
       assert.equal(app.requests.length,count);assert.doesNotMatch(app.text(),/Added and approved|Useful chain target/);
     }
   }
+});
+
+
+function saveAvoidedFactions(app,value) {
+  const input=app.find(node=>node.attributes.get('aria-label')==='Avoid faction IDs');input.value=value;app.button('Save avoided factions').emit('click');
+}
+function avoidActive(app,checked=true) {
+  const input=app.find(node=>node.attributes.get('aria-label')==='Avoid active players');input.checked=checked;input.emit('change');
+}
+const avoidancePool=()=>[target,{...target,id:900,name:'Inactive safe player',faction:{id:333,name:'Safe faction'},lastAction:NOW/1000-3600},
+  {...target,id:901,name:'Unknown activity player',faction:{id:333,name:'Safe faction'},lastAction:null}];
+
+test('personal exclusions save locally, filter displayed rows and shown exports, and survive session removal',async()=>{
+  const app=fixture();await app.signIn(avoidancePool());const before=app.requests.length;
+  saveAvoidedFactions(app,'222, 222');avoidActive(app);await flush();
+  assert.equal(app.requests.length,before,'Saving personal exclusions performs no service or database request.');
+  const prefs=app.storage.get(app.preferencesKey);
+  assert.deepEqual([...prefs.excludedFactionIds],[222]);assert.equal(prefs.avoidActive,true);assert.equal(prefs.activityMinutes,15);
+  const cards=descendants(app.root).filter(node=>node.className==='card');assert.equal(cards.length,1);assert.match(textContent(cards[0]),/Inactive safe player/);
+  const scope=app.find(node=>node.attributes.get('aria-label')==='Export scope');scope.value='shown';app.button('Export CSV').emit('click');
+  const preview=app.find(node=>node.attributes.get('aria-label')==='Exported target list');assert.match(preview.value,/Inactive safe player/);assert.doesNotMatch(preview.value,/Target Player|Unknown activity player/);
+  scope.value='all';app.button('Export CSV').emit('click');assert.match(preview.value,/Target Player/);
+  saveAvoidedFactions(app,'333, bad');assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222]);
+  assert.match(app.text(),/previous exclusions are unchanged/);
+  const minutes=app.find(node=>node.attributes.get('aria-label')==='Activity cutoff in minutes');minutes.value='0';minutes.emit('change');assert.equal(minutes.value,'15');
+  await app.signOut();assert.equal(app.storage.get(app.preferencesKey).avoidActive,true);
+  const restored=fixture(null,prefs);await restored.signIn(avoidancePool());assert.equal(descendants(restored.root).filter(node=>node.className==='card').length,1);
+});
+
+test('finder sends faction and activity exclusions and verifies the returned faction and activity',async()=>{
+  for(const responseKind of ['allowed','excluded-faction','active','unknown']) {
+    const app=fixture();await app.signIn(avoidancePool(),{capabilities:{nextTarget:true,targetExclusions:true}});
+    saveAvoidedFactions(app,'222');avoidActive(app);app.button('NWA').emit('click');const request=app.requests.at(-1),body=JSON.parse(request.data);
+    assert.deepEqual(body.excludedFactionIds,[222]);assert.equal(body.minInactiveMinutes,15);
+    const chosen={...avoidancePool()[1],checkedAt:new Date(NOW).toISOString(),reservationExpiresAt:new Date(NOW+120000).toISOString(),reserved:false,
+      ...(responseKind==='excluded-faction'?{faction:{id:222}}:responseKind==='active'?{lastAction:NOW/1000-1}:responseKind==='unknown'?{lastAction:null}:{})};
+    app.response(request,{player,target:chosen});await flush();
+    assert.equal(app.navigations.length,responseKind==='allowed'?1:0);
+  }
+});
+
+test('old backends cannot silently ignore saved exclusions and changing preferences cancels an in-flight selection',async()=>{
+  const old=fixture();await old.signIn(avoidancePool(),{capabilities:{nextTarget:true}});saveAvoidedFactions(old,'222');
+  const count=old.requests.length;old.button('NWA').emit('click');await flush();assert.equal(old.requests.length,count);assert.match(old.text(),/Update the NWA backend/);
+  const app=fixture();await app.signIn(avoidancePool(),{capabilities:{nextTarget:true,targetExclusions:true}});
+  app.button('NWA').emit('click');const pending=app.requests.at(-1);saveAvoidedFactions(app,'222');
+  app.response(pending,{player,target:{...target,checkedAt:new Date(NOW).toISOString(),reservationExpiresAt:new Date(NOW+120000).toISOString(),reserved:false}});await flush();
+  assert.deepEqual(app.navigations,[]);
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.14.1
+// @version      0.15.0
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -73,6 +73,20 @@ const TargetListCore = (() => {
     return (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || '';
   }
+  function parseExcludedFactions(value) {
+    if (typeof value !== 'string') return null;
+    const tokens = value.trim() ? value.trim().split(/[\s,;]+/).filter(Boolean) : [];
+    if (tokens.length > 100 || tokens.some(token => !/^[1-9]\d*$/.test(token) || !Number.isSafeInteger(Number(token)) || Number(token) > 2147483647)) return null;
+    return [...new Set(tokens.map(Number))].sort((a, b) => a - b);
+  }
+  function avoidReason(target, options, now = Date.now()) {
+    if (Array.isArray(options.excludedFactionIds) && options.excludedFactionIds.includes(target.faction?.id)) return 'Faction excluded';
+    if (!options.avoidActive) return '';
+    const minutes = options.activityMinutes;
+    if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > 10080) return 'Invalid activity cutoff';
+    if (!Number.isSafeInteger(target.lastAction) || target.lastAction <= 0 || target.lastAction > now / 1000) return 'Activity unknown';
+    return target.lastAction > now / 1000 - minutes * 60 ? 'Recently active' : '';
+  }
   function estimateSourceLabel(target) {
     const provider = typeof target?.estimateProvider === 'string' ? target.estimateProvider.trim() : '';
     const source = typeof target?.estimateSource === 'string' ? target.estimateSource.trim() : '';
@@ -111,7 +125,8 @@ const TargetListCore = (() => {
 
   function select(targets, player, options, now = Date.now()) {
     const query = (options.query || '').trim().toLowerCase();
-    return targets.map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
+    return targets.filter(target => !avoidReason(target, options, now))
+      .map(target => ({ target, assessment: assess(target, player, options.maxRatio, now, options.minRatio, options.estimateDays) }))
       .filter(({ target, assessment }) => {
         if (options.mode === 'suggested' && !assessment.suggested) return false;
         return !query || `${target.id} ${target.name} ${target.faction?.name || ''} ${reason(target)}`.toLowerCase().includes(query);
@@ -198,7 +213,7 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
 })();
 
 const TargetListExport = (() => {
@@ -383,7 +398,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.14.1' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -460,6 +475,10 @@ function mountTargetList(platform, storageWarning = '') {
     authorizedPool: false, backgroundLoading: false, targetLoad: null, lastPoolAttemptAt: 0, backgroundRenderPending: false,
     busy: false, removingKey: false, open: false, generation: 0, error: '', query: '', mode: 'all',
     minRatio, maxRatio,
+    excludedFactionIds: Array.isArray(preferences?.excludedFactionIds) ? C.parseExcludedFactions(preferences.excludedFactionIds.join(',')) || [] : [],
+    avoidActive: preferences?.avoidActive === true,
+    activityMinutes: Number.isSafeInteger(preferences?.activityMinutes) && preferences.activityMinutes >= 1 && preferences.activityMinutes <= 10080 ? preferences.activityMinutes : 15,
+    targetExclusionsSupported: false,
     estimateDays: Number.isSafeInteger(preferences?.estimateDays) && preferences.estimateDays >= 1 && preferences.estimateDays <= 365
       ? preferences.estimateDays : C.DEFAULT_ESTIMATE_DAYS,
     recentTargets: C.recentTargets(preferences?.recentTargets), reservationsSupported: false, nextTargetSupported: null,
@@ -535,6 +554,7 @@ function mountTargetList(platform, storageWarning = '') {
     .actions button{font-size:11px;padding:5px 7px}.actions .attack{border-radius:6px}.actions small{font-size:10px;overflow-wrap:anywhere}.actions .check-status{background:transparent;border-color:transparent;color:var(--muted);order:2;padding:3px 0}
     .notes{grid-column:1/4;font-size:11px;color:var(--muted);overflow-wrap:anywhere;line-height:1.5}.empty{padding:24px 14px;text-align:center;background:var(--field);border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12px;margin:10px 0}
     .preferences{border-top:1px solid var(--line);margin-top:14px;padding-top:4px}.preferences>summary{padding:10px 0;font-size:12px;color:var(--muted)}.preferences-body{padding:4px 0 2px}.preferences h3{font-size:12px;font-weight:650;margin:10px 0 6px}.account{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:12px;margin-top:14px}.account button{font-size:11px}.account .muted{font-size:10px}
+    .avoid-settings{display:grid;gap:8px;margin:12px 0}.avoid-settings textarea{width:100%;resize:vertical}.avoid-settings label{display:grid;gap:5px}.avoid-settings .avoid-active{display:flex;align-items:center;gap:7px}.avoid-settings input[type=number]{width:100%;max-width:130px}
     .footnote{margin-top:14px;font-size:11px;color:var(--muted)}.pool-footer{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:10px;color:var(--muted)}.pool-warnings{color:#efd49a;font-size:11px;overflow-wrap:anywhere}.pool-warnings p{margin:8px 0}
     .tabs{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0;border-bottom:1px solid var(--line)}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:7px 0;background:transparent;color:var(--muted);font-size:12px}.tabs button[aria-pressed=true]{border-bottom-color:var(--accent);color:var(--text)}
     .suggestionform{display:grid;gap:12px;margin:14px 0 20px}.suggestionfields{display:grid;grid-template-columns:140px 1fr;gap:10px}
@@ -651,7 +671,8 @@ function mountTargetList(platform, storageWarning = '') {
     catch (error) { message(error.message); }
   }
   function savePreferences() { persist(() => platform.setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio,
-    estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets) })); }
+    estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets),
+    excludedFactionIds: state.excludedFactionIds, avoidActive: state.avoidActive, activityMinutes: state.activityMinutes })); }
   function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays); }
   function rememberTarget(id) {
     state.lastTargetId = id;
@@ -669,6 +690,7 @@ function mountTargetList(platform, storageWarning = '') {
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
     state.feedTargets = []; state.feedCursor = null; state.reservationsSupported = false; state.nextTargetSupported = null;
+    state.targetExclusionsSupported = false;
     state.retryAttempt = null; state.backendNotice = ''; state.feedFailures = 0; state.nextFeedAt = 0; state.hardRetryAt = 0;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
     state.backgroundRenderPending = false;
@@ -1411,6 +1433,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.player = data.player; state.targets = feed.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
         state.reservationsSupported = data.reservations?.supported === true;
         state.nextTargetSupported = data.capabilities?.nextTarget === true;
+        state.targetExclusionsSupported = data.capabilities?.targetExclusions === true;
         state.pendingSuggestionDetailsSupported = data.capabilities?.pendingSuggestionDetails === true;
         state.removalSupported = data.capabilities?.targetRemoval === true;
         state.backendNotice = data.capabilities?.schema?.status === 'incompatible' ? 'Backend database update required. Contact the NWA administrator.'
@@ -1458,9 +1481,20 @@ function mountTargetList(platform, storageWarning = '') {
     const current = () => !disposed && state.finding && findGeneration === state.findGeneration && generation === state.generation
       && targetGeneration === state.targetGeneration && state.token && Date.parse(state.expiresAt) > Date.now();
     try {
+      if ((state.excludedFactionIds.length || state.avoidActive) && !state.player) {
+        await loadTargets(false, true, false, 5000); targetGeneration = state.targetGeneration;
+        if (!current()) return;
+      }
+      if ((state.excludedFactionIds.length || state.avoidActive) && !state.targetExclusionsSupported) {
+        findNotice('Update the NWA backend to use faction and activity exclusions in the target finder. Your filters remain saved.'); return;
+      }
       if (state.nextTargetSupported !== false) {
         const selection = { minRatio: state.minRatio, maxRatio: state.maxRatio, estimateDays: state.estimateDays,
           recentTargetIds: C.recentTargets(state.recentTargets).slice(-50).map(row => row.id), query: state.query.trim().slice(0, 200), timeoutMs: 8000 };
+        if (state.excludedFactionIds.length || state.avoidActive) {
+          selection.excludedFactionIds = state.excludedFactionIds;
+          selection.minInactiveMinutes = state.avoidActive ? state.activityMinutes : 0;
+        }
         const signature = JSON.stringify(selection);
         if (!state.retryAttempt || state.retryAttempt.signature !== signature) {
           state.retryAttempt = { signature, requestId: typeof crypto !== 'undefined' && crypto.randomUUID
@@ -1472,6 +1506,7 @@ function mountTargetList(platform, storageWarning = '') {
           if (!current()) return;
           if (!data?.player?.battleStats || !Number.isSafeInteger(data?.target?.id) || data.target.id <= 0 || data.target.id > 2147483647
               || !(Date.parse(data.target.reservationExpiresAt) > Date.now()) || data.target.reserved
+              || C.avoidReason(data.target, state)
               || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).suggested
               || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).ready) {
             throw new Error('NWA could not verify the reserved target. Try again.');
@@ -1490,6 +1525,7 @@ function mountTargetList(platform, storageWarning = '') {
           if (error.status && (error.status < 500 || DEFINITE_SELECTION_FAILURES.has(error.code))) state.retryAttempt = null;
           if (error.status === 404 && error.code === 'NOT_FOUND') {
             state.nextTargetSupported = false; state.backendNotice = 'Backend update available for faster target selection.';
+            if (state.excludedFactionIds.length || state.avoidActive) throw new Error('Update the NWA backend to apply your faction and activity exclusions.');
           } else if (error.code === 'NO_TARGET_AVAILABLE') {
             findNotice('No matching targets are available right now. Adjust your filters or try again shortly.'); return;
           } else throw error;
@@ -1553,7 +1589,7 @@ function mountTargetList(platform, storageWarning = '') {
         state.targets = state.targets.map(row => row.id === target.id ? { ...row, ...checked } : row);
         const latest = state.targets.find(row => row.id === target.id);
         const assessment = latest && assessTarget(latest);
-        if (!assessment?.suggested || !assessment.ready) continue;
+        if (!assessment?.suggested || !assessment.ready || C.avoidReason(latest, state)) continue;
         rememberTarget(target.id);
         findNotice(`Opening ${latest.name || 'target'}…`);
         window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`);
@@ -1579,6 +1615,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   async function checkStatus(id, openAttack = false) {
     if (state.removingKey || state.pendingChecks.has(id)) return;
+    if (openAttack && C.avoidReason(state.targets.find(target => target.id === id) || {}, state)) { message('This player is excluded by your target preferences.'); return; }
     if (openAttack && !state.reservationsSupported) { message(COORDINATION_UNAVAILABLE); renderCards(); return; }
     state.pendingChecks.add(id); message(''); renderCards();
     const generation = state.generation;
@@ -1593,6 +1630,7 @@ function mountTargetList(platform, storageWarning = '') {
         const latest = state.targets.find(target => target.id === id);
         const assessment = latest && assessTarget(latest);
         if (!state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh() || !assessment?.suggested || !assessment.ready
+          || C.avoidReason(latest, state)
           || !state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
           throw new Error('This target is no longer ready. Refresh the list and try another.');
         }
@@ -1856,6 +1894,11 @@ function mountTargetList(platform, storageWarning = '') {
     // Background changes must not overwrite a number the member is still typing.
     for (const [property, node] of panelUi.ratios) if (root.activeElement !== node) node.value = panelUi.percent(state[property]);
     if (root.activeElement !== panelUi.age) panelUi.age.value = String(state.estimateDays);
+    if (panelUi.avoidActive) {
+      panelUi.avoidActive.checked = state.avoidActive;
+      if (root.activeElement !== panelUi.activityMinutes) panelUi.activityMinutes.value = String(state.activityMinutes);
+      setText(panelUi.exclusionSummary, state.excludedFactionIds.length + ' faction(s) avoided' + (state.avoidActive ? ' · Skip activity within ' + state.activityMinutes + ' minutes and unknown activity.' : ''));
+    }
     panelUi.ageCaution.hidden = state.estimateDays <= 28;
     setText(panelUi.estimateNote, `Possible matches use estimated total stats, with estimates no older than ${state.estimateDays} days. This is a rough difficulty guide: stat distribution, equipment and bonuses also affect fights.`);
     const metadata = JSON.stringify([state.warnings, state.generatedAt, state.backendNotice]);
@@ -2014,6 +2057,31 @@ function mountTargetList(platform, storageWarning = '') {
     preferencesBody.append(element('h3', 'Target preferences'), ageControls);
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
     ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; preferencesBody.append(ageCaution);
+    const avoidSettings = element('section', null, 'avoid-settings'); avoidSettings.setAttribute('aria-label', 'Personal target exclusions');
+    const factionsLabel = element('label', 'Avoid faction IDs'), factions = focusKey(element('textarea'), 'preferences:excluded-factions');
+    factions.rows = 2; factions.maxLength = 1400; factions.value = state.excludedFactionIds.join(', ');
+    factions.setAttribute('aria-label', 'Avoid faction IDs'); factions.placeholder = 'For example: 12345, 67890'; factionsLabel.append(factions);
+    const factionSave = button('Save avoided factions', () => {
+      const ids = C.parseExcludedFactions(factions.value);
+      if (ids === null) { message('Enter up to 100 valid faction IDs, separated by commas or spaces. Your previous exclusions are unchanged.'); return; }
+      state.excludedFactionIds = ids; factions.value = ids.join(', '); savePreferences(); cancelFind(); message(''); render();
+    });
+    const activeLabel = element('label', null, 'avoid-active'), active = focusKey(element('input'), 'preferences:avoid-active');
+    active.type = 'checkbox'; active.checked = state.avoidActive; active.setAttribute('aria-label', 'Avoid active players');
+    active.addEventListener('change', () => { state.avoidActive = active.checked; savePreferences(); cancelFind(); message(''); render(); });
+    activeLabel.append(active, element('span', 'Avoid active players'));
+    const minutesLabel = element('label', 'Active within the last (minutes)'), minutes = focusKey(element('input'), 'preferences:activity-minutes');
+    minutes.type = 'number'; minutes.min = '1'; minutes.max = '10080'; minutes.step = '1'; minutes.value = String(state.activityMinutes); minutes.setAttribute('aria-label', 'Activity cutoff in minutes');
+    minutes.addEventListener('change', () => {
+      const next = Number(minutes.value);
+      if (!minutes.value.trim() || !Number.isSafeInteger(next) || next < 1 || next > 10080) { minutes.value = String(state.activityMinutes); message('Enter a whole number from 1 to 10080 minutes.'); return; }
+      state.activityMinutes = next; savePreferences(); cancelFind(); message(''); render();
+    }); minutesLabel.append(minutes);
+    const summary = element('p', '', 'notice'); panelUi.avoidActive = active; panelUi.activityMinutes = minutes; panelUi.exclusionSummary = summary;
+    setText(summary, state.excludedFactionIds.length + ' faction(s) avoided' + (state.avoidActive ? ' · Skip activity within ' + state.activityMinutes + ' minutes and unknown activity.' : ''));
+    avoidSettings.append(factionsLabel, factionSave, activeLabel, minutesLabel, summary,
+      element('small', 'Personal filters only. Separate IDs with commas, spaces or new lines; clear the field and save to remove exclusions. Unknown activity is skipped when avoiding active players. Shared NWA membership and profile notices stay visible.'));
+    preferencesBody.append(avoidSettings);
     const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
     const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
     for (const [value, label] of [['all', 'All targets'], ['shown', 'Shown targets']]) {
@@ -2202,6 +2270,7 @@ function mountTargetList(platform, storageWarning = '') {
     let range = 0, old = 0, unknown = 0, ready = 0;
     const now = Date.now();
     for (const target of state.targets) {
+      if (C.avoidReason(target, state, now)) continue;
       const assessment = C.assess(target, state.player, state.maxRatio, now, state.minRatio, state.estimateDays);
       if (!assessment.allied && assessment.inRange) range++;
       if (assessment.ratio !== null && !assessment.fresh) old++;
@@ -2224,14 +2293,15 @@ function mountTargetList(platform, storageWarning = '') {
     });
   }
   function renderTargetCards() {
-    const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays]);
+    const filterKey = JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays, state.excludedFactionIds, state.avoidActive, state.activityMinutes]);
     if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
     const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
     const selected = new Map();
-    let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0;
+    let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0, excluded = 0;
     // Assess each target once for filtering, counts, ordering and its card.
     for (const target of state.targets) {
+      if (C.avoidReason(target, state, now)) { excluded++; continue; }
       const assessment = C.assess(target, state.player, state.maxRatio, now, state.minRatio, state.estimateDays);
       if (!assessment.allied && assessment.inRange) range++;
       if (assessment.ratio !== null && !assessment.fresh) old++;
@@ -2251,7 +2321,7 @@ function mountTargetList(platform, storageWarning = '') {
         || (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id).map(row => row.target.id);
     }
     const rows = orderedIds.map(id => selected.get(id));
-    const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
+    const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now${excluded ? ' · ' + excluded + ' excluded by your settings' : ''}`;
     const shownReady = freshPool && state.reservationsSupported
       ? rows.filter(({ target, assessment }) => assessment.suggested && assessment.ready && !target.reserved).length : 0;
     const visibleRows = rows.slice(0, visibleCardLimit), visibleIds = visibleRows.map(row => row.target.id), visibleIdSet = new Set(visibleIds);
@@ -2325,7 +2395,7 @@ function mountTargetList(platform, storageWarning = '') {
         }
         const latest = state.targets.find(t => t.id === target.id);
         const currentAssessment = latest && assessTarget(latest);
-        if (!latest || !state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh()
+        if (!latest || C.avoidReason(latest, state) || !state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh()
             || latest.reserved || !currentAssessment.suggested || !currentAssessment.ready) {
           event.preventDefault(); message('Check the status and stat range for this target before opening an attack.'); renderCards(); return false;
         }

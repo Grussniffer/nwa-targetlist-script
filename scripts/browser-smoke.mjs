@@ -190,6 +190,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         }
         if (window.__mock.reservations) data.reservations = window.__mock.reservations;
         if (window.__mock.nextTarget) data.capabilities = { nextTarget: true, requestDeadlineMs: 8000, schema: { status: 'ready', failedChecks: [] } };
+        if (window.__mock.targetExclusions) data.capabilities = { ...data.capabilities, targetExclusions: true };
         if (window.__mock.removalEnabled) data.capabilities = { ...data.capabilities, targetRemoval: true };
       } else if (url.pathname === '/api/targets/remove' && request.method === 'POST') {
         if (!window.__mock.canReview) {
@@ -205,7 +206,10 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         } else {
           const selection = JSON.parse(request.data);
           const target = targets.find(row => row.estimatedStats / player.battleStats.total >= selection.minRatio
-            && row.estimatedStats / player.battleStats.total <= selection.maxRatio && !selection.recentTargetIds.includes(row.id));
+            && row.estimatedStats / player.battleStats.total <= selection.maxRatio && !selection.recentTargetIds.includes(row.id)
+            && !(selection.excludedFactionIds || []).includes(row.faction?.id)
+            && (selection.minInactiveMinutes == null || selection.minInactiveMinutes === 0 || typeof row.lastAction === 'number' && Number.isFinite(row.lastAction)
+              && row.lastAction > 0 && row.lastAction <= Date.now() / 1000 - selection.minInactiveMinutes * 60));
           if (!target) {
             status = 409; data = { error: { code: 'NO_TARGET_AVAILABLE', message: 'No matching target.' } };
           } else {
@@ -908,6 +912,121 @@ async function checkPageAdminManagement(pageContext, scripts, mode) {
     mode+': opening a pending request does not submit or approve it');
   await pending.close();
   console.log('PASS ' + mode + ' contextual profile/attack admin add+approve and removal: lazy cached permissions, mandatory reason/confirmation, immediate badges, compact bounds and native transport');
+}
+
+
+function installAvoidanceFixture({ entries = [], supported = true } = {}) {
+  const mock = window.__mock, now = Math.floor(Date.now() / 1000);
+  for (const [key, value] of entries) mock.store.set(key, value);
+  mock.nextTarget = true; mock.targetExclusions = supported;
+  const names = ['Avoided faction player', 'Active player', 'Unknown activity player', 'Inactive player'];
+  for (let index = 0; index < mock.targets.length; index++) Object.assign(mock.targets[index], {
+    name: names[index], estimatedStats: 300000, estimateUpdatedAt: now - 3600,
+    faction: { id: index === 0 ? 77001 : 77002, name: index === 0 ? 'Avoided faction' : 'Allowed target faction' },
+    lastAction: index === 1 ? now - 60 : index === 2 ? null : now - 3600,
+    status: { state: 'Okay', description: 'Okay (avoidance mock)', until: null }, checkedAt: new Date(Date.now()).toISOString(),
+    reason: 'Original NWA reason remains visible.'
+  });
+  const content = document.createElement('main'); content.id = 'content-wrapper';
+  content.style.cssText='margin:160px 16px 0;width:calc(100% - 32px);padding:0';
+  content.innerHTML='<h1>Player [101]</h1><p>Listed player remains labelled even when personal filters exclude them.</p>';
+  document.body.append(content);
+}
+async function checkAvoidancePreferences(pageContext, scripts, mode) {
+  for (const width of mode === 'PDA' ? [390,320] : [1280]) {
+    const label=mode.toLowerCase()+'-'+width, viewport={width,height:900};
+    const page=await mount(viewport,scripts,pageContext,installAvoidanceFixture,{},'https://www.torn.com/profiles.php?XID=101');
+    await login(page);
+    assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Avoid active players"]').checked),false,
+      label+': activity avoidance starts disabled');
+    assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Activity cutoff in minutes"]').value),'15');
+    const before=await page.evaluate(()=>window.__mock.requests.length);
+    await shadow(page,'[aria-label="Avoid faction IDs"]','fill','77001, 77003\n77001');
+    await clickButton(page,'Save avoided factions');
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===3);
+    assert.equal(await cardSnapshot(page,101),null,label+': avoided faction is excluded from target cards');
+    assert.equal(await page.evaluate(()=>document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode')),'listed',
+      label+': personal avoidance never hides the listed-player reason notice');
+    await openPlayerNotice(page);
+    assert.match(await page.evaluate(()=>window.__playerNoticeShadow.querySelector('.full-reason').textContent),/Original NWA reason/);
+    await page.evaluate(()=>window.__playerNoticeShadow.querySelector('summary').click());
+    await page.evaluate(()=>{
+      const input=window.__targetlistShadow.querySelector('[aria-label="Avoid active players"]');
+      input.checked=true;input.dispatchEvent(new Event('change',{bubbles:true}));
+    });
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===1);
+    assert.ok(await cardSnapshot(page,104));
+    assert.equal(await cardSnapshot(page,102),null,label+': active players are excluded');
+    assert.equal(await cardSnapshot(page,103),null,label+': unknown activity cannot be treated as inactive');
+    await wait(page,()=>window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin)?.avoidActive===true);
+    const priorPreferences=await page.evaluate(()=>JSON.stringify(window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin)));
+    for(const invalid of ['77001, nonsense','0','2147483648',Array.from({length:101},(_,i)=>String(80000+i)).join(' ')]) {
+      await shadow(page,'[aria-label="Avoid faction IDs"]','fill',invalid);
+      await clickButton(page,'Save avoided factions');
+      assert.equal(await page.evaluate(()=>JSON.stringify(window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin))),priorPreferences,
+        label+': invalid faction input does not replace saved filters');
+      assert.ok(await cardSnapshot(page,104));
+    }
+    await shadow(page,'[aria-label="Avoid faction IDs"]','fill','77001,77003');
+    await clickButton(page,'Save avoided factions');
+    await shadow(page,'[aria-label="Export scope"]','select','shown');await clickButton(page,'Export CSV');
+    const shown=await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Exported target list"]').value);
+    assert.match(shown,/Inactive player/);assert.doesNotMatch(shown,/Avoided faction player|Unknown activity player|Active player/);
+    await shadow(page,'[aria-label="Export scope"]','select','all');await clickButton(page,'Export CSV');
+    const all=await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Exported target list"]').value);
+    for(const name of ['Avoided faction player','Active player','Unknown activity player','Inactive player'])assert.ok(all.includes(name));
+    await clickButton(page,'Close export');
+    // The new controls stay inside the existing preferences panel on small PDA viewports.
+    const geometry=await page.evaluate(()=>{
+      const root=window.__targetlistShadow,panel=root.querySelector('.panel').getBoundingClientRect(),input=root.querySelector('[aria-label="Avoid faction IDs"]').getBoundingClientRect();
+      return {left:panel.left,right:panel.right,inputLeft:input.left,inputRight:input.right,width:innerWidth,
+        overflow:root.querySelector('.scroll').scrollWidth>root.querySelector('.scroll').clientWidth+1};
+    });
+    assert(geometry.left>=0&&geometry.right<=width&&geometry.inputLeft>=0&&geometry.inputRight<=width&&!geometry.overflow,
+      label+': avoidance controls fit the viewport '+JSON.stringify(geometry));
+    await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Avoid faction IDs"]').scrollIntoView({block:'center'}));
+    await page.screenshot({path:path.join(artifacts,'browser-avoidance-'+label+'.png'),fullPage:true});
+    const saved=await page.evaluate(()=>[...window.__mock.store]);
+    await shadow(page,'[aria-label="Close NWA settings"]','click');
+    const destination='https://www.torn.com/page.php?sid=attack&user2ID=104';
+    await page.evaluate(()=>window.__mock.holds.push('/api/targets/next'));
+    const navigated=page.waitForURL(destination,{timeout:5000});
+    await page.route('https://www.torn.com/page.php?sid=attack&user2ID=*',route=>{
+      assert.equal(new URL(route.request().url()).searchParams.get('user2ID'),'104',label+': finder never navigates to excluded or active targets');
+      return route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><h1>Filtered reserved mock destination</h1>'});
+    });
+    await shadow(page,'.launcher','click');
+    await wait(page,()=>window.__mock.pending.some(request=>new URL(request.url).pathname==='/api/targets/next'));
+    const selection=await page.evaluate(()=>JSON.parse(window.__mock.requests.find(row=>row.path==='/api/targets/next').data));
+    assert.deepEqual(selection.excludedFactionIds,[77001,77003],label+': finder sends the saved faction exclusions');
+    assert.equal(selection.minInactiveMinutes,15,label+': finder enforces the saved activity cutoff on the backend');
+    if(mode==='PDA')assert.equal(await page.evaluate(()=>window.__mock.pda.calls.some(call=>call.name==='PDA_httpPost'
+      &&new URL(call.args[0]).pathname==='/api/targets/next')),true,label+': filtered finder uses native PDA transport');
+    await page.evaluate(()=>window.__mock.release('/api/targets/next'));
+    await navigated;
+    await page.close();
+    const restored=await mount(viewport,scripts,pageContext,installAvoidanceFixture,{entries:saved},'https://www.torn.com/profiles.php?XID=101');
+    await wait(restored,()=>window.__mock.feedResponses.length===1);
+    await shadow(restored,'.settings-toggle','click');
+    await wait(restored,()=>window.__targetlistShadow.querySelectorAll('.card').length===1);
+    assert.ok(await cardSnapshot(restored,104));
+    assert.equal(await restored.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Avoid active players"]').checked),true);
+    assert.equal(await restored.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Activity cutoff in minutes"]').value),'15');
+    assert.equal(await restored.evaluate(()=>window.__mock.requests.some(row=>row.path==='/api/session'&&row.method==='POST')),false,
+      label+': restored settings reuse the existing login');
+    await restored.evaluate(()=>{window.__mock.targets[2].lastAction=Math.floor(Date.now()/1000)+600;});
+    await refreshMockFeed(restored);
+    assert.equal(await cardSnapshot(restored,103),null,label+': future activity is not considered inactive');
+    const old=await mount(viewport,scripts,pageContext,installAvoidanceFixture,{entries:saved,supported:false},'https://www.torn.com/profiles.php?XID=101');
+    await wait(old,()=>window.__mock.feedResponses.length===1);
+    await shadow(old,'.launcher','click');
+    await wait(old,()=>window.__targetlistShadow.textContent.toLowerCase().includes('backend')&&window.__targetlistShadow.textContent.toLowerCase().includes('update'));
+    assert.equal(await old.evaluate(()=>window.__mock.requests.some(row=>row.path==='/api/targets/next')),false,
+      label+': older backends cannot bypass saved exclusions');
+    assert.match(old.url(),/profiles.php\?XID=101$/);
+    await old.close();await restored.close();
+  }
+  console.log('PASS '+mode+' local faction/activity avoidance: strict saved IDs, activity/unknown/future exclusion, shown exports, filtered finder, notice preservation, durable settings and old-backend blocking');
 }
 
 async function checkAdminManagement(pageContext, scripts, mode) {
@@ -2897,6 +3016,7 @@ try {
   await checkExports(context, [source], 'GM');
   await checkAdminManagement(context, [source], 'GM');
   await checkPageAdminManagement(context, [source], 'GM');
+  await checkAvoidancePreferences(context, [source], 'GM');
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
   try {
@@ -2908,6 +3028,7 @@ try {
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkPageAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkAvoidancePreferences(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
   }
   finally { await deltaPdaContext.close(); }
 
