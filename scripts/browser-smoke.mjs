@@ -941,10 +941,26 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
       label+': activity avoidance starts disabled');
     assert.equal(await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Activity cutoff in minutes"]').value),'15');
     const before=await page.evaluate(()=>window.__mock.requests.length);
-    await shadow(page,'[aria-label="Avoid faction IDs"]','fill','77001, 77003\n77001');
-    await clickButton(page,'Save avoided factions');
+    const options=await page.evaluate(()=>[...window.__targetlistShadow.querySelector('[aria-label="Faction to avoid"]').options]
+      .filter(option=>Number(option.value)>0).map(option=>({value:option.value,text:option.textContent})));
+    assert.deepEqual(options,[{value:'77002',text:'Allowed target faction [77002]'},{value:'77001',text:'Avoided faction [77001]'}],
+      label+': the native dropdown lists faction names alphabetically from the complete pool');
+    await shadow(page,'[aria-label="Faction to avoid"]','select','77001');
+    await clickButton(page,'Avoid faction');
     await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===3);
     assert.equal(await cardSnapshot(page,101),null,label+': avoided faction is excluded from target cards');
+    assert.equal(await page.evaluate(()=>[...window.__targetlistShadow.querySelector('[aria-label="Faction to avoid"]').options]
+      .some(option=>option.value==='77001')),false,label+': an avoided faction is omitted from the add dropdown');
+    await shadow(page,'[aria-label="Faction to avoid"]','select','77002');await clickButton(page,'Avoid faction');
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===0);
+    await shadow(page,'[aria-label="Stop avoiding Allowed target faction"]','click');
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===3);
+    assert.equal(await page.evaluate(()=>[...window.__targetlistShadow.querySelector('[aria-label="Faction to avoid"]').options]
+      .some(option=>option.value==='77002')),true,label+': removing one exclusion offers that named faction again');
+    await clickButton(page,'Clear avoided factions');await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===4);
+    await shadow(page,'[aria-label="Faction to avoid"]','select','77001');await clickButton(page,'Avoid faction');
+    await wait(page,()=>window.__targetlistShadow.querySelectorAll('.card').length===3);
+    assert.equal(await page.evaluate(()=>window.__mock.requests.length),before,label+': adding, removing and clearing named factions never calls an API');
     assert.equal(await page.evaluate(()=>document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode')),'listed',
       label+': personal avoidance never hides the listed-player reason notice');
     await openPlayerNotice(page);
@@ -959,16 +975,6 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     assert.equal(await cardSnapshot(page,102),null,label+': active players are excluded');
     assert.equal(await cardSnapshot(page,103),null,label+': unknown activity cannot be treated as inactive');
     await wait(page,()=>window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin)?.avoidActive===true);
-    const priorPreferences=await page.evaluate(()=>JSON.stringify(window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin)));
-    for(const invalid of ['77001, nonsense','0','2147483648',Array.from({length:101},(_,i)=>String(80000+i)).join(' ')]) {
-      await shadow(page,'[aria-label="Avoid faction IDs"]','fill',invalid);
-      await clickButton(page,'Save avoided factions');
-      assert.equal(await page.evaluate(()=>JSON.stringify(window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin))),priorPreferences,
-        label+': invalid faction input does not replace saved filters');
-      assert.ok(await cardSnapshot(page,104));
-    }
-    await shadow(page,'[aria-label="Avoid faction IDs"]','fill','77001,77003');
-    await clickButton(page,'Save avoided factions');
     await shadow(page,'[aria-label="Export scope"]','select','shown');await clickButton(page,'Export CSV');
     const shown=await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Exported target list"]').value);
     assert.match(shown,/Inactive player/);assert.doesNotMatch(shown,/Avoided faction player|Unknown activity player|Active player/);
@@ -978,13 +984,13 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     await clickButton(page,'Close export');
     // The new controls stay inside the existing preferences panel on small PDA viewports.
     const geometry=await page.evaluate(()=>{
-      const root=window.__targetlistShadow,panel=root.querySelector('.panel').getBoundingClientRect(),input=root.querySelector('[aria-label="Avoid faction IDs"]').getBoundingClientRect();
+      const root=window.__targetlistShadow,panel=root.querySelector('.panel').getBoundingClientRect(),input=root.querySelector('[aria-label="Faction to avoid"]').getBoundingClientRect();
       return {left:panel.left,right:panel.right,inputLeft:input.left,inputRight:input.right,width:innerWidth,
         overflow:root.querySelector('.scroll').scrollWidth>root.querySelector('.scroll').clientWidth+1};
     });
     assert(geometry.left>=0&&geometry.right<=width&&geometry.inputLeft>=0&&geometry.inputRight<=width&&!geometry.overflow,
       label+': avoidance controls fit the viewport '+JSON.stringify(geometry));
-    await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Avoid faction IDs"]').scrollIntoView({block:'center'}));
+    await page.evaluate(()=>window.__targetlistShadow.querySelector('[aria-label="Faction to avoid"]').scrollIntoView({block:'center'}));
     await page.screenshot({path:path.join(artifacts,'browser-avoidance-'+label+'.png'),fullPage:true});
     const saved=await page.evaluate(()=>[...window.__mock.store]);
     await shadow(page,'[aria-label="Close NWA settings"]','click');
@@ -998,7 +1004,7 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     await shadow(page,'.launcher','click');
     await wait(page,()=>window.__mock.pending.some(request=>new URL(request.url).pathname==='/api/targets/next'));
     const selection=await page.evaluate(()=>JSON.parse(window.__mock.requests.find(row=>row.path==='/api/targets/next').data));
-    assert.deepEqual(selection.excludedFactionIds,[77001,77003],label+': finder sends the saved faction exclusions');
+    assert.deepEqual(selection.excludedFactionIds,[77001],label+': finder sends the saved faction exclusions');
     assert.equal(selection.minInactiveMinutes,15,label+': finder enforces the saved activity cutoff on the backend');
     if(mode==='PDA')assert.equal(await page.evaluate(()=>window.__mock.pda.calls.some(call=>call.name==='PDA_httpPost'
       &&new URL(call.args[0]).pathname==='/api/targets/next')),true,label+': filtered finder uses native PDA transport');
@@ -1017,6 +1023,21 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     await restored.evaluate(()=>{window.__mock.targets[2].lastAction=Math.floor(Date.now()/1000)+600;});
     await refreshMockFeed(restored);
     assert.equal(await cardSnapshot(restored,103),null,label+': future activity is not considered inactive');
+    const legacyEntries=structuredClone(saved),preference=legacyEntries.find(([key])=>key.startsWith('targetlist.preferences.'))[1];
+    preference.excludedFactionIds=[77001,77003,77004];
+    preference.excludedFactionNames={...preference.excludedFactionNames,77003:'Old target faction'};
+    const legacy=await mount(viewport,scripts,pageContext,installAvoidanceFixture,{entries:legacyEntries},'https://www.torn.com/profiles.php?XID=101');
+    await wait(legacy,()=>window.__mock.feedResponses.length===1);await shadow(legacy,'.settings-toggle','click');
+    await wait(legacy,()=>window.__targetlistShadow.querySelectorAll('.card').length===1);
+    await shadow(legacy,'[aria-label="Stop avoiding Old target faction"]','click');
+    await wait(legacy,()=>!window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin).excludedFactionIds.includes(77003));
+    await shadow(legacy,'[aria-label="Stop avoiding Faction 77004"]','click');
+    await wait(legacy,()=>!window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin).excludedFactionIds.includes(77004));
+    await clickButton(legacy,'Clear avoided factions');
+    await wait(legacy,()=>window.__mock.store.get('targetlist.preferences.'+window.__mock.serviceOrigin).excludedFactionIds.length===0);
+    assert.equal(await legacy.evaluate(()=>window.__mock.requests.filter(row=>row.path!=='/api/targets').length),0,
+      label+': legacy IDs and missing faction names can be removed entirely locally');
+    await legacy.close();
     const old=await mount(viewport,scripts,pageContext,installAvoidanceFixture,{entries:saved,supported:false},'https://www.torn.com/profiles.php?XID=101');
     await wait(old,()=>window.__mock.feedResponses.length===1);
     await shadow(old,'.launcher','click');
@@ -1026,7 +1047,7 @@ async function checkAvoidancePreferences(pageContext, scripts, mode) {
     assert.match(old.url(),/profiles.php\?XID=101$/);
     await old.close();await restored.close();
   }
-  console.log('PASS '+mode+' local faction/activity avoidance: strict saved IDs, activity/unknown/future exclusion, shown exports, filtered finder, notice preservation, durable settings and old-backend blocking');
+  console.log('PASS '+mode+' named faction/activity avoidance: alphabetic options, local add/remove/clear, legacy IDs, activity/unknown/future exclusion, shown exports, filtered finder, notice preservation, durable settings and old-backend blocking');
 }
 
 async function checkAdminManagement(pageContext, scripts, mode) {

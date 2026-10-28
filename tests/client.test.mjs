@@ -2606,7 +2606,11 @@ test('Admin discards stale responses on logout and removes controls when leaders
 
 
 function saveAvoidedFactions(app,value) {
-  const input=app.find(node=>node.attributes.get('aria-label')==='Avoid faction IDs');input.value=value;app.button('Save avoided factions').emit('click');
+  const ids=/^[1-9]\d*(?:[\s,]+[1-9]\d*)*$/.test(value)?[...new Set(value.split(/[\s,]+/))]:[value];
+  for(const id of ids) {
+    const input=app.find(node=>node.attributes.get('aria-label')==='Faction to avoid');
+    input.value=id;input.emit('change');app.button('Avoid faction').emit('click');
+  }
 }
 function avoidActive(app,checked=true) {
   const input=app.find(node=>node.attributes.get('aria-label')==='Avoid active players');input.checked=checked;input.emit('change');
@@ -2650,4 +2654,36 @@ test('old backends cannot silently ignore saved exclusions and changing preferen
   app.button('NWA').emit('click');const pending=app.requests.at(-1);saveAvoidedFactions(app,'222');
   app.response(pending,{player,target:{...target,checkedAt:new Date(NOW).toISOString(),reservationExpiresAt:new Date(NOW+120000).toISOString(),reserved:false}});await flush();
   assert.deepEqual(app.navigations,[]);
+});
+
+
+test('faction dropdown uses unique full-pool names, saves multiple choices instantly and supports removal and clear',async()=>{
+  const app=fixture();await app.signIn(avoidancePool());const before=app.requests.length;
+  const dropdown=()=>app.find(node=>node.attributes.get('aria-label')==='Faction to avoid');
+  assert.deepEqual(dropdown().children.map(node=>node.textContent),['Choose a faction...','Safe faction [333]','Target Faction [222]']);
+  saveAvoidedFactions(app,'333');saveAvoidedFactions(app,'222');await flush();
+  assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222,333]);
+  assert.equal(app.storage.get(app.preferencesKey).excludedFactionNames[333],'Safe faction');
+  assert.equal(dropdown().disabled,true);assert.equal(app.button('Avoid faction').disabled,true);
+  app.find(node=>node.attributes.get('aria-label')==='Stop avoiding Safe faction').emit('click');await flush();
+  assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222]);
+  assert.equal(dropdown().children.some(node=>node.value==='333'),true);
+  assert.equal(descendants(app.root).filter(node=>node.className==='card').length,2);
+  app.button('Clear avoided factions').emit('click');await flush();
+  assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[]);
+  assert.equal(descendants(app.root).filter(node=>node.className==='card').length,3);
+  assert.equal(app.requests.length,before,'Choosing and removing factions uses the existing feed and local storage only.');
+});
+
+test('legacy exclusions outside the current pool retain remembered names and remain removable',async()=>{
+  const app=fixture(null,{excludedFactionIds:[222,444,555],excludedFactionNames:{444:'Remembered Faction'}});
+  await app.signIn(avoidancePool());
+  assert.match(app.text(),/Remembered Faction \(not in the current pool\)/);
+  assert.match(app.text(),/Faction 555 \(not in the current pool\)/);
+  app.find(node=>node.attributes.get('aria-label')==='Stop avoiding Faction 555').emit('click');await flush();
+  assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222,444]);
+  assert.equal(app.storage.get(app.preferencesKey).excludedFactionNames[444],'Remembered Faction');
+  app.button('Refresh list').emit('click');app.response(app.requests.at(-1),{player,targets:[],warnings:[],reservations:coordination});await flush();
+  assert.ok(app.find(node=>node.attributes.get('aria-label')==='Stop avoiding Target Faction'));
+  assert.deepEqual([...app.storage.get(app.preferencesKey).excludedFactionIds],[222,444]);
 });

@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -77,6 +77,7 @@ function mountTargetList(platform, storageWarning = '') {
     busy: false, removingKey: false, open: false, generation: 0, error: '', query: '', mode: 'all',
     minRatio, maxRatio,
     excludedFactionIds: Array.isArray(preferences?.excludedFactionIds) ? C.parseExcludedFactions(preferences.excludedFactionIds.join(',')) || [] : [],
+    excludedFactionNames: {},
     avoidActive: preferences?.avoidActive === true,
     activityMinutes: Number.isSafeInteger(preferences?.activityMinutes) && preferences.activityMinutes >= 1 && preferences.activityMinutes <= 10080 ? preferences.activityMinutes : 15,
     targetExclusionsSupported: false,
@@ -95,6 +96,10 @@ function mountTargetList(platform, storageWarning = '') {
     pendingSuggestionDetailsSupported: false, pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
+  for (const id of state.excludedFactionIds) {
+    const name = preferences?.excludedFactionNames?.[id];
+    if (typeof name === 'string' && name.trim() && name.length <= 100) state.excludedFactionNames[id] = name.trim();
+  }
   let exportSnapshot = null, exportView = null;
   const css = document.createElement('style');
   css.textContent = `
@@ -155,7 +160,7 @@ function mountTargetList(platform, storageWarning = '') {
     .actions button{font-size:11px;padding:5px 7px}.actions .attack{border-radius:6px}.actions small{font-size:10px;overflow-wrap:anywhere}.actions .check-status{background:transparent;border-color:transparent;color:var(--muted);order:2;padding:3px 0}
     .notes{grid-column:1/4;font-size:11px;color:var(--muted);overflow-wrap:anywhere;line-height:1.5}.empty{padding:24px 14px;text-align:center;background:var(--field);border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12px;margin:10px 0}
     .preferences{border-top:1px solid var(--line);margin-top:14px;padding-top:4px}.preferences>summary{padding:10px 0;font-size:12px;color:var(--muted)}.preferences-body{padding:4px 0 2px}.preferences h3{font-size:12px;font-weight:650;margin:10px 0 6px}.account{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding-top:12px;margin-top:14px}.account button{font-size:11px}.account .muted{font-size:10px}
-    .avoid-settings{display:grid;gap:8px;margin:12px 0}.avoid-settings textarea{width:100%;resize:vertical}.avoid-settings label{display:grid;gap:5px}.avoid-settings .avoid-active{display:flex;align-items:center;gap:7px}.avoid-settings input[type=number]{width:100%;max-width:130px}
+    .avoid-settings{display:grid;gap:8px;margin:12px 0}.avoid-settings select{width:100%;max-width:100%}.avoid-settings label{display:grid;gap:5px}.avoid-settings .avoid-active{display:flex;align-items:center;gap:7px}.avoid-settings input[type=number]{width:100%;max-width:130px}.avoided-factions{display:grid;gap:6px}.avoided-faction{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.avoided-faction span{min-width:0;overflow-wrap:anywhere}.avoided-faction button{flex:0 0 auto;min-height:36px}
     .footnote{margin-top:14px;font-size:11px;color:var(--muted)}.pool-footer{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:10px;color:var(--muted)}.pool-warnings{color:#efd49a;font-size:11px;overflow-wrap:anywhere}.pool-warnings p{margin:8px 0}
     .tabs{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0;border-bottom:1px solid var(--line)}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;padding:7px 0;background:transparent;color:var(--muted);font-size:12px}.tabs button[aria-pressed=true]{border-bottom-color:var(--accent);color:var(--text)}
     .suggestionform{display:grid;gap:12px;margin:14px 0 20px}.suggestionfields{display:grid;grid-template-columns:140px 1fr;gap:10px}
@@ -273,7 +278,8 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function savePreferences() { persist(() => platform.setValue(preferencesKey, { minRatio: state.minRatio, maxRatio: state.maxRatio,
     estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets),
-    excludedFactionIds: state.excludedFactionIds, avoidActive: state.avoidActive, activityMinutes: state.activityMinutes })); }
+    excludedFactionIds: state.excludedFactionIds, avoidActive: state.avoidActive, activityMinutes: state.activityMinutes,
+    ...(Object.keys(state.excludedFactionNames).length ? { excludedFactionNames: state.excludedFactionNames } : {}) })); }
   function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays); }
   function rememberTarget(id) {
     state.lastTargetId = id;
@@ -1467,6 +1473,45 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionContainer = null; suggestionSignature = null; cardNodes.clear();
     orderedRowsKey = null; orderedIds = []; mountedIds = []; emptyCard = null;
   }
+  function factionChoices() {
+    const factions = new Map();
+    for (const target of state.targets) {
+      const faction = target.faction;
+      if (!Number.isSafeInteger(faction?.id) || faction.id <= 0 || faction.id > 2147483647) continue;
+      const name = typeof faction.name === 'string' && faction.name.trim() ? faction.name.trim() : 'Faction ' + faction.id;
+      if (!factions.has(faction.id)) factions.set(faction.id, name);
+    }
+    return [...factions].sort((a, b) => a[1].localeCompare(b[1]) || a[0] - b[0]);
+  }
+  function updateFactionPreferences() {
+    if (!panelUi?.factionSelect) return;
+    const choices = factionChoices(), known = new Map(choices);
+    for (const id of state.excludedFactionIds) if (known.has(id)) state.excludedFactionNames[id] = known.get(id);
+    const signature = JSON.stringify([choices, state.excludedFactionIds, state.excludedFactionNames]);
+    if (signature === panelUi.factionSignature) return;
+    panelUi.factionSignature = signature;
+    const selected = panelUi.factionSelect.value;
+    panelUi.factionSelect.replaceChildren();
+    const available = choices.filter(([id]) => !state.excludedFactionIds.includes(id));
+    const placeholder = element('option', available.length ? 'Choose a faction...' : 'No more factions in the target pool'); placeholder.value = ''; panelUi.factionSelect.append(placeholder);
+    for (const [id, name] of available) { const option = element('option', name + ' [' + id + ']'); option.value = String(id); panelUi.factionSelect.append(option); }
+    panelUi.factionSelect.value = available.some(([id]) => String(id) === selected) ? selected : '';
+    panelUi.factionSelect.disabled = !available.length || state.excludedFactionIds.length >= 100;
+    panelUi.factionAdd.disabled = panelUi.factionSelect.disabled || !panelUi.factionSelect.value;
+    panelUi.factionList.replaceChildren();
+    for (const id of state.excludedFactionIds) {
+      const name = known.get(id) || state.excludedFactionNames[id] || 'Faction ' + id;
+      const row = element('div', null, 'avoided-faction');
+      const label = element('span', name + (known.has(id) ? '' : ' (not in the current pool)'));
+      const remove = focusKey(button('Remove', () => {
+        state.excludedFactionIds = state.excludedFactionIds.filter(value => value !== id); delete state.excludedFactionNames[id];
+        savePreferences(); cancelFind(); message(''); render(); panelUi?.factionSelect?.focus?.({ preventScroll: true });
+      }), 'preferences:unavoid:' + id);
+      remove.setAttribute('aria-label', 'Stop avoiding ' + name); row.append(label, remove); panelUi.factionList.append(row);
+    }
+    if (!state.excludedFactionIds.length) panelUi.factionList.append(element('small', 'No factions avoided.'));
+    panelUi.factionClear.hidden = !state.excludedFactionIds.length;
+  }
   function updatePanelControls() {
     if (!state.player && state.token) {
       panelUi.retry.disabled = state.busy || state.loading || state.removingKey;
@@ -1496,6 +1541,7 @@ function mountTargetList(platform, storageWarning = '') {
     for (const [property, node] of panelUi.ratios) if (root.activeElement !== node) node.value = panelUi.percent(state[property]);
     if (root.activeElement !== panelUi.age) panelUi.age.value = String(state.estimateDays);
     if (panelUi.avoidActive) {
+      updateFactionPreferences();
       panelUi.avoidActive.checked = state.avoidActive;
       if (root.activeElement !== panelUi.activityMinutes) panelUi.activityMinutes.value = String(state.activityMinutes);
       setText(panelUi.exclusionSummary, state.excludedFactionIds.length + ' faction(s) avoided' + (state.avoidActive ? ' · Skip activity within ' + state.activityMinutes + ' minutes and unknown activity.' : ''));
@@ -1659,14 +1705,23 @@ function mountTargetList(platform, storageWarning = '') {
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
     ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; preferencesBody.append(ageCaution);
     const avoidSettings = element('section', null, 'avoid-settings'); avoidSettings.setAttribute('aria-label', 'Personal target exclusions');
-    const factionsLabel = element('label', 'Avoid faction IDs'), factions = focusKey(element('textarea'), 'preferences:excluded-factions');
-    factions.rows = 2; factions.maxLength = 1400; factions.value = state.excludedFactionIds.join(', ');
-    factions.setAttribute('aria-label', 'Avoid faction IDs'); factions.placeholder = 'For example: 12345, 67890'; factionsLabel.append(factions);
-    const factionSave = button('Save avoided factions', () => {
-      const ids = C.parseExcludedFactions(factions.value);
-      if (ids === null) { message('Enter up to 100 valid faction IDs, separated by commas or spaces. Your previous exclusions are unchanged.'); return; }
-      state.excludedFactionIds = ids; factions.value = ids.join(', '); savePreferences(); cancelFind(); message(''); render();
+    const factionsLabel = element('label', 'Avoid factions'), factions = focusKey(element('select'), 'preferences:excluded-factions');
+    factions.setAttribute('aria-label', 'Faction to avoid'); factionsLabel.append(factions);
+    const factionAdd = focusKey(button('Avoid faction', () => {
+      const id = Number(factions.value), chosen = factionChoices().find(([value]) => value === id);
+      if (!chosen || !factions.value || state.excludedFactionIds.includes(id) || state.excludedFactionIds.length >= 100) {
+        message('Choose a faction from the dropdown. Your previous exclusions are unchanged.'); return;
+      }
+      state.excludedFactionIds = [...state.excludedFactionIds, id].sort((a, b) => a - b); state.excludedFactionNames[id] = chosen[1];
+      savePreferences(); cancelFind(); message(''); render(); panelUi?.factionSelect?.focus?.({ preventScroll: true });
+    }), 'preferences:avoid-faction');
+    factions.addEventListener('change', () => { factionAdd.disabled = !factions.value || factions.disabled; });
+    const factionList = element('div', null, 'avoided-factions'); factionList.setAttribute('aria-label', 'Avoided factions');
+    const factionClear = button('Clear avoided factions', () => {
+      state.excludedFactionIds = []; state.excludedFactionNames = {}; savePreferences(); cancelFind(); message(''); render(); panelUi?.factionSelect?.focus?.({ preventScroll: true });
     });
+    panelUi.factionSelect = factions; panelUi.factionAdd = factionAdd; panelUi.factionList = factionList; panelUi.factionClear = factionClear;
+    updateFactionPreferences();
     const activeLabel = element('label', null, 'avoid-active'), active = focusKey(element('input'), 'preferences:avoid-active');
     active.type = 'checkbox'; active.checked = state.avoidActive; active.setAttribute('aria-label', 'Avoid active players');
     active.addEventListener('change', () => { state.avoidActive = active.checked; savePreferences(); cancelFind(); message(''); render(); });
@@ -1680,8 +1735,8 @@ function mountTargetList(platform, storageWarning = '') {
     }); minutesLabel.append(minutes);
     const summary = element('p', '', 'notice'); panelUi.avoidActive = active; panelUi.activityMinutes = minutes; panelUi.exclusionSummary = summary;
     setText(summary, state.excludedFactionIds.length + ' faction(s) avoided' + (state.avoidActive ? ' · Skip activity within ' + state.activityMinutes + ' minutes and unknown activity.' : ''));
-    avoidSettings.append(factionsLabel, factionSave, activeLabel, minutesLabel, summary,
-      element('small', 'Personal filters only. Separate IDs with commas, spaces or new lines; clear the field and save to remove exclusions. Unknown activity is skipped when avoiding active players. Shared NWA membership and profile notices stay visible.'));
+    avoidSettings.append(factionsLabel, factionAdd, factionList, factionClear, activeLabel, minutesLabel, summary,
+      element('small', 'Personal filters only. Choose factions from the full target pool; changes save immediately on this device. Unknown activity is skipped when avoiding active players. Shared NWA membership and profile notices stay visible.'));
     preferencesBody.append(avoidSettings);
     const exports = element('div', null, 'exports'); const scopeLabel = element('label', 'Export:');
     const exportScope = element('select'); exportScope.setAttribute('aria-label', 'Export scope');
