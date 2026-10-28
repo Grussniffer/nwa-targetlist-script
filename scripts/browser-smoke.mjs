@@ -234,6 +234,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         const view = url.searchParams.get('view');
         const matching = window.__mock.suggestions.filter(row => view === 'mine' ? row.suggestedBy.id === player.id
           : view === 'history' ? ['approved', 'rejected'].includes(row.status) : row.status === 'pending');
+        window.__mock.suggestionResponses = (window.__mock.suggestionResponses || 0) + 1;
         data = { canReview: window.__mock.canReview, suggestions: structuredClone(matching.slice(offset, offset + 50)),
           nextOffset: matching.length > offset + 50 ? offset + 50 : null };
       } else if (url.pathname === '/api/suggestions' && request.method === 'POST') {
@@ -250,8 +251,15 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
           const row = window.__mock.suggestions.find(row => row.id === url.pathname.split('/')[3]);
           const decision = JSON.parse(request.data).decision;
           row.status = decision; row.reviewedBy = { id: player.id, name: player.name, faction: player.faction }; row.reviewedAt = new Date(Date.now()).toISOString();
-          if (decision === 'approved') targets.push(makeTarget(row.targetId, 'Mock Approved Player', 200000));
-          data = { suggestion: structuredClone(row), addedPlayers: decision === 'approved' ? 1 : 0 };
+          let addedPlayers = 0;
+          if (decision === 'approved') {
+            const additions = row.type === 'faction'
+              ? [1, 2].map(index => makeTarget(row.targetId * 10 + index, 'Mock Approved Faction Member ' + index, 200000,
+                { faction: { id: row.targetId, name: 'Mock Suggested Faction' } }))
+              : [makeTarget(row.targetId, 'Mock Approved Player', 200000)];
+            targets.push(...additions); addedPlayers = additions.length;
+          }
+          data = { suggestion: structuredClone(row), addedPlayers };
         }
       } else throw new Error(`Unexpected mock path: ${request.method} ${url.pathname}`);
       if (url.pathname === '/api/targets') window.__mock.feedResponses.push({ search: url.search, status,
@@ -773,6 +781,91 @@ async function openSuggestions(page) {
   await clickButton(page, 'Suggestions');
   await wait(page, () => Boolean(window.__targetlistShadow.querySelector('.suggestionform')) && !window.__targetlistShadow.querySelector('.queueheader button').disabled);
 }
+async function checkAdminManagement(pageContext, scripts, mode) {
+  const widths = mode === 'PDA' ? [390, 320] : [1280];
+  for (const width of widths) {
+    const admin = await mount({ width, height: 900 }, scripts, pageContext, () => {
+      window.__mock.removalEnabled = true;
+    });
+    await login(admin);
+    await keyboardActivate(admin, '[aria-label="NWA sections"] button', 'Admin');
+    await wait(admin, () => window.__mock.suggestionResponses >= 1
+      && window.__targetlistShadow.textContent.includes('Only current leaders and co-leaders of allowed factions'));
+    await wait(admin, () => !window.__targetlistShadow.querySelector('.adminaddform'));
+    assert.equal(await admin.evaluate(() => window.__targetlistShadow.querySelectorAll('.adminaddform,.removalform').length), 0,
+      `${mode} ${width}px: a member cannot see admin mutation forms`);
+    assert.equal(await admin.evaluate(() => window.__mock.requests.some(row => row.method === 'POST' && row.path === '/api/suggestions')), false);
+    await admin.evaluate(() => { window.__mock.canReview = true; });
+    await clickButton(admin, 'Targets');
+    await keyboardActivate(admin, '[aria-label="NWA sections"] button', 'Admin');
+    await wait(admin, () => Boolean(window.__targetlistShadow.querySelector('.adminaddform')));
+    assert.equal(await admin.evaluate(() => window.__targetlistShadow.activeElement?.textContent), 'Admin',
+      `${mode} ${width}px: Admin retains keyboard focus through its permission lookup`);
+    for (const type of ['player', 'faction']) {
+      const targetId = type === 'player' ? 22001 : 33001;
+      await shadow(admin, '[aria-label="Admin target type"]', 'select', type);
+      await shadow(admin, '[aria-label="Add player or faction ID"]', 'fill', String(targetId));
+      await shadow(admin, '[aria-label="Reason for adding targets"]', 'fill', '  Admin mock reason.  ');
+      const before = await admin.evaluate(() => ({ count: window.__mock.targets.length,
+        submits: window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions').length,
+        reviews: window.__mock.requests.filter(row => row.path.endsWith('/review')).length }));
+      await keyboardActivate(admin, '.adminaddform button', 'Add and approve');
+      await wait(admin, () => Boolean(window.__targetlistShadow.querySelector('.adminaddform button'))
+        && !window.__targetlistShadow.querySelector('.adminaddform button').disabled);
+      const after = await admin.evaluate(() => ({ count: window.__mock.targets.length,
+        submit: window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions').at(-1),
+        submits: window.__mock.requests.filter(row => row.method === 'POST' && row.path === '/api/suggestions').length,
+        review: window.__mock.requests.filter(row => row.path.endsWith('/review')).at(-1),
+        reviews: window.__mock.requests.filter(row => row.path.endsWith('/review')).length,
+        suggestion: window.__mock.suggestions.at(-1),
+        focus: window.__targetlistShadow.activeElement?.textContent }));
+      assert.deepEqual(JSON.parse(after.submit.data), { type, targetId, comment: 'Admin mock reason.' });
+      assert.deepEqual(JSON.parse(after.review.data), { decision: 'approved' });
+      assert.equal(after.submits, before.submits + 1); assert.equal(after.reviews, before.reviews + 1);
+      assert.equal(after.count, before.count + (type === 'faction' ? 2 : 1));
+      assert.equal(after.suggestion.status, 'approved');
+      assert.equal(after.focus, 'Add and approve', `${mode} ${width}px: add retains keyboard focus after refresh`);
+      await admin.screenshot({ path: path.join(artifacts, `browser-admin-${mode.toLowerCase()}-${width}-${type}.png`), fullPage: true });
+      const geometry = await admin.evaluate(() => {
+        const root = window.__targetlistShadow, panel = root.querySelector('.panel').getBoundingClientRect(), scroll = root.querySelector('.scroll');
+        return { left: panel.left, right: panel.right, width: innerWidth,
+          documentWidth: document.documentElement.scrollWidth, overflow: scroll.scrollWidth > scroll.clientWidth + 1 };
+      });
+      assert(geometry.left >= 0 && geometry.right <= width && geometry.documentWidth <= width && !geometry.overflow,
+        `${mode} ${width}px: Admin forms stay inside the viewport: ${JSON.stringify(geometry)}`);
+      await clickButton(admin, 'Targets');
+      assert.equal(await admin.evaluate(() => window.__targetlistShadow.querySelectorAll('.cards:not(.suggestionqueue)>.card').length), after.count,
+        `${mode} ${width}px: approved additions appear immediately in the target pool`);
+      await clickButton(admin, 'Admin');
+      await wait(admin, () => Boolean(window.__targetlistShadow.querySelector('.adminaddform')));
+      await shadow(admin, '.removalform select', 'select', type);
+      await shadow(admin, '[aria-label="Remove player or faction ID"]', 'fill', String(targetId));
+      await shadow(admin, '[aria-label="Reason for removing targets"]', 'fill', 'Remove mock admin addition');
+      await admin.evaluate(() => {
+        const box=window.__targetlistShadow.querySelector('[aria-label="Confirm shared target removal"]');
+        box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}));
+        window.__targetlistShadow.querySelector('.removalform').requestSubmit();
+      });
+      await wait(admin, () => window.__mock.targets.length === 4 && Boolean(window.__targetlistShadow.querySelector('.removalform button'))
+        && !window.__targetlistShadow.querySelector('.removalform button').disabled);
+      await clickButton(admin, 'Targets');
+      assert.equal(await admin.evaluate(() => window.__targetlistShadow.querySelectorAll('.cards:not(.suggestionqueue)>.card').length), 4,
+        `${mode} ${width}px: admin removal immediately updates the target pool`);
+      await clickButton(admin, 'Admin');
+      await wait(admin, () => Boolean(window.__targetlistShadow.querySelector('.adminaddform')));
+    }
+    if (mode === 'PDA') assert.equal(await admin.evaluate(() => window.__mock.pda.calls.filter(call => call.name === 'PDA_httpPost'
+      && new URL(call.args[0]).pathname === '/api/suggestions').length), 2, 'Both admin additions use the native PDA transport');
+    await admin.evaluate(() => { window.__mock.canReview = false; });
+    await clickButton(admin, 'Targets');await clickButton(admin, 'Admin');
+    await wait(admin, () => !window.__targetlistShadow.querySelector('.adminaddform'));
+    assert.equal(await admin.evaluate(() => window.__targetlistShadow.querySelectorAll('.adminaddform,.removalform').length), 0,
+      `${mode} ${width}px: demotion hides both admin mutation forms`);
+    await admin.close();
+  }
+  console.log(`PASS ${mode} Admin player/faction add-and-approve/removal: current permissions, native transport, immediate updates, focus and viewport widths ${widths.join('/')}`);
+}
+
 async function fillSuggestion(page, { type = 'player', targetId = '22001', comment = 'Mock useful chain target.' } = {}) {
   await shadow(page, '[aria-label="Suggestion type"]', 'select', type);
   await shadow(page, '[aria-label="Player or faction ID"]', 'fill', targetId);
@@ -2669,6 +2762,7 @@ try {
   await checkSingleRequestFinder(context, [source], 'GM');
   await checkDeltaRendering(context, [source], 'GM');
   await checkExports(context, [source], 'GM');
+  await checkAdminManagement(context, [source], 'GM');
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
   try {
@@ -2678,6 +2772,7 @@ try {
     await checkSingleRequestFinder(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
   }
   finally { await deltaPdaContext.close(); }
 

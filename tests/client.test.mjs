@@ -2499,3 +2499,107 @@ test('a rejected replacement session stops recovery and requires a new sign-in',
   assert.equal(app.requests.length, 2); assert.equal(app.storage.has(app.storageKey), false);
   assert.match(app.text(), /Torn Limited API key/); assert.deepEqual(app.navigations, []);
 });
+
+
+async function openAdmin(app, canReview = true) {
+  app.button('Admin').emit('click');
+  const access=app.requests.at(-1);
+  assert.match(access.url,/\/api\/suggestions\?view=pending&offset=0$/);
+  app.response(access,{canReview,suggestions:[],nextOffset:null});await flush();
+}
+function fillAdmin(app, {type='player',targetId='45678',comment='Useful chain target.'}={}) {
+  for(const [label,value,event] of [['Admin target type',type,'change'],['Add player or faction ID',targetId,'input'],['Reason for adding targets',comment,'input']]) {
+    const input=app.find(node=>node.attributes.get('aria-label')===label);input.value=value;input.emit(event);
+  }
+}
+const adminForm=app=>app.find(node=>node.className==='suggestionform adminaddform');
+
+test('Admin checks permissions on demand and never exposes mutation forms to ordinary members',async()=>{
+  const app=fixture();await app.signIn();await openAdmin(app,false);
+  assert.match(app.text(),/Only current leaders and co-leaders/);
+  assert.equal(descendants(app.root).some(node=>node.className==='suggestionform adminaddform'||node.className==='suggestionform removalform'),false);
+  app.button('Refresh admin access').emit('click');const request=app.requests.at(-1);
+  app.response(request,{error:{code:'TORN_UNAVAILABLE',message:'Try shortly.'}},503);await flush();
+  assert.equal(descendants(app.root).some(node=>node.className==='suggestionform adminaddform'),false);
+});
+
+test('Admin adds and approves players and factions once, preserving audit data and immediately refreshing the pool',async()=>{
+  for(const type of ['player','faction']) {
+    const app=fixture();await app.signIn();await openAdmin(app);
+    fillAdmin(app,{type,comment:'  Useful chain target.  '});
+    const form=adminForm(app);form.emit('submit');const submit=app.requests.at(-1);form.emit('submit');
+    assert.equal(app.requests.at(-1),submit);
+    assert.equal(submit.url,serviceBase+'/api/suggestions');
+    assert.deepEqual(JSON.parse(submit.data),{type,targetId:45678,comment:'Useful chain target.'});
+    const row=suggestion({type,comment:'Useful chain target.'});
+    app.response(submit,{suggestion:row},201);await flush();
+    const review=app.requests.at(-1);
+    assert.equal(review.url,serviceBase+'/api/suggestions/'+row.id+'/review');
+    assert.deepEqual(JSON.parse(review.data),{decision:'approved'});
+    const before=app.requests.length;
+    app.response(review,{suggestion:{...row,status:'approved',reviewedBy:player},addedPlayers:type==='player'?1:12});await flush();
+    const refreshes=app.requests.slice(before);
+    const queue=refreshes.find(r=>r.url.includes('/api/suggestions?'));
+    const pool=refreshes.find(r=>r.url.endsWith('/api/targets'));assert.ok(queue&&pool);
+    app.response(queue,{canReview:true,suggestions:[],nextOffset:null});
+    app.response(pool,{player,targets:[target,{...target,id:45678,name:'Admin Added Target'}],warnings:[],reservations:coordination});await flush();
+    assert.match(app.text(),/Added and approved/);
+    assert.equal(app.find(node=>node.attributes.get('aria-label')==='Add player or faction ID').value,'');
+    app.button('Targets').emit('click');assert.match(app.text(),/Admin Added Target/);
+  }
+});
+
+test('Admin validates required reason and IDs without overwriting ordinary suggestion drafts',async()=>{
+  const app=fixture();await app.signIn();await openSuggestions(app);
+  fillSuggestion(app,{comment:'Keep this member draft.'});await openAdmin(app);
+  const count=app.requests.length;
+  for(const values of [{comment:' '},{comment:'x'.repeat(1001)},{targetId:'0'},{targetId:'2147483648'},{targetId:'1e3'}]) {
+    fillAdmin(app,values);adminForm(app).emit('submit');await flush();assert.equal(app.requests.length,count);
+  }
+  app.button('Suggestions').emit('click');app.response(app.requests.at(-1),{canReview:true,suggestions:[],nextOffset:null});await flush();
+  assert.equal(app.find(node=>node.attributes.get('aria-label')==='Reason for suggesting this target').value,'Keep this member draft.');
+});
+
+test('Admin never approves an unverified submit response or silently approves an existing request',async()=>{
+  for(const failure of ['wrong-target','wrong-suggester','bad-id','duplicate']) {
+    const app=fixture();await app.signIn();await openAdmin(app);fillAdmin(app);adminForm(app).emit('submit');
+    const submit=app.requests.at(-1),before=app.requests.length;
+    if(failure==='duplicate')app.response(submit,{error:{code:'SUGGESTION_CONFLICT',message:'Already pending or listed.'}},409);
+    else app.response(submit,{suggestion:suggestion({comment:'Useful chain target.',...(failure==='wrong-target'?{targetId:999}:failure==='wrong-suggester'?{suggestedBy:{id:999}}:{id:'bad'})})},201);
+    await flush();assert.equal(app.requests.length,before);assert.equal(app.button('Add and approve').disabled,false);
+    assert.equal(app.storage.get(app.storageKey).token,SESSION);
+  }
+});
+
+test('Admin retains a saved request after uncertain approval without automatically resubmitting it',async()=>{
+  const app=fixture();await app.signIn();await openAdmin(app);fillAdmin(app);adminForm(app).emit('submit');
+  const row=suggestion({comment:'Useful chain target.'});app.response(app.requests.at(-1),{suggestion:row},201);await flush();
+  app.requests.at(-1).ontimeout();await flush();
+  assert.match(app.text(),/Addition request saved. Approval is not confirmed/);
+  assert.equal(descendants(app.root).some(node=>node.className==='suggestionform adminaddform'),false);
+  const postCount=app.requests.filter(r=>r.method==='POST').length;
+  app.button('Open My suggestions').emit('click');
+  assert.match(app.requests.at(-1).url,/view=mine/);
+  app.response(app.requests.at(-1),{canReview:true,suggestions:[row],nextOffset:null});await flush();
+  assert.equal(app.requests.filter(r=>r.method==='POST').length,postCount);
+  assert.match(app.text(),/Useful chain target/);
+});
+
+test('Admin discards stale responses on logout and removes controls when leadership is revoked',async()=>{
+  for(const interruption of ['logout-before-submit','logout-before-approval','role-loss']) {
+    const app=fixture();await app.signIn();await openAdmin(app);fillAdmin(app);
+    const retained=adminForm(app);retained.emit('submit');let held=app.requests.at(-1);
+    const row=suggestion({comment:'Useful chain target.'});
+    if(interruption!=='logout-before-submit') {app.response(held,{suggestion:row},201);await flush();held=app.requests.at(-1);}
+    if(interruption==='role-loss') {
+      app.response(held,{error:{code:'REVIEW_NOT_ALLOWED',message:'Leadership revoked.'}},403);await flush();
+      const count=app.requests.length;retained.emit('submit');assert.equal(app.requests.length,count);
+      assert.equal(descendants(app.root).some(node=>node.className==='suggestionform adminaddform'),false);
+      assert.equal(app.storage.get(app.storageKey).token,SESSION);
+    } else {
+      await app.signOut();const count=app.requests.length;
+      app.response(held,interruption==='logout-before-submit'?{suggestion:row}:{suggestion:{...row,status:'approved',reviewedBy:player},addedPlayers:1});await flush();
+      assert.equal(app.requests.length,count);assert.doesNotMatch(app.text(),/Added and approved|Useful chain target/);
+    }
+  }
+});

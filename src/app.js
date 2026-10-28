@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.13.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.14.0' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -86,6 +86,7 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionView: 'pending', suggestions: [], nextSuggestionOffset: null, canReview: false,
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '', removalSupported: false, removalOpen: false,
     removalDraft: { type: 'player', targetId: '', reason: '', confirm: false },
+    adminDraft: { type: 'player', targetId: '', comment: '' }, adminPending: null,
     pendingSuggestionDetailsSupported: false, pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
@@ -290,6 +291,7 @@ function mountTargetList(platform, storageWarning = '') {
     state.removingKey = false;
     state.view = 'targets'; state.suggestionView = 'pending'; state.suggestions = []; state.nextSuggestionOffset = null;
     state.removalSupported = false; state.removalOpen = false; state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
+    state.adminDraft = { type: 'player', targetId: '', comment: '' }; state.adminPending = null;
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
     persist(() => {
@@ -1134,6 +1136,7 @@ function mountTargetList(platform, storageWarning = '') {
     const suggestionGeneration = ++state.suggestionGeneration;
     const offset = append ? state.nextSuggestionOffset : 0;
     state.suggestionView = view; state.suggestionsLoading = true;
+    if (state.view === 'admin') state.canReview = false;
     if (!append) { state.suggestions = []; state.nextSuggestionOffset = null; }
     message(''); render();
     try {
@@ -1198,6 +1201,57 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
 
+  async function addAdminTarget() {
+    if (!state.token || !state.canReview || state.adminPending || state.suggestionMutation || state.removingKey || state.suggestionsLoading) return;
+    const draft = { ...state.adminDraft }, targetId = Number(draft.targetId), comment = draft.comment.trim();
+    if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(targetId) || targetId > 2147483647) {
+      message('Enter a valid player or faction ID.'); return;
+    }
+    if (!comment || [...comment].length > 1000) { message('Add a reason for this target, up to 1,000 characters.'); return; }
+    const generation = state.generation;
+    const returnFocus = root.activeElement?.getAttribute?.('data-focus-key') === 'admin:add';
+    cancelFind(); state.suggestionMutation = 'admin-add'; state.suggestionNotice = ''; message(''); render();
+    try {
+      const submitted = await request('POST', '/api/suggestions', { type: draft.type, targetId, comment });
+      if (generation !== state.generation) return;
+      const row = submitted.suggestion;
+      if (!row || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(row.id) || row.type !== draft.type
+        || row.targetId !== targetId || row.comment !== comment || row.status !== 'pending' || row.suggestedBy?.id !== state.player.id) {
+        // An unverified submit response must never select a request for approval.
+        throw new Error('The addition request could not be verified. Check My suggestions before submitting again.');
+      }
+      state.adminPending = { id: row.id, type: row.type, targetId };
+      state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
+      if (!state.canReview) throw new Error('The request was saved, but current admin permissions could not be confirmed.');
+      const result = await request('POST', `/api/suggestions/${row.id}/review`, { decision: 'approved' });
+      if (generation !== state.generation) return;
+      if (result.suggestion?.id !== row.id || result.suggestion.type !== row.type || result.suggestion.targetId !== targetId
+        || result.suggestion.status !== 'approved' || result.suggestion.reviewedBy?.id !== state.player.id
+        || !Number.isSafeInteger(result.addedPlayers) || result.addedPlayers < 0 || result.addedPlayers > (row.type === 'player' ? 1 : 1000)) {
+        throw new Error('Approval could not be verified. Check the saved request before trying again.');
+      }
+      state.adminPending = null; state.adminDraft = { type: 'player', targetId: '', comment: '' };
+      state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
+      if (row.type === 'player') { state.pendingPlayerIds.delete(targetId); pageSuggestedIds.delete(targetId); }
+      state.suggestionNotice = 'Added and approved. ' + result.addedPlayers + ' player(s) added to the shared NWA list.'
+        + (result.warnings?.length ? ' ' + result.warnings.join(' ') : '');
+      await Promise.all([loadSuggestions(), loadTargets(true)]);
+    } catch (error) {
+      if (generation !== state.generation) return;
+      if (state.adminPending) state.suggestionNotice = 'Addition request saved. Approval is not confirmed. Open My suggestions to check its current status before retrying.';
+      if (error.code === 'REVIEW_NOT_ALLOWED') { state.suggestionGeneration++; state.suggestionsLoading = false; }
+      handleError(error);
+    } finally {
+      if (generation === state.generation) {
+        state.suggestionMutation = null; render(); updatePageNotice();
+        if (returnFocus && state.open && state.view === 'admin' && (!root.activeElement || root.activeElement === panelHeading)) {
+          const key = state.adminPending ? 'admin:inspect' : 'admin:add';
+          [...content.querySelectorAll('[data-focus-key]')].find(node => node.getAttribute('data-focus-key') === key)?.focus?.({ preventScroll: true });
+        }
+      }
+    }
+  }
+
   async function removeTargetsFromList() {
     if (!state.token || !state.canReview || !state.removalSupported || state.suggestionMutation || state.removingKey) return;
     const draft = state.removalDraft, id = Number(draft.targetId), reason = draft.reason.trim();
@@ -1227,6 +1281,7 @@ function mountTargetList(platform, storageWarning = '') {
     try {
       const data = await request('POST', `/api/suggestions/${id}/review`, { decision });
       if (generation !== state.generation) return;
+      if (state.adminPending?.id === id) { state.adminPending = null; state.adminDraft = { type: 'player', targetId: '', comment: '' }; }
       state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
       if (data.suggestion?.type === 'player') {
         state.pendingPlayerIds.delete(data.suggestion.targetId); pageSuggestedIds.delete(data.suggestion.targetId);
@@ -1358,11 +1413,11 @@ function mountTargetList(platform, storageWarning = '') {
     panelUi = { name: playerName, faction: factionName, signOut, total, stats: new Map(), ratios: new Map() };
     profile.append(identity, total); content.append(profile);
     const tabs = element('div', null, 'tabs'); tabs.setAttribute('aria-label', 'NWA sections');
-    for (const [view, label] of [['targets', 'Targets'], ['suggestions', 'Suggestions']]) {
+    for (const [view, label] of [['targets', 'Targets'], ['suggestions', 'Suggestions'], ['admin', 'Admin']]) {
       const tab = button(label, () => {
         if (state.view === view) return;
         state.view = view; render();
-        if (view === 'suggestions') void loadSuggestions();
+        if (view === 'suggestions' || view === 'admin') void loadSuggestions();
       });
       focusKey(tab, `section:${view}`); tab.setAttribute('aria-pressed', String(state.view === view)); tabs.append(tab);
     }
@@ -1382,7 +1437,7 @@ function mountTargetList(platform, storageWarning = '') {
     preferencesBody.append(grid);
     const account = element('div', null, 'account');
     account.append(element('span', 'Removes your saved key and logins.', 'muted'), signOut);
-    if (state.view === 'suggestions') {
+    if (state.view === 'suggestions' || state.view === 'admin') {
       suggestionContainer = element('div'); content.append(suggestionContainer); renderSuggestions();
       preferencesBody.append(account); content.append(preferencesPanel); return;
     }
@@ -1517,12 +1572,51 @@ function mountTargetList(platform, storageWarning = '') {
     details.append(form); return details;
   }
 
+  function renderAdminContent() {
+    suggestionContainer.append(element('h3', 'Manage NWA targets'), element('p',
+      'Admin access uses your current Torn faction leader or co-leader role. Changes affect the shared list in the script and Discord.', 'notice'));
+    const refresh = focusKey(button(state.suggestionsLoading ? 'Checking permissions...' : 'Refresh admin access', () => void loadSuggestions()), 'admin:refresh');
+    refresh.disabled = state.suggestionsLoading || Boolean(state.suggestionMutation); suggestionContainer.append(refresh);
+    if (state.suggestionNotice) { const notice = element('div', state.suggestionNotice, 'notice'); notice.setAttribute('role', 'status'); suggestionContainer.append(notice); }
+    if (state.suggestionsLoading) { suggestionContainer.append(element('p', 'Checking current admin permissions...', 'notice')); return; }
+    if (!state.canReview) { suggestionContainer.append(element('p', 'Only current leaders and co-leaders of allowed factions can add or remove targets. Other members can use Suggestions.', 'notice')); return; }
+    suggestionContainer.append(element('h3', 'Add a player or faction'));
+    if (state.adminPending) {
+      suggestionContainer.append(element('p', 'A saved addition needs checking before another is submitted. Opening the request does not repeat approval.', 'notice'));
+      const inspect = focusKey(button('Open My suggestions', () => { state.view = 'suggestions'; render(); void loadSuggestions('mine'); }), 'admin:inspect');
+      const another = focusKey(button('Start another addition', () => {
+        state.adminPending = null; state.adminDraft = { type: 'player', targetId: '', comment: '' }; state.suggestionNotice = ''; render();
+      }), 'admin:another');
+      inspect.disabled = another.disabled = Boolean(state.suggestionMutation); suggestionContainer.append(inspect, another);
+    } else {
+      const busy = Boolean(state.suggestionMutation || state.removingKey);
+      const form = element('form', null, 'suggestionform adminaddform'), fields = element('div', null, 'suggestionfields');
+      const typeLabel = element('label', 'Add'), type = focusKey(element('select'), 'admin:type'); type.setAttribute('aria-label', 'Admin target type');
+      for (const [value, label] of [['player', 'Player'], ['faction', 'Entire faction']]) { const option = element('option', label); option.value = value; type.append(option); }
+      type.value = state.adminDraft.type; type.disabled = busy;
+      type.addEventListener('change', () => { if (!state.suggestionMutation) state.adminDraft.type = type.value; }); typeLabel.append(type);
+      const idLabel = element('label', 'Player or faction ID'), id = focusKey(element('input'), 'admin:id');
+      id.type = 'number'; id.min = '1'; id.max = '2147483647'; id.step = '1'; id.required = true;
+      id.setAttribute('aria-label', 'Add player or faction ID'); id.value = state.adminDraft.targetId; id.disabled = busy;
+      id.addEventListener('input', () => { if (!state.suggestionMutation) state.adminDraft.targetId = id.value; }); idLabel.append(id); fields.append(typeLabel, idLabel);
+      const reasonLabel = element('label', 'Reason (required)'), reason = focusKey(element('textarea'), 'admin:reason');
+      reason.required = true; reason.maxLength = 2000; reason.rows = 3; reason.setAttribute('aria-label', 'Reason for adding targets');
+      reason.value = state.adminDraft.comment; reason.disabled = busy;
+      reason.addEventListener('input', () => { if (!state.suggestionMutation) state.adminDraft.comment = reason.value; }); reasonLabel.append(reason);
+      const submit = focusKey(element('button', state.suggestionMutation === 'admin-add' ? 'Adding...' : 'Add and approve', 'primary'), 'admin:add'); submit.type = 'submit'; submit.disabled = busy;
+      form.append(fields, reasonLabel, element('small', 'Up to 1,000 characters. Saves your reason and records you as submitter and reviewer. Faction additions import current members; previously excluded players stay excluded until individually approved.'), submit);
+      form.addEventListener('submit', event => { event.preventDefault(); void addAdminTarget(); }); suggestionContainer.append(form);
+    }
+    const removal = removalControls(); removal.open = true; suggestionContainer.append(removal);
+  }
+
   function renderSuggestionContent() {
     if (!state.open || !suggestionContainer) return;
     const signature = JSON.stringify([state.suggestions, state.canReview, state.suggestionView, state.suggestionsLoading,
-      state.suggestionMutation, state.suggestionNotice, state.nextSuggestionOffset, state.removalSupported]);
+      state.suggestionMutation, state.suggestionNotice, state.nextSuggestionOffset, state.removalSupported, state.view, state.adminPending]);
     if (signature === suggestionSignature) return;
     suggestionSignature = signature; suggestionContainer.replaceChildren();
+    if (state.view === 'admin') { renderAdminContent(); return; }
     suggestionContainer.append(element('p', 'Suggest a player or faction for the shared target pool. Every suggestion needs a reason.', 'notice'));
     const form = element('form', null, 'suggestionform');
     const fields = element('div', null, 'suggestionfields');
