@@ -45,6 +45,8 @@ class Element {
   }
   remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); this.parentNode = null; }
   contains(node) { return all(this).includes(node); }
+  getRootNode() { let node = this; while (node.parentNode && node.tagName !== 'SHADOW-ROOT') node = node.parentNode; return node; }
+  focus() { this.getRootNode().activeElement = this; }
   get isConnected() { return this.tagName === 'DOCUMENT' || Boolean(this.parentNode?.isConnected); }
   get firstChild() { return this.children[0] ?? null; }
   get lastChild() { return this.children.at(-1) ?? null; }
@@ -85,7 +87,7 @@ class Element {
 }
 
 async function flush() { for (let index = 0; index < 12; index++) await Promise.resolve(); }
-function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}) {
+function fixture(url, { saved = true, mounted = true, nativeAnchor = true, permissions = false } = {}) {
   let now = NOW; let nextTimeout = 1;
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
   const document = new Element('document'); const html = new Element('html'); const body = new Element('body');
@@ -104,7 +106,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   };
   const window = new Element('window'); window.location = { href: url, assign() {} }; window.innerWidth = 1200; window.innerHeight = 800;
   window.getComputedStyle = node => ({ display: node.hidden ? 'none' : 'block', visibility: 'visible', position: 'static' });
-  const requests = []; const timers = []; const timeouts = new Map(); const observers = [];
+  const requests = [], permissionRequests = []; const timers = []; const timeouts = new Map(); const observers = [];
   const storage = new Map();
   if (saved) storage.set('targetlist.session.https://targetlist.grusmedia.no', { token: 'saved-session', expiresAt: new Date(NOW + 3600000).toISOString() });
   class MutationObserver {
@@ -132,7 +134,11 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
     getComputedStyle: window.getComputedStyle, Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 },
     GM_getValue: (key, fallback) => storage.get(key) ?? fallback,
     GM_setValue: (key, value) => storage.set(key, value), GM_deleteValue: key => storage.delete(key),
-    GM_xmlhttpRequest: request => requests.push(request),
+    GM_xmlhttpRequest: request => {
+      if (new URL(request.url).pathname !== '/api/permissions') { requests.push(request); return; }
+      permissionRequests.push(request);
+      if (permissions !== null) void Promise.resolve().then(() => response(request, { canManageTargets: permissions }));
+    },
     setInterval: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
     clearInterval() {},
     setTimeout: (callback, delay = 0) => { const id = nextTimeout++; timeouts.set(id, { callback, delay }); return id; },
@@ -146,7 +152,7 @@ function fixture(url, { saved = true, mounted = true, nativeAnchor = true } = {}
   function control(label) { const root = document.getElementById('torn-targetlist-host').shadow; const button = all(root).find(node => node.tagName === 'BUTTON' && node.textContent === label); assert.ok(button, `button ${label} exists`); return button; }
   function notice() { return document.getElementById('nwa-target-page-notice'); }
   function noticeText() { return notice()?.shadow?.textContent || notice()?.textContent || ''; }
-  return { document, body, window, storage, requests, timers, observers, feed, response, control, mutation, notice, noticeText,
+  return { document, body, window, storage, requests, permissionRequests, timers, observers, feed, response, control, mutation, notice, noticeText,
     openSettings() {
       const root = document.getElementById('torn-targetlist-host').shadow;
       all(root).find(node => node.className === 'settings-toggle').emit('click');
@@ -549,4 +555,106 @@ test('signing out discards pending author details and ignores an in-flight detai
   const removal = page.requests.at(-1); assert.equal(removal.method, 'DELETE');
   page.response(removal, null, 204); await flush(); page.response(late, { suggestion: pendingRow }); await flush();
   assert.equal(page.notice(), null); assert.equal(page.body.textContent.includes('Other_Member'), false); assert.equal(page.storage.size, 0);
+});
+
+
+const adminSuggestionId='00000000-0000-4000-8000-000000000001';
+const adminRow=(extra={})=>({id:adminSuggestionId,type:'player',targetId:900,comment:'A justified target.',status:'pending',suggestedBy:player,...extra});
+function noticeButton(page,label) {
+  const found=all(page.notice().shadow).find(node=>node.tagName==='BUTTON'&&node.textContent===label);
+  assert.ok(found,'Notice button '+label+' exists');return found;
+}
+async function pageAdminAccess(page,canManageTargets=true) {
+  openPending(page);page.response(page.permissionRequests.at(-1),{canManageTargets});await flush();
+}
+
+test('page admin permissions load only on opening, share a five-minute cache and retry safely',async()=>{
+  const page=fixture('https://www.torn.com/profiles.php?XID=900',{permissions:null});
+  await page.feed();assert.equal(page.permissionRequests.length,0);
+  await pageAdminAccess(page,false);assert.equal(page.permissionRequests.length,1);
+  assert.equal(page.notice().shadow.querySelector('.page-admin').hidden,true);
+  const details=page.notice().shadow.querySelector('details');details.open=false;details.emit('toggle');details.open=true;details.emit('toggle');
+  assert.equal(page.permissionRequests.length,1);
+  page.tick(NOW+301000);await page.feed();openPending(page);assert.equal(page.permissionRequests.length,2);
+  page.response(page.permissionRequests.at(-1),{canManageTargets:'yes'});await flush();
+  assert.match(page.noticeText(),/Admin access could not be checked/);
+  noticeButton(page,'Check admin access').emit('click');assert.equal(page.permissionRequests.length,3);
+  page.response(page.permissionRequests.at(-1),{canManageTargets:true});await flush();
+  assert.equal(page.notice().shadow.querySelector('.page-admin-removal'),null,'Old backend removal support is not assumed.');
+  assert.match(page.noticeText(),/enable target removal/);
+  assert.equal(page.requests.filter(r=>new URL(r.url).pathname==='/api/suggestions').length,0);
+});
+
+test('page admin adds exactly the profile or attack player and refreshes without fetching the queue',async()=>{
+  for(const url of ['https://www.torn.com/profiles.php?XID=900','https://www.torn.com/page.php?sid=attack&user2ID=900']) {
+    const page=fixture(url,{permissions:null});await page.feed([],undefined,{targetRemoval:true});await pageAdminAccess(page);
+    const comment=page.notice().shadow.querySelector('textarea');
+    noticeButton(page,'Add and approve').emit('click');assert.equal(page.requests.length,1);
+    assert.match(page.noticeText(),/Add a reason/);
+    comment.value='  A justified target.  ';comment.emit('input');
+    const add=noticeButton(page,'Add and approve');add.emit('click');const submit=page.requests.at(-1);add.emit('click');
+    assert.equal(page.requests.at(-1),submit);assert.deepEqual(JSON.parse(submit.data),{type:'player',targetId:900,comment:'A justified target.'});
+    page.response(submit,{suggestion:adminRow()},201);await flush();
+    const review=page.requests.at(-1);assert.ok(review.url.endsWith('/'+adminSuggestionId+'/review'));
+    page.response(review,{suggestion:adminRow({status:'approved',reviewedBy:player}),addedPlayers:1});await flush();
+    assert.equal(new URL(page.requests.at(-1).url).pathname,'/api/targets');
+    await page.feed([{...target,reason:'A justified target.'}],undefined,{targetRemoval:true});
+    assert.equal(page.notice().getAttribute('data-mode'),'listed');
+    assert.equal(page.requests.filter(r=>r.method==='GET'&&new URL(r.url).pathname==='/api/suggestions').length,0);
+    openPending(page);assert.ok(page.notice().shadow.querySelector('.page-admin-removal'));
+  }
+});
+
+test('page removal requires a reason and explicit confirmation, uses viewed ID and immediately evicts the target',async()=>{
+  const page=fixture('https://www.torn.com/page.php?sid=attack&user2ID=900',{permissions:null});
+  await page.feed([target],undefined,{targetRemoval:true});await pageAdminAccess(page);
+  let form=page.notice().shadow.querySelector('.page-admin-removal');form.emit('submit');assert.equal(page.requests.length,1);
+  form=page.notice().shadow.querySelector('.page-admin-removal');
+  const reason=form.querySelector('textarea');reason.value='Peace agreed.';reason.emit('input');form.emit('submit');assert.equal(page.requests.length,1);
+  form=page.notice().shadow.querySelector('.page-admin-removal');const confirm=form.querySelector('input');confirm.checked=true;confirm.emit('change');
+  form.emit('submit');const removal=page.requests.at(-1);form.emit('submit');assert.equal(page.requests.at(-1),removal);
+  assert.deepEqual(JSON.parse(removal.data),{type:'player',targetId:900,reason:'Peace agreed.',confirm:true});
+  page.response(removal,{type:'player',targetId:900,removedIds:[900],removedCount:1});await flush();
+  assert.equal(page.notice().getAttribute('data-mode'),'suggest','Local removal is visible before the next feed returns.');
+  await page.feed([],undefined,{targetRemoval:true});openPending(page);assert.ok(noticeButton(page,'Add and approve'));
+});
+
+test('pending players offer review instead of duplicate add and partial approval never resubmits',async()=>{
+  for(const existing of [true,false]) {
+    const page=fixture('https://www.torn.com/profiles.php?XID=900',{permissions:null});
+    await page.feed([], {revision:'a'.repeat(64),playerIds:existing?[900]:[]});await pageAdminAccess(page);
+    if(!existing) {
+      const comment=page.notice().shadow.querySelector('textarea');comment.value='A justified target.';comment.emit('input');
+      noticeButton(page,'Add and approve').emit('click');page.response(page.requests.at(-1),{suggestion:adminRow()},201);await flush();
+      page.requests.at(-1).ontimeout();await flush();
+      assert.match(page.noticeText(),/Addition request saved. Approval is not confirmed/);
+      assert.equal(page.notice().shadow.querySelector('.quick-form').hidden,true);
+    }
+    assert.equal(all(page.notice().shadow).some(node=>node.textContent==='Add and approve'&&node.tagName==='BUTTON'),false);
+    const before=page.requests.filter(r=>r.method==='POST').length;noticeButton(page,'Review in NWA').emit('click');
+    assert.equal(page.requests.filter(r=>r.method==='POST').length,before);
+    assert.ok(page.requests.at(-1).url.includes('/api/suggestions?view='+(existing?'pending':'mine')));
+  }
+});
+
+test('late permission results and retained page controls cannot act after logout, role loss or navigation',async()=>{
+  for(const action of ['logout','navigation','role-loss','closed']) {
+    const page=fixture('https://www.torn.com/profiles.php?XID=900',{permissions:null});
+    await page.feed([],undefined,{targetRemoval:true});await pageAdminAccess(page);
+    const add=noticeButton(page,'Add and approve'),comment=page.notice().shadow.querySelector('textarea');comment.value='A justified target.';comment.emit('input');
+    if(action==='logout') {
+      page.openSettings();page.control('Sign out and remove key').emit('click');page.response(page.requests.at(-1),null,204);await flush();
+    } else if(action==='navigation') page.changeUrl('https://www.torn.com/profiles.php?XID=901');
+    else if(action==='closed') { const details=page.notice().shadow.querySelector('details');details.open=false;details.emit('toggle'); }
+    else {
+      add.emit('click');page.response(page.requests.at(-1),{suggestion:adminRow()},201);await flush();
+      page.response(page.requests.at(-1),{error:{code:'REVIEW_NOT_ALLOWED',message:'Leadership revoked.'}},403);await flush();
+      assert.equal(page.notice().shadow.querySelector('.page-admin').hidden,true);
+      assert.ok([...page.storage.values()].some(value=>value?.token==='saved-session'));
+    }
+    const before=page.requests.length;add.emit('click');assert.equal(page.requests.length,before);
+  }
+  const late=fixture('https://www.torn.com/profiles.php?XID=900',{permissions:null});await late.feed([]);openPending(late);
+  const check=late.permissionRequests.at(-1);late.openSettings();late.control('Sign out and remove key').emit('click');late.response(late.requests.at(-1),null,204);await flush();
+  late.response(check,{canManageTargets:true});await flush();assert.equal(late.notice(),null);
 });

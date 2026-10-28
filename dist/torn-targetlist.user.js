@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.14.0
+// @version      0.14.1
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -383,7 +383,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.14.0' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.14.1' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -471,6 +471,7 @@ function mountTargetList(platform, storageWarning = '') {
     suggestionsLoading: false, suggestionGeneration: 0, suggestionMutation: null, suggestionNotice: '', removalSupported: false, removalOpen: false,
     removalDraft: { type: 'player', targetId: '', reason: '', confirm: false },
     adminDraft: { type: 'player', targetId: '', comment: '' }, adminPending: null,
+    pagePermissions: { status: 'unknown', checkedAt: 0 },
     pendingSuggestionDetailsSupported: false, pendingSuggestions: { status: 'unsupported', revision: null, playerIds: [] }, pendingPlayerIds: new Set(), pendingSuggestionEpoch: 0,
     suggestionDraft: { type: 'player', targetId: '', comment: '' }
   };
@@ -676,6 +677,8 @@ function mountTargetList(platform, storageWarning = '') {
     state.view = 'targets'; state.suggestionView = 'pending'; state.suggestions = []; state.nextSuggestionOffset = null;
     state.removalSupported = false; state.removalOpen = false; state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
     state.adminDraft = { type: 'player', targetId: '', comment: '' }; state.adminPending = null;
+    state.pagePermissions = { status: 'unknown', checkedAt: 0 };
+    pageAdminDraft = { id: null, reason: '', confirm: false, feedback: '' };
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
     persist(() => {
@@ -697,7 +700,7 @@ function mountTargetList(platform, storageWarning = '') {
     return true;
   }
   function handleError(error) {
-    if (error.code === 'REVIEW_NOT_ALLOWED') state.canReview = false;
+    if (error.code === 'REVIEW_NOT_ALLOWED') { state.canReview = false; state.pagePermissions = { status: 'ready', checkedAt: Date.now() }; }
     const authStatus = error.status === 401 || error.status === 403;
     const confirmed = ['SESSION_REQUIRED', 'SESSION_EXPIRED', 'FACTION_NOT_ALLOWED', 'FACTION_CHANGED',
       'KEY_REJECTED', 'LIMITED_KEY_REQUIRED', 'KEY_PERMISSIONS_REQUIRED', 'INVALID_KEY', 'KEY_ACCESS',
@@ -902,7 +905,97 @@ function mountTargetList(platform, storageWarning = '') {
   let pageNoticeForm = null, pageNoticeComment = null, pageNoticeSubmit = null, pageNoticeFeedback = null, pageNoticeTitle = null, pageNoticeQuickHeading = null;
   let pageSuggestion = { id: null, comment: '', message: '' }, pagePendingDetails = null;
   let pageNoticePendingInfo = null, pageNoticePendingAuthor = null, pageNoticePendingReason = null, pageNoticePendingMessage = null, pageNoticePendingRetry = null;
+  let pageAdminControls = null, pageAdminSignature = null;
+  let pageAdminDraft = { id: null, reason: '', confirm: false, feedback: '' };
   const pageSuggestedIds = new Set();
+  function pageAdminMessage(text, id) {
+    if (id !== pageAdminDraft.id || C.pageTargetId(window.location?.href) !== id) return;
+    pageAdminDraft.feedback = text; pageAdminSignature = null; updatePageNotice();
+  }
+  function loadPageAdminAccess(force = false) {
+    if (!state.token || state.removingKey || !pageNoticeDetails?.open || !authorizedPoolFresh()) return;
+    const previous = state.pagePermissions;
+    if (previous.status === 'loading' || !force && previous.status !== 'unknown' && Date.now() - previous.checkedAt < 300000) return;
+    const generation = state.generation, entry = { status: 'loading', checkedAt: Date.now() };
+    state.pagePermissions = entry;
+    void (async () => {
+      try {
+        const data = await request('GET', '/api/permissions', undefined, state.token, 5000);
+        if (generation !== state.generation || state.pagePermissions !== entry) return;
+        if (typeof data?.canManageTargets !== 'boolean') throw new Error('Admin access could not be verified.');
+        state.canReview = data.canManageTargets; entry.status = 'ready'; entry.checkedAt = Date.now();
+      } catch (error) {
+        if (generation !== state.generation || state.pagePermissions !== entry) return;
+        state.canReview = false; entry.status = error.status === 404 ? 'unsupported' : 'error'; entry.checkedAt = Date.now();
+        if (error.status === 401 || error.status === 403) handleError(error);
+      } finally {
+        if (generation === state.generation && state.pagePermissions === entry) { render(); updatePageNotice(); }
+      }
+    })();
+  }
+  function pageAdminEligible(id, listed) {
+    return pageVisible() && pageNoticeDetails?.open && C.pageTargetId(window.location?.href) === id && pageSuggestion.id === id
+      && authorizedPoolFresh() && state.canReview && state.pagePermissions.status === 'ready'
+      && Date.now() - state.pagePermissions.checkedAt < 300000
+      && state.targets.some(target => target.id === id) === listed;
+  }
+  function renderPageAdminControls(id, target) {
+    if (!pageAdminControls) return;
+    if (!pageNoticeDetails.open) { pageAdminControls.hidden = true; pageAdminSignature = null; return; }
+    if (pageNoticeDetails.open) loadPageAdminAccess();
+    const access = state.pagePermissions, pending = state.pendingPlayerIds.has(id) || pageSuggestedIds.has(id) || Boolean(state.adminPending);
+    const signature = JSON.stringify([id, Boolean(target), access.status, access.checkedAt, state.canReview, pending,
+      state.suggestionMutation, state.removingKey, state.removalSupported, pageAdminDraft.feedback]);
+    if (signature === pageAdminSignature) return;
+    pageAdminSignature = signature;
+    const noticeRoot = pageAdminControls.getRootNode(), active = noticeRoot.activeElement;
+    const focused = pageAdminControls.contains(active), focus = focused && active.getAttribute?.('data-focus-key');
+    pageAdminControls.replaceChildren(); pageAdminControls.hidden = access.status === 'ready' && !state.canReview;
+    const busy = Boolean(state.suggestionMutation || state.removingKey);
+    if (access.status === 'error' || access.status === 'unsupported') {
+      pageAdminControls.append(element('p', access.status === 'unsupported' ? 'Update the NWA backend to enable page admin actions.' : 'Admin access could not be checked.', 'quick-help'));
+      const retry = button('Check admin access', () => { loadPageAdminAccess(true); updatePageNotice(); }); retry.disabled = busy; pageAdminControls.append(retry);
+    } else if (access.status !== 'ready') {
+      pageAdminControls.append(element('p', access.status === 'loading' ? 'Checking admin access...' : 'Admin access is checked when opened.', 'quick-help'));
+    } else if (state.canReview) {
+      pageAdminControls.append(element('p', 'Admin · Player [' + id + ']', 'quick-help'));
+      if (pageAdminDraft.feedback) { const feedback = element('p', pageAdminDraft.feedback, 'quick-feedback'); feedback.setAttribute('role', 'status'); pageAdminControls.append(feedback); }
+      if (!target) {
+        if (pending) {
+          const review = button('Review in NWA', () => { state.view = 'suggestions'; toggle(true); void loadSuggestions(state.adminPending ? 'mine' : 'pending'); });
+          review.disabled = busy; pageAdminControls.append(review);
+        } else if (state.pendingSuggestions.status !== 'unavailable') {
+          const add = focusKey(button(state.suggestionMutation === 'admin-add' ? 'Adding...' : 'Add and approve', () => {
+            if (!pageAdminEligible(id, false)) return;
+            void addAdminTarget({ type: 'player', targetId: String(id), comment: pageNoticeComment.value }, true);
+          }), 'page-admin:add');
+          add.disabled = busy; pageAdminControls.append(add);
+        }
+      } else if (!state.removalSupported) {
+        pageAdminControls.append(element('p', 'Update the NWA backend to enable target removal.', 'quick-help'));
+      } else {
+        const form = element('form', null, 'quick-form page-admin-removal');
+        const label = element('label', 'Removal reason (required)'), reason = focusKey(element('textarea'), 'page-admin:reason');
+        reason.required = true; reason.rows = 2; reason.maxLength = 2000; reason.disabled = busy; reason.value = pageAdminDraft.reason;
+        reason.setAttribute('aria-label', 'Reason for removing this player');
+        reason.addEventListener('input', () => { if (!state.suggestionMutation && pageAdminDraft.id === id) pageAdminDraft.reason = reason.value; }); label.append(reason);
+        const confirmation = element('label', null, 'page-admin-confirm'), confirm = focusKey(element('input'), 'page-admin:confirm');
+        confirm.type = 'checkbox'; confirm.required = true; confirm.disabled = busy; confirm.checked = pageAdminDraft.confirm;
+        confirm.setAttribute('aria-label', 'Confirm removing this player');
+        confirm.addEventListener('change', () => { if (!state.suggestionMutation && pageAdminDraft.id === id) pageAdminDraft.confirm = confirm.checked; });
+        confirmation.append(confirm, element('span', 'Remove this player from the shared NWA list.'));
+        const remove = focusKey(element('button', state.suggestionMutation === 'remove' ? 'Removing...' : 'Remove from NWA'), 'page-admin:remove'); remove.type = 'submit'; remove.disabled = busy;
+        form.append(label, confirmation, remove); form.addEventListener('submit', event => {
+          event.preventDefault(); if (!pageAdminEligible(id, true)) return;
+          void removeTargetsFromList({ type: 'player', targetId: String(id), reason: pageAdminDraft.reason, confirm: pageAdminDraft.confirm }, true);
+        }); pageAdminControls.append(form);
+      }
+    }
+    if (focused && pageNoticeDetails.open) {
+      const replacement = focus && [...pageAdminControls.querySelectorAll('[data-focus-key]')].find(node => node.getAttribute('data-focus-key') === focus && !node.disabled);
+      (replacement || pageNoticeSummary).focus?.({ preventScroll: true });
+    }
+  }
   function pageSuggestionMessage(text, id) {
     if (id !== pageSuggestion.id || C.pageTargetId(window.location?.href) !== id) return;
     pageSuggestion.message = text; updatePageNotice();
@@ -962,6 +1055,7 @@ function mountTargetList(platform, storageWarning = '') {
     pageNoticeMode = null; pageNoticeForm = null; pageNoticeComment = null; pageNoticeSubmit = null; pageNoticeFeedback = null; pageNoticeTitle = null; pageNoticeQuickHeading = null;
     pageNotice = null; pageNoticeReason = null; pageNoticeFullReason = null; pageNoticeSummary = null;
     pageNoticeEstimate = null; pageNoticeEstimateDetail = null; pageNoticeDetail = null; pageNoticeDetails = null;
+    pageAdminControls = null; pageAdminSignature = null;
   }
   function firstTextLine(anchor) {
     const rect = anchor.getBoundingClientRect?.();
@@ -1080,7 +1174,8 @@ function mountTargetList(platform, storageWarning = '') {
     style(pageNoticeDetail, 'width', `${detailWidth}px`); style(pageNoticeDetail, 'left', `${detailLeft - match.left}px`);
     const below = Math.max(0, match.viewportBottom - match.top - 22 - 12);
     const above = Math.max(0, match.top - match.viewportTop - 12);
-    const preferredHeight = Math.min(pageNoticeMode === 'suggest' ? 320 : 200, match.viewportHeight * (pageNoticeMode === 'suggest' ? 0.6 : 0.4));
+    const editable = pageNoticeMode === 'suggest' || state.pagePermissions.status === 'ready' && state.canReview;
+    const preferredHeight = Math.min(editable ? 320 : 200, match.viewportHeight * (editable ? 0.6 : 0.4));
     const upwards = below < preferredHeight && above > below;
     style(pageNoticeDetail, 'top', upwards ? 'auto' : 'calc(100% + 4px)');
     style(pageNoticeDetail, 'bottom', upwards ? 'calc(100% + 4px)' : 'auto');
@@ -1103,6 +1198,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (pageSuggestion.id !== id) {
       removePageNotice();
       pageSuggestion = { id, comment: '', message: '' }; pagePendingDetails = null;
+      pageAdminDraft = { id, reason: '', confirm: false, feedback: '' };
     }
     observeNoticeArea(id);
     if (!pageNotice) {
@@ -1135,6 +1231,7 @@ function mountTargetList(platform, storageWarning = '') {
         button{min-height:30px;border:1px solid #52525b;border-radius:4px;padding:4px 8px;background:#27272a;color:#f4f4f5;font:12px Arial,Helvetica,sans-serif;cursor:pointer}
         button[type="submit"]{background:#3f4d22;border-color:#9fbd57}button:disabled{opacity:.6;cursor:wait}
         .quick-actions{display:flex;gap:6px}.quick-feedback{margin-top:6px;white-space:pre-wrap}.quick-help{color:#a1a1aa;font-size:10px}
+        .page-admin{display:grid;gap:7px;margin-top:8px;padding-top:7px;border-top:1px solid #52525b}.page-admin-confirm{display:flex!important;grid-template-columns:none;align-items:start;gap:6px;font-weight:400!important}.page-admin-confirm input{flex:0 0 auto;margin:2px 0}.page-admin button{min-height:36px}
       `;
       const notice = element('section', null, 'notice');
       notice.setAttribute('role', 'note'); notice.setAttribute('aria-label', target ? 'NWA target list notice' : 'Suggest this player to NWA');
@@ -1182,6 +1279,7 @@ function mountTargetList(platform, storageWarning = '') {
         pageNoticePendingInfo.append(pageNoticePendingAuthor, pageNoticePendingReason, pageNoticePendingMessage, pageNoticePendingRetry);
         pageNoticeDetail.append(pageNoticeForm, pageNoticeFeedback, pageNoticePendingInfo);
       }
+      pageAdminControls = element('div', null, 'page-admin'); pageNoticeDetail.append(pageAdminControls);
       pageNoticeDetails.append(pageNoticeSummary, pageNoticeDetail); notice.append(pageNoticeDetails);
       noticeRoot.append(style, notice);
       pageNoticeDetails.addEventListener('toggle', () => {
@@ -1231,7 +1329,7 @@ function mountTargetList(platform, storageWarning = '') {
           if (pageNoticePendingReason.textContent !== 'Reason: ' + row.comment) pageNoticePendingReason.textContent = 'Reason: ' + row.comment;
         }
       }
-      positionPageNotice(id); observeNoticeArea(id); return;
+      renderPageAdminControls(id, null); positionPageNotice(id); observeNoticeArea(id); return;
     }
     const reason = (typeof target.reason === 'string' && target.reason.trim())
       || (typeof target.notes === 'string' && target.notes.trim()) || 'No reason provided.';
@@ -1252,7 +1350,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (pageNoticeEstimateDetail.textContent !== estimateDetail) pageNoticeEstimateDetail.textContent = estimateDetail;
     const description = `${estimateDetail}. ${text}`;
     if (pageNoticeSummary.title !== description) { pageNoticeSummary.title = description; pageNoticeSummary.setAttribute('aria-label', `NWA target list. ${description}`); }
-    positionPageNotice(id); observeNoticeArea(id);
+    renderPageAdminControls(id, target); positionPageNotice(id); observeNoticeArea(id);
   }
   function schedulePageNotice() {
     if (disposed || !pageVisible() || !C.pageTargetId(window.location?.href) || pageNoticeTimer !== null) return;
@@ -1527,6 +1625,7 @@ function mountTargetList(platform, storageWarning = '') {
       const data = await request('GET', `/api/suggestions?view=${view}&offset=${offset}`);
       if (generation !== state.generation || suggestionGeneration !== state.suggestionGeneration) return;
       state.canReview = data.canReview === true;
+      state.pagePermissions = { status: 'ready', checkedAt: Date.now() };
       // Keep a changing shared queue from displaying a repeated row across pages.
       const rows = append ? [...state.suggestions, ...data.suggestions] : data.suggestions;
       state.suggestions = [...new Map(rows.map(row => [row.id, row])).values()];
@@ -1585,16 +1684,20 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
 
-  async function addAdminTarget() {
+  async function addAdminTarget(input = state.adminDraft, fromPage = false) {
     if (!state.token || !state.canReview || state.adminPending || state.suggestionMutation || state.removingKey || state.suggestionsLoading) return;
-    const draft = { ...state.adminDraft }, targetId = Number(draft.targetId), comment = draft.comment.trim();
+    const draft = { ...input }, targetId = Number(draft.targetId), comment = draft.comment.trim();
+    const report = text => fromPage ? pageAdminMessage(text, targetId) : message(text);
+    if (fromPage && (!pageAdminEligible(targetId, false) || draft.type !== 'player' || state.pendingPlayerIds.has(targetId)
+      || pageSuggestedIds.has(targetId) || state.pendingSuggestions.status === 'unavailable')) return;
     if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(targetId) || targetId > 2147483647) {
-      message('Enter a valid player or faction ID.'); return;
+      report('Enter a valid player or faction ID.'); return;
     }
-    if (!comment || [...comment].length > 1000) { message('Add a reason for this target, up to 1,000 characters.'); return; }
+    if (!comment || [...comment].length > 1000) { report('Add a reason for this target, up to 1,000 characters.'); return; }
     const generation = state.generation;
-    const returnFocus = root.activeElement?.getAttribute?.('data-focus-key') === 'admin:add';
-    cancelFind(); state.suggestionMutation = 'admin-add'; state.suggestionNotice = ''; message(''); render();
+    const returnFocus = !fromPage && root.activeElement?.getAttribute?.('data-focus-key') === 'admin:add';
+    const pageWasFocused = fromPage && Boolean(pageAdminControls?.contains(pageAdminControls.getRootNode?.()?.activeElement));
+    cancelFind(); state.suggestionMutation = 'admin-add'; state.suggestionNotice = ''; report(''); message(''); render(); updatePageNotice();
     try {
       const submitted = await request('POST', '/api/suggestions', { type: draft.type, targetId, comment });
       if (generation !== state.generation) return;
@@ -1604,7 +1707,11 @@ function mountTargetList(platform, storageWarning = '') {
         // An unverified submit response must never select a request for approval.
         throw new Error('The addition request could not be verified. Check My suggestions before submitting again.');
       }
-      state.adminPending = { id: row.id, type: row.type, targetId };
+      state.adminPending = { id: row.id, type: row.type, targetId, fromPage };
+      if (row.type === 'player') {
+        if (pageSuggestedIds.size >= 200) pageSuggestedIds.delete(pageSuggestedIds.values().next().value);
+        pageSuggestedIds.add(targetId);
+      }
       state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
       if (!state.canReview) throw new Error('The request was saved, but current admin permissions could not be confirmed.');
       const result = await request('POST', `/api/suggestions/${row.id}/review`, { decision: 'approved' });
@@ -1614,17 +1721,21 @@ function mountTargetList(platform, storageWarning = '') {
         || !Number.isSafeInteger(result.addedPlayers) || result.addedPlayers < 0 || result.addedPlayers > (row.type === 'player' ? 1 : 1000)) {
         throw new Error('Approval could not be verified. Check the saved request before trying again.');
       }
-      state.adminPending = null; state.adminDraft = { type: 'player', targetId: '', comment: '' };
+      state.adminPending = null;
+      if (!fromPage) state.adminDraft = { type: 'player', targetId: '', comment: '' };
+      if (fromPage && pageSuggestion.id === targetId) pageSuggestion.comment = '';
       state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
       if (row.type === 'player') { state.pendingPlayerIds.delete(targetId); pageSuggestedIds.delete(targetId); }
       state.suggestionNotice = 'Added and approved. ' + result.addedPlayers + ' player(s) added to the shared NWA list.'
         + (result.warnings?.length ? ' ' + result.warnings.join(' ') : '');
-      await Promise.all([loadSuggestions(), loadTargets(true)]);
+      if (fromPage) pageAdminMessage(state.suggestionNotice, targetId);
+      await Promise.all([...(fromPage ? [] : [loadSuggestions()]), loadTargets(true, false, fromPage)]);
     } catch (error) {
       if (generation !== state.generation) return;
       if (state.adminPending) state.suggestionNotice = 'Addition request saved. Approval is not confirmed. Open My suggestions to check its current status before retrying.';
       if (error.code === 'REVIEW_NOT_ALLOWED') { state.suggestionGeneration++; state.suggestionsLoading = false; }
       handleError(error);
+      if (fromPage) pageAdminMessage(state.adminPending ? state.suggestionNotice : error.message || 'The addition could not be confirmed.', targetId);
     } finally {
       if (generation === state.generation) {
         state.suggestionMutation = null; render(); updatePageNotice();
@@ -1632,16 +1743,20 @@ function mountTargetList(platform, storageWarning = '') {
           const key = state.adminPending ? 'admin:inspect' : 'admin:add';
           [...content.querySelectorAll('[data-focus-key]')].find(node => node.getAttribute('data-focus-key') === key)?.focus?.({ preventScroll: true });
         }
+        if (pageWasFocused && C.pageTargetId(window.location?.href) === targetId && pageNoticeDetails?.open
+          && (!document.activeElement || document.activeElement === document.body || document.activeElement === pageNotice)) pageNoticeSummary.focus?.({ preventScroll: true });
       }
     }
   }
 
-  async function removeTargetsFromList() {
+  async function removeTargetsFromList(draft = state.removalDraft, fromPage = false) {
     if (!state.token || !state.canReview || !state.removalSupported || state.suggestionMutation || state.removingKey) return;
-    const draft = state.removalDraft, id = Number(draft.targetId), reason = draft.reason.trim();
+    const id = Number(draft.targetId), reason = draft.reason.trim(), report = text => fromPage ? pageAdminMessage(text, id) : message(text);
+    if (fromPage && (!pageAdminEligible(id, true) || draft.type !== 'player')) return;
     if (!['player', 'faction'].includes(draft.type) || !/^[1-9]\d*$/.test(draft.targetId.trim()) || !Number.isSafeInteger(id)
-      || id > 2147483647 || !reason || [...reason].length > 1000 || !draft.confirm) { message('Choose a player or faction, provide a reason and confirm removal.'); return; }
-    const generation = state.generation; cancelFind(); state.suggestionMutation = 'remove'; message(''); render();
+      || id > 2147483647 || !reason || [...reason].length > 1000 || !draft.confirm) { report('Choose a player or faction, provide a reason and confirm removal.'); return; }
+    const generation = state.generation, pageWasFocused = fromPage && Boolean(pageAdminControls?.contains(pageAdminControls.getRootNode?.()?.activeElement));
+    cancelFind(); state.suggestionMutation = 'remove'; report(''); message(''); render(); updatePageNotice();
     try {
       const result = await request('POST', '/api/targets/remove', { type: draft.type, targetId: id, reason, confirm: true });
       if (generation !== state.generation) return;
@@ -1649,13 +1764,24 @@ function mountTargetList(platform, storageWarning = '') {
         || new Set(result.removedIds).size !== result.removedIds.length || draft.type === 'player' && result.removedIds.some(value => value !== id)
         || result.removedIds.length > 5000 || result.removedIds.some(value => !Number.isSafeInteger(value) || value <= 0 || value > 2147483647)) throw new Error('Removal result could not be verified. Refresh the list before trying again.');
       const removed = new Set(result.removedIds); state.targetGeneration++; state.targets = state.targets.filter(row => !removed.has(row.id));
-      state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
+      if (!fromPage) state.removalDraft = { type: 'player', targetId: '', reason: '', confirm: false };
+      if (fromPage && pageAdminDraft.id === id) { pageAdminDraft.reason = ''; pageAdminDraft.confirm = false; }
       state.suggestionNotice = 'Removed ' + result.removedCount + ' player(s) from the shared NWA list.' + (result.warnings?.length ? ' ' + result.warnings.join(' ') : '');
+      if (fromPage) pageAdminMessage(state.suggestionNotice, id);
       render(); updatePageNotice(); await loadTargets(true, false, true);
     } catch (error) {
       if (generation !== state.generation) return;
-      state.removalDraft.confirm = false; handleError(error); void loadTargets(true, false, true);
-    } finally { if (generation === state.generation) { state.suggestionMutation = null; render(); } }
+      if (!fromPage) state.removalDraft.confirm = false;
+      if (fromPage && pageAdminDraft.id === id) pageAdminDraft.confirm = false;
+      handleError(error); if (fromPage) pageAdminMessage(error.message || 'Removal could not be confirmed. Refresh the list before trying again.', id);
+      void loadTargets(true, false, true);
+    } finally {
+      if (generation === state.generation) {
+        state.suggestionMutation = null; render(); updatePageNotice();
+        if (pageWasFocused && C.pageTargetId(window.location?.href) === id
+          && (!document.activeElement || document.activeElement === document.body || document.activeElement === pageNotice)) pageNoticeSummary?.focus?.({ preventScroll: true });
+      }
+    }
   }
 
   async function reviewSuggestion(id, decision) {
@@ -1665,7 +1791,10 @@ function mountTargetList(platform, storageWarning = '') {
     try {
       const data = await request('POST', `/api/suggestions/${id}/review`, { decision });
       if (generation !== state.generation) return;
-      if (state.adminPending?.id === id) { state.adminPending = null; state.adminDraft = { type: 'player', targetId: '', comment: '' }; }
+      if (state.adminPending?.id === id) {
+        if (!state.adminPending.fromPage) state.adminDraft = { type: 'player', targetId: '', comment: '' };
+        state.adminPending = null;
+      }
       state.pendingSuggestionEpoch++; state.pendingSuggestions = { ...state.pendingSuggestions, revision: null };
       if (data.suggestion?.type === 'player') {
         state.pendingPlayerIds.delete(data.suggestion.targetId); pageSuggestedIds.delete(data.suggestion.targetId);

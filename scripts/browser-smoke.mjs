@@ -192,9 +192,13 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         if (window.__mock.nextTarget) data.capabilities = { nextTarget: true, requestDeadlineMs: 8000, schema: { status: 'ready', failedChecks: [] } };
         if (window.__mock.removalEnabled) data.capabilities = { ...data.capabilities, targetRemoval: true };
       } else if (url.pathname === '/api/targets/remove' && request.method === 'POST') {
-        const body = JSON.parse(request.data), removed = targets.filter(row => body.type === 'player' ? row.id === body.targetId : row.faction?.id === body.targetId);
-        const ids = new Set(removed.map(row => row.id)); targets.splice(0, targets.length, ...targets.filter(row => !ids.has(row.id)));
-        data = { type: body.type, targetId: body.targetId, removedIds: [...ids], removedCount: ids.size };
+        if (!window.__mock.canReview) {
+          status = 403; data = { error: { code: 'REVIEW_NOT_ALLOWED', message: 'Mock leadership permission removed' } };
+        } else {
+          const body = JSON.parse(request.data), removed = targets.filter(row => body.type === 'player' ? row.id === body.targetId : row.faction?.id === body.targetId);
+          const ids = new Set(removed.map(row => row.id)); targets.splice(0, targets.length, ...targets.filter(row => !ids.has(row.id)));
+          data = { type: body.type, targetId: body.targetId, removedIds: [...ids], removedCount: ids.size };
+        }
       } else if (url.pathname === '/api/targets/next' && request.method === 'POST') {
         if (!window.__mock.nextTarget) {
           status = 404; data = { error: { code: 'NOT_FOUND', message: 'Endpoint not found.' } };
@@ -229,6 +233,9 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
         const targetId = Number(url.pathname.split('/')[4]);
         data = { suggestion: window.__mock.pendingPlayers?.includes(targetId) ? { type: 'player', status: 'pending', targetId,
           comment: 'Repeated attacks on alliance members. Full _reason_ with <b>literal text</b>.', suggestedBy: { id: 4242, name: 'Pending_Member' } } : null };
+      } else if (url.pathname === '/api/permissions' && request.method === 'GET') {
+        window.__mock.permissionResponses = (window.__mock.permissionResponses || 0) + 1;
+        data = { canManageTargets: window.__mock.canReview };
       } else if (url.pathname === '/api/suggestions' && request.method === 'GET') {
         const offset = Number(url.searchParams.get('offset') || 0);
         const view = url.searchParams.get('view');
@@ -256,7 +263,7 @@ async function mount(viewport = { width: 1280, height: 960 }, scripts = [source]
             const additions = row.type === 'faction'
               ? [1, 2].map(index => makeTarget(row.targetId * 10 + index, 'Mock Approved Faction Member ' + index, 200000,
                 { faction: { id: row.targetId, name: 'Mock Suggested Faction' } }))
-              : [makeTarget(row.targetId, 'Mock Approved Player', 200000)];
+              : [makeTarget(row.targetId, 'Mock Approved Player', 200000, { reason: row.comment })];
             targets.push(...additions); addedPlayers = additions.length;
           }
           data = { suggestion: structuredClone(row), addedPlayers };
@@ -781,6 +788,128 @@ async function openSuggestions(page) {
   await clickButton(page, 'Suggestions');
   await wait(page, () => Boolean(window.__targetlistShadow.querySelector('.suggestionform')) && !window.__targetlistShadow.querySelector('.queueheader button').disabled);
 }
+
+async function noticeAction(page, text) {
+  await page.evaluate(text => {
+    const button = [...window.__playerNoticeShadow.querySelectorAll('button')].find(node => node.textContent === text);
+    if (!button) throw new Error('Missing notice action: ' + text);
+    button.click();
+  }, text);
+}
+async function openPlayerNotice(page) {
+  await page.evaluate(() => {
+    const details = window.__playerNoticeShadow.querySelector('details');
+    if (!details.open) window.__playerNoticeShadow.querySelector('summary').click();
+  });
+  await wait(page, () => window.__playerNoticeShadow.querySelector('details').open);
+}
+async function checkPageAdminManagement(pageContext, scripts, mode) {
+  const cases = mode === 'PDA' ? [{ width: 390, attack: true }, { width: 320, attack: false }] : [{ width: 1280, attack: false }, { width: 1280, attack: true }];
+  for (const sample of cases) {
+    const label = mode.toLowerCase() + '-' + sample.width + '-' + (sample.attack ? 'attack' : 'profile');
+    const page = await mount({ width: sample.width, height: 900 }, scripts, pageContext, attack => {
+      const content = document.createElement('main'); content.id = 'content-wrapper';
+      content.style.cssText = 'margin:160px 16px 0;width:calc(100% - 32px);padding:0';
+      content.innerHTML = '<h1>' + (attack ? 'Attacking' : 'Player [999]') + '</h1><p>Contextual admin fixture.</p>';
+      document.body.append(content);
+      window.__adminPageHeight = content.getBoundingClientRect().height;
+      window.__mock.canReview = true; window.__mock.removalEnabled = true;
+    }, sample.attack, sample.attack ? 'https://www.torn.com/page.php?sid=attack&user2ID=999' : 'https://www.torn.com/profiles.php?XID=999');
+    await login(page); await shadow(page, '[aria-label="Close NWA settings"]', 'click');
+    await wait(page, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'suggest');
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/permissions').length), 0,
+      label + ': rendering a closed badge never fetches admin access');
+    await openPlayerNotice(page);
+    await wait(page, () => [...window.__playerNoticeShadow.querySelectorAll('button')].some(node => node.textContent === 'Add and approve' && !node.disabled));
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.method === 'GET' && row.path === '/api/permissions').length), 1,
+      label + ': first dropdown opening performs one shared permission lookup');
+    await page.evaluate(() => window.__playerNoticeShadow.querySelector('summary').click());
+    await openPlayerNotice(page);
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.method === 'GET' && row.path === '/api/permissions').length), 1,
+      label + ': dropdown reopening reuses the permission result');
+    const initialPosts = await page.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST').length);
+    await noticeAction(page, 'Add and approve');
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST').length), initialPosts,
+      label + ': an admin addition still requires a reason');
+    await page.evaluate(() => {
+      const input = window.__playerNoticeShadow.querySelector('[aria-label="Reason for suggesting this player"]');
+      input.value = '  Approved directly from this player page.  '; input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await noticeAction(page, 'Add and approve');
+    await wait(page, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'listed');
+    const writes = await page.evaluate(() => window.__mock.requests.filter(row => row.method === 'POST' && (row.path === '/api/suggestions' || row.path.endsWith('/review'))));
+    assert.equal(writes.length, 2, label + ': one submission and one approval');
+    assert.deepEqual(JSON.parse(writes[0].data), { type: 'player', targetId: 999, comment: 'Approved directly from this player page.' });
+    assert.deepEqual(JSON.parse(writes[1].data), { decision: 'approved' });
+    await openPlayerNotice(page);
+    await wait(page, () => Boolean(window.__playerNoticeShadow.querySelector('.page-admin-removal')));
+    assert.match(await page.evaluate(() => window.__playerNoticeShadow.querySelector('.full-reason').textContent), /Approved directly from this player page/);
+    await page.evaluate(() => window.__playerNoticeShadow.querySelector('.page-admin-removal').requestSubmit());
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/targets/remove').length), 0,
+      label + ': removal requires both reason and explicit confirmation');
+    await page.evaluate(() => {
+      const input = window.__playerNoticeShadow.querySelector('[aria-label="Reason for removing this player"]');
+      input.value = 'Peace agreement'; input.dispatchEvent(new Event('input', { bubbles: true }));
+      window.__playerNoticeShadow.querySelector('.page-admin-removal').requestSubmit();
+    });
+    assert.equal(await page.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/targets/remove').length), 0,
+      label + ': a removal reason alone cannot remove the player');
+    const geometry = await page.evaluate(() => {
+      const root = window.__playerNoticeShadow, popup = root.querySelector('.detail'), rect = popup.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: innerWidth,
+        viewportHeight: innerHeight, documentWidth: document.documentElement.scrollWidth,
+        originalHeight: window.__adminPageHeight, contentHeight: document.getElementById('content-wrapper').getBoundingClientRect().height,
+        overflow: popup.scrollWidth > popup.clientWidth + 1 };
+    });
+    assert(geometry.left >= 0 && geometry.right <= sample.width && geometry.top >= 0 && geometry.bottom <= geometry.viewportHeight
+      && geometry.documentWidth <= sample.width && !geometry.overflow, label + ': popup remains in viewport ' + JSON.stringify(geometry));
+    assert.equal(geometry.contentHeight, geometry.originalHeight, label + ': contextual admin actions add no page layout row');
+    await page.screenshot({ path: path.join(artifacts, 'browser-page-admin-' + label + '.png'), fullPage: true });
+    await page.evaluate(() => {
+      const root = window.__playerNoticeShadow, confirm = root.querySelector('[aria-label="Confirm removing this player"]');
+      confirm.checked = true; confirm.dispatchEvent(new Event('change', { bubbles: true }));
+      root.querySelector('.page-admin-removal').requestSubmit(); root.querySelector('.page-admin-removal')?.requestSubmit();
+    });
+    await wait(page, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'suggest');
+    const removals = await page.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/targets/remove'));
+    assert.equal(removals.length, 1, label + ': duplicate activation does not repeat removal');
+    assert.deepEqual(JSON.parse(removals[0].data), { type: 'player', targetId: 999, reason: 'Peace agreement', confirm: true });
+    assert.equal(await page.evaluate(() => window.__mock.targets.some(target => target.id === 999)), false);
+    if (mode === 'PDA') assert.equal(await page.evaluate(() => window.__mock.pda.calls.some(call => call.name === 'PDA_httpPost'
+      && new URL(call.args[0]).pathname === '/api/targets/remove')), true, label + ': native PDA transport carries removal');
+    await page.evaluate(() => { window.__mock.canReview = false; window.__mockNow += 300001; });
+    await refreshMockFeed(page); await openPlayerNotice(page);
+    await wait(page, () => window.__mock.permissionResponses >= 2);
+    assert.equal(await page.evaluate(() => [...window.__playerNoticeShadow.querySelectorAll('.page-admin button')]
+      .some(node => ['Add and approve', 'Remove from NWA'].includes(node.textContent))), false,
+      label + ': expired permissions refresh and hide mutations after demotion');
+    assert.equal(await page.evaluate(() => window.__mock.store.has('targetlist.session.' + window.__mock.serviceOrigin)), true,
+      label + ': loss of leadership keeps the ordinary allowed-member session');
+    await page.close();
+  }
+  const pending = await mount({ width: mode === 'PDA' ? 320 : 1280, height: 900 }, scripts, pageContext, () => {
+    const content = document.createElement('main'); content.id='content-wrapper';
+    content.style.cssText='margin:160px 16px 0;width:calc(100% - 32px);padding:0';
+    content.innerHTML='<h1>Player [999]</h1><p>Pending contextual admin fixture.</p>';document.body.append(content);
+    window.__mock.canReview=true;window.__mock.pendingPlayers=[999];
+    window.__mock.suggestions.push({...structuredClone(window.__mock.suggestions[0]),
+      id:'00000000-0000-4000-8000-000000000002',targetId:999,targetName:'Pending page target'});
+  }, undefined, 'https://www.torn.com/profiles.php?XID=999');
+  await login(pending);await shadow(pending,'[aria-label="Close NWA settings"]','click');
+  await wait(pending,()=>window.__playerNoticeShadow?.querySelector('summary').textContent.includes('Pending'));
+  await openPlayerNotice(pending);
+  await wait(pending,()=>[...window.__playerNoticeShadow.querySelectorAll('.page-admin button')].some(node=>node.textContent==='Review in NWA'));
+  assert.equal(await pending.evaluate(()=>[...window.__playerNoticeShadow.querySelectorAll('.page-admin button')].some(node=>node.textContent==='Add and approve')),false,
+    mode+': pending targets offer review instead of a duplicate addition');
+  await noticeAction(pending,'Review in NWA');
+  await wait(pending,()=>!window.__targetlistShadow.querySelector('.panel').hidden
+    && [...window.__targetlistShadow.querySelectorAll('.suggestioncard')].some(node=>node.textContent.includes('Pending page target')));
+  assert.equal(await pending.evaluate(()=>window.__mock.requests.filter(row=>row.method==='POST'&&row.path.startsWith('/api/suggestions')).length),0,
+    mode+': opening a pending request does not submit or approve it');
+  await pending.close();
+  console.log('PASS ' + mode + ' contextual profile/attack admin add+approve and removal: lazy cached permissions, mandatory reason/confirmation, immediate badges, compact bounds and native transport');
+}
+
 async function checkAdminManagement(pageContext, scripts, mode) {
   const widths = mode === 'PDA' ? [390, 320] : [1280];
   for (const width of widths) {
@@ -2128,7 +2257,7 @@ try {
         }, mode.attack, mode.attack ? 'https://www.torn.com/page.php?sid=attack&user2ID=999' : 'https://www.torn.com/profiles.php?XID=999');
       await login(quick); await shadow(quick, '[aria-label="Close NWA settings"]', 'click');
       await wait(quick, () => document.getElementById('nwa-target-page-notice')?.getAttribute('data-mode') === 'suggest');
-      const before = await quick.evaluate(() => window.__mock.requests.length);
+      assert.equal(await quick.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/suggestions').length), 0, 'closed player badges do not load permissions');
       const point = await quick.evaluate(() => {
         const host = document.getElementById('nwa-target-page-notice'), rect = window.__playerNoticeShadow.querySelector('summary').getBoundingClientRect();
         if (host.getBoundingClientRect().height > 23) throw new Error('Quick action added a content row.');
@@ -2138,6 +2267,8 @@ try {
       await wait(quick, () => window.__playerNoticeShadow.querySelector('details').open);
       await wait(quick, () => window.__playerNoticeShadow.activeElement === window.__playerNoticeShadow.querySelector('textarea'));
       assert.equal(await quick.evaluate(() => window.__playerNoticeShadow.activeElement === window.__playerNoticeShadow.querySelector('textarea')), true);
+      await wait(quick, () => window.__mock.permissionResponses >= 1);
+      const before = await quick.evaluate(() => window.__mock.requests.length);
       await quick.evaluate(() => window.__playerNoticeShadow.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
       assert.equal(await quick.evaluate(() => window.__mock.requests.length), before, 'blank reasons cannot send a request');
       assert.match(await quick.evaluate(() => window.__playerNoticeShadow.querySelector('.quick-feedback').textContent), /reason/);
@@ -2213,7 +2344,9 @@ try {
     await wait(shared, () => document.getElementById('nwa-target-page-notice').getAttribute('data-mode') === 'listed');
     assert.match(await shared.evaluate(() => window.__playerNoticeShadow.querySelector('.reason').textContent), /Saved approved reason/);
     assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/suggestions').length), 0,
-      'pending details never fetch the full suggestion queue');
+      'pending details and admin permission checks never fetch the full suggestion queue');
+    assert.equal(await shared.evaluate(() => window.__mock.requests.filter(row => row.path === '/api/permissions').length), 1,
+      'one lazy permission lookup is reused across all pending/detail feed changes');
     await shared.close();
   }
   console.log('PASS shared pending suggestions on desktop profiles/native PDA attacks: compact badge, revision-only refresh, unknown-state handling, rejection, approval, keyboard focus and no extra queue requests');
@@ -2763,6 +2896,7 @@ try {
   await checkDeltaRendering(context, [source], 'GM');
   await checkExports(context, [source], 'GM');
   await checkAdminManagement(context, [source], 'GM');
+  await checkPageAdminManagement(context, [source], 'GM');
   const deltaPdaContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   await deltaPdaContext.route('**/*', route => { networkRequests++; return route.abort(); });
   try {
@@ -2773,6 +2907,7 @@ try {
     await checkDeltaRendering(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkExports(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
     await checkAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
+    await checkPageAdminManagement(deltaPdaContext, [pdaRuntimeSource, source], 'PDA');
   }
   finally { await deltaPdaContext.close(); }
 
