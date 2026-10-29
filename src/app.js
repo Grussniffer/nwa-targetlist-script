@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.2' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.3' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -36,6 +36,9 @@ if (!window.top || window.top === window.self) {
 
 function mountTargetList(platform, storageWarning = '') {
   const C = TargetListCore;
+  const serviceClock = C.createServiceClock();
+  const serviceNow = () => serviceClock.now();
+  const monotonicNow = () => typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
   const FEED_REFRESH_MS = 10_000;
   const IDLE_FEED_REFRESH_MS = 30_000;
   const CARD_BATCH_SIZE = 50;
@@ -285,7 +288,7 @@ function mountTargetList(platform, storageWarning = '') {
     estimateDays: state.estimateDays, lastTargetId: state.lastTargetId, recentTargets: C.recentTargets(state.recentTargets),
     excludedFactionIds: state.excludedFactionIds, avoidActive: state.avoidActive, activityMinutes: state.activityMinutes,
     ...(Object.keys(state.excludedFactionNames).length ? { excludedFactionNames: state.excludedFactionNames } : {}) })); }
-  function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays); }
+  function assessTarget(target) { return C.assess(target, state.player, state.maxRatio, serviceNow(), state.minRatio, state.estimateDays); }
   function rememberTarget(id) {
     state.lastTargetId = id;
     state.recentTargets = C.recentTargets([...state.recentTargets.filter(value => value.id !== id), { id, at: Date.now() }]);
@@ -294,8 +297,9 @@ function mountTargetList(platform, storageWarning = '') {
   function saveSession() {
     return platform.setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
   }
-  function clearSession() {
+  function clearSession({ preserveClock = false } = {}) {
     const clearedToken = state.token;
+    if (!preserveClock) serviceClock.reset();
     pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' }; pagePendingDetails = null; state.pendingSuggestionDetailsSupported = false;
     state.pendingSuggestionEpoch++; state.pendingSuggestions = { status: 'unsupported', revision: null, playerIds: [] }; state.pendingPlayerIds.clear();
     cancelFind(); state.findAfterLogin = false;
@@ -326,8 +330,8 @@ function mountTargetList(platform, storageWarning = '') {
     let saved;
     try { saved = platform.getValue(storageKey, null); } catch { return false; }
     if (!saved || typeof saved.token !== 'string' || !saved.token || saved.token === state.token
-      || !(Date.parse(saved.expiresAt) > Date.now())) return false;
-    clearSession();
+      || !(Date.parse(saved.expiresAt) > serviceNow())) return false;
+    clearSession({ preserveClock: true });
     state.token = saved.token; state.expiresAt = saved.expiresAt;
     // Restore through the backend before showing protected data or allowing a hit.
     void loadTargets();
@@ -350,6 +354,7 @@ function mountTargetList(platform, storageWarning = '') {
     message(error.message || 'The request failed. Try again shortly.');
   }
   function request(method, path, body, token = state.token, timeoutMs = 20000) {
+    const requestStarted = monotonicNow();
     return new Promise((resolve, reject) => {
       let settled = false, transport = null;
       const succeed = value => { if (!settled) { settled = true; cancelLater(deadline); pendingRequests.delete(cancel); resolve(value); } };
@@ -389,6 +394,7 @@ function mountTargetList(platform, storageWarning = '') {
             if (error.retryAfterSeconds > 0) state.hardRetryAt = Math.max(state.hardRetryAt, Date.now() + error.retryAfterSeconds * 1000);
             fail(error); return;
           }
+          serviceClock.observe(data?.serverTime, monotonicNow() - requestStarted);
           succeed(data);
         },
         onerror: () => fail(new Error('Cannot reach the target service. Check its address and the userscript connection permission.')),
@@ -408,8 +414,8 @@ function mountTargetList(platform, storageWarning = '') {
       const data = await request('POST', '/api/session', { apiKey, storeKey: true }, null);
       if (generation !== state.generation) return;
       const storedUntil = Date.parse(data?.keyStorage?.expiresAt);
-      if (data?.keyStorage?.mode !== 'encrypted' || !Number.isFinite(storedUntil) || storedUntil <= Date.now()
-          || storedUntil > Date.now() + 7 * 24 * 60 * 60 * 1000 + 5000) {
+      if (data?.keyStorage?.mode !== 'encrypted' || !Number.isFinite(storedUntil) || storedUntil <= serviceNow()
+          || storedUntil > serviceNow() + 7 * 24 * 60 * 60 * 1000 + 5000) {
         if (typeof data?.token === 'string' && data.token) {
           try { await request('DELETE', '/api/session', undefined, data.token); } catch { /* Best-effort cleanup of an incompatible backend session. */ }
         }
@@ -458,7 +464,7 @@ function mountTargetList(platform, storageWarning = '') {
     return state.authorizedPool && age >= 0 && age < C.LIVE_STATUS_MAX_AGE;
   }
   function canExport() {
-    return Boolean(state.token && state.player && Date.parse(state.expiresAt) > Date.now()
+    return Boolean(state.token && state.player && Date.parse(state.expiresAt) > serviceNow()
       && authorizedPoolFresh() && !state.loading && !state.busy && !state.removingKey);
   }
   function updateExportControls() {
@@ -509,7 +515,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   function showExport(format) {
     if (!exportAccess()) return;
-    const now = Date.now(), shown = panelUi.exportScope.value === 'shown';
+    const now = serviceNow(), shown = panelUi.exportScope.value === 'shown';
     const targets = shown ? C.select(state.targets, state.player, state, now).map(row => row.target) : state.targets;
     let serialized;
     try { serialized = TargetListExport.serialize(format, targets, { now }); }
@@ -824,7 +830,7 @@ function mountTargetList(platform, storageWarning = '') {
     }
     const id = C.pageTargetId(window.location?.href);
     if (!pageVisible()) { observeNoticeArea(null); pageNoticeResizeObserver?.disconnect(); removePageNotice(); return; }
-    const authorized = id && id <= 2147483647 && state.player && state.token && Date.parse(state.expiresAt) > Date.now() && authorizedPoolFresh();
+    const authorized = id && id <= 2147483647 && state.player && state.token && Date.parse(state.expiresAt) > serviceNow() && authorizedPoolFresh();
     const target = authorized ? state.targets.find(target => target.id === id) : null;
     if (!authorized || !target && id === state.player.id) { observeNoticeArea(null); removePageNotice(); return; }
     const mode = target ? 'listed' : 'suggest';
@@ -976,7 +982,7 @@ function mountTargetList(platform, storageWarning = '') {
     const estimate = known ? C.compact(target.estimatedStats) : 'Unknown';
     const fresh = known && assessTarget(target).fresh;
     const estimateDetail = known
-      ? `Estimated battle stats: ${estimate} · ${C.estimateSourceLabel(target) || 'Unknown source'} · ${C.ageLabel(target.estimateUpdatedAt)}${fresh ? '' : ' · Estimate needs refresh'}`
+      ? `Estimated battle stats: ${estimate} · ${C.estimateSourceLabel(target) || 'Unknown source'} · ${C.ageLabel(target.estimateUpdatedAt, serviceNow())}${fresh ? '' : ' · Estimate needs refresh'}`
       : 'Estimated battle stats: Unknown · No estimate available';
     if (pageNoticeEstimate.textContent !== estimate) pageNoticeEstimate.textContent = estimate;
     if (pageNoticeEstimate.parentElement.getAttribute('data-known') !== String(known)) pageNoticeEstimate.parentElement.setAttribute('data-known', String(known));
@@ -1077,7 +1083,7 @@ function mountTargetList(platform, storageWarning = '') {
   async function findTarget() {
     if (disposed || state.finding || state.busy) return;
     message('');
-    if (!state.token || Date.parse(state.expiresAt) <= Date.now()) {
+    if (!state.token || Date.parse(state.expiresAt) <= serviceNow()) {
       if (state.token && restoreNewerSession()) return;
       if (state.token) clearSession();
       state.findAfterLogin = true; toggle(true, launcher); render(); return;
@@ -1091,7 +1097,7 @@ function mountTargetList(platform, storageWarning = '') {
     const deadline = Date.now() + 12000;
     let targetGeneration = state.targetGeneration;
     const current = () => !disposed && state.finding && findGeneration === state.findGeneration && generation === state.generation
-      && targetGeneration === state.targetGeneration && state.token && Date.parse(state.expiresAt) > Date.now();
+      && targetGeneration === state.targetGeneration && state.token && Date.parse(state.expiresAt) > serviceNow();
     try {
       if ((state.excludedFactionIds.length || state.avoidActive) && !state.player) {
         await loadTargets(false, true, false, 5000); targetGeneration = state.targetGeneration;
@@ -1116,13 +1122,16 @@ function mountTargetList(platform, storageWarning = '') {
         try {
           const data = await request('POST', '/api/targets/next', { ...selection, requestId: attempt.requestId }, state.token, 10000);
           if (!current()) return;
-          if (!data?.player?.battleStats || !Number.isSafeInteger(data?.target?.id) || data.target.id <= 0 || data.target.id > 2147483647
-              || !(Date.parse(data.target.reservationExpiresAt) > Date.now()) || data.target.reserved
-              || C.avoidReason(data.target, state)
-              || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).suggested
-              || !C.assess(data.target, data.player, state.maxRatio, Date.now(), state.minRatio, state.estimateDays).ready) {
-            throw new Error('NWA could not verify the reserved target. Try again.');
+          const invalid = detail => new Error(`NWA could not verify the reserved target: ${detail}. Try again.`);
+          if (!data?.player?.battleStats || !Number.isSafeInteger(data?.target?.id) || data.target.id <= 0 || data.target.id > 2147483647) {
+            throw invalid('the response was incomplete');
           }
+          const verifiedAt = serviceNow();
+          const assessment = C.assess(data.target, data.player, state.maxRatio, verifiedAt, state.minRatio, state.estimateDays);
+          if (!(Date.parse(data.target.reservationExpiresAt) > verifiedAt) || data.target.reserved) throw invalid('the reservation is no longer available');
+          if (C.avoidReason(data.target, state, verifiedAt) || !assessment.suggested) throw invalid('the target no longer matches your preferences');
+          if (!assessment.live) throw invalid('the status check is too old or has an invalid time');
+          if (!assessment.ready) throw invalid('the player is no longer available');
           state.retryAttempt = null; state.nextTargetSupported = true;
           state.player = data.player; state.reservationsSupported = true;
           state.targets = state.targets.map(row => row.id === data.target.id ? data.target : row);
@@ -1144,7 +1153,7 @@ function mountTargetList(platform, storageWarning = '') {
         }
       }
       if (!state.player || !authorizedPoolFresh()
-          || !C.select(state.targets, state.player, { ...state, mode: 'suggested' }).length) {
+          || !C.select(state.targets, state.player, { ...state, mode: 'suggested' }, serviceNow()).length) {
         let feedTimer;
         let restored;
         try {
@@ -1161,7 +1170,7 @@ function mountTargetList(platform, storageWarning = '') {
         }
       }
       if (!state.reservationsSupported) { findNotice(COORDINATION_UNAVAILABLE); return; }
-      const matches = C.select(state.targets, state.player, { ...state, mode: 'suggested' });
+      const matches = C.select(state.targets, state.player, { ...state, mode: 'suggested' }, serviceNow());
       state.recentTargets = C.recentTargets(state.recentTargets);
       const candidates = C.candidates(matches, state.recentTargets);
       // Preserve the previous version's last-target preference on first update.
@@ -1195,13 +1204,13 @@ function mountTargetList(platform, storageWarning = '') {
         }
         if (!current()) return;
         if (checked?.id !== target.id) throw new Error('NWA could not verify this target. Try again.');
-        if (!state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+        if (!state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > serviceNow())) {
           throw new Error('NWA could not reserve this target. Try again.');
         }
         state.targets = state.targets.map(row => row.id === target.id ? { ...row, ...checked } : row);
         const latest = state.targets.find(row => row.id === target.id);
         const assessment = latest && assessTarget(latest);
-        if (!assessment?.suggested || !assessment.ready || C.avoidReason(latest, state)) continue;
+        if (!assessment?.suggested || !assessment.ready || C.avoidReason(latest, state, serviceNow())) continue;
         rememberTarget(target.id);
         findNotice(`Opening ${latest.name || 'target'}…`);
         window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`);
@@ -1218,7 +1227,7 @@ function mountTargetList(platform, storageWarning = '') {
     } finally {
       if (findGeneration === state.findGeneration) {
         state.finding = false;
-        if (state.token && Date.parse(state.expiresAt) <= Date.now()) {
+        if (state.token && Date.parse(state.expiresAt) <= serviceNow()) {
           if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); findNotice('Session expired. Open NWA settings to sign in again.'); }
         }
         render();
@@ -1227,7 +1236,7 @@ function mountTargetList(platform, storageWarning = '') {
   }
   async function checkStatus(id, openAttack = false) {
     if (state.removingKey || state.pendingChecks.has(id)) return;
-    if (openAttack && C.avoidReason(state.targets.find(target => target.id === id) || {}, state)) { message('This player is excluded by your target preferences.'); return; }
+    if (openAttack && C.avoidReason(state.targets.find(target => target.id === id) || {}, state, serviceNow())) { message('This player is excluded by your target preferences.'); return; }
     if (openAttack && !state.reservationsSupported) { message(COORDINATION_UNAVAILABLE); renderCards(); return; }
     state.pendingChecks.add(id); message(''); renderCards();
     const generation = state.generation;
@@ -1241,9 +1250,9 @@ function mountTargetList(platform, storageWarning = '') {
       if (openAttack) {
         const latest = state.targets.find(target => target.id === id);
         const assessment = latest && assessTarget(latest);
-        if (!state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh() || !assessment?.suggested || !assessment.ready
-          || C.avoidReason(latest, state)
-          || !state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > Date.now())) {
+        if (!state.token || Date.parse(state.expiresAt) <= serviceNow() || !authorizedPoolFresh() || !assessment?.suggested || !assessment.ready
+          || C.avoidReason(latest, state, serviceNow())
+          || !state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > serviceNow())) {
           throw new Error('This target is no longer ready. Refresh the list and try another.');
         }
         rememberTarget(id);
@@ -1560,7 +1569,7 @@ function mountTargetList(platform, storageWarning = '') {
       for (const warning of state.warnings) panelUi.poolMetadata.append(element('p', warning));
       if (state.backendNotice) panelUi.poolMetadata.append(element('p', state.backendNotice));
     }
-    setText(panelUi.poolUpdated, state.generatedAt ? `Pool updated: ${C.ageLabel(Date.parse(state.generatedAt) / 1000)}` : 'Pool update time unknown');
+    setText(panelUi.poolUpdated, state.generatedAt ? `Pool updated: ${C.ageLabel(Date.parse(state.generatedAt) / 1000, serviceNow())}` : 'Pool update time unknown');
   }
   function render() {
     const focus = captureFocus(content);
@@ -1935,7 +1944,7 @@ function mountTargetList(platform, storageWarning = '') {
 
   function poolSummary() {
     let range = 0, old = 0, unknown = 0, ready = 0;
-    const now = Date.now();
+    const now = serviceNow();
     for (const target of state.targets) {
       if (C.avoidReason(target, state, now)) continue;
       const assessment = C.assess(target, state.player, state.maxRatio, now, state.minRatio, state.estimateDays);
@@ -1993,7 +2002,7 @@ function mountTargetList(platform, storageWarning = '') {
     const filterKey = targetFilterKey();
     if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
-    const now = Date.now(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
+    const now = serviceNow(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
     const selected = new Map();
     let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0, excluded = 0;
     // Assess each target once for filtering, counts, ordering and its card.
@@ -2100,7 +2109,7 @@ function mountTargetList(platform, storageWarning = '') {
         }
         const latest = state.targets.find(t => t.id === target.id);
         const currentAssessment = latest && assessTarget(latest);
-        if (!latest || C.avoidReason(latest, state) || !state.token || Date.parse(state.expiresAt) <= Date.now() || !authorizedPoolFresh()
+        if (!latest || C.avoidReason(latest, state, serviceNow()) || !state.token || Date.parse(state.expiresAt) <= serviceNow() || !authorizedPoolFresh()
             || latest.reserved || !currentAssessment.suggested || !currentAssessment.ready) {
           event.preventDefault(); message('Check the status and stat range for this target before opening an attack.'); renderCards(); return false;
         }
@@ -2146,7 +2155,7 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
   const saved = platform.getValue(storageKey, null);
-  if (saved?.token && Date.parse(saved.expiresAt) > Date.now()) {
+  if (saved?.token && Date.parse(saved.expiresAt) > serviceNow()) {
     state.token = saved.token; state.expiresAt = saved.expiresAt;
   } else if (!storageWarning) persist(() => platform.deleteValue(storageKey));
   function updateViewport() {
@@ -2168,7 +2177,7 @@ function mountTargetList(platform, storageWarning = '') {
   listen(document, 'visibilitychange', () => {
     updatePageNotice();
     if (!pageVisible()) lazyCardsObserver?.disconnect();
-    if (pageVisible() && state.token && Date.parse(state.expiresAt) > Date.now() && !state.busy) {
+    if (pageVisible() && state.token && Date.parse(state.expiresAt) > serviceNow() && !state.busy) {
       void loadTargets(false, false, Boolean(state.player));
     }
   });
@@ -2198,7 +2207,7 @@ function mountTargetList(platform, storageWarning = '') {
   const maintenanceTimer = setInterval(() => {
     if (disposed) return;
     updatePageNotice();
-    if (state.token && Date.parse(state.expiresAt) <= Date.now()) {
+    if (state.token && Date.parse(state.expiresAt) <= serviceNow()) {
       if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); render(); }
     }
     else if (pageVisible() && state.open && state.player && !state.pendingChecks.size) {

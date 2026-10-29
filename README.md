@@ -39,6 +39,8 @@ Open Torn and click the green **NWA** button on the right edge. Sign in with you
 
 NWA prepares targets in the background. Click **NWA** to find an available target within your stat range. With backend 0.9.0 or later, the server chooses and reserves a target in one request. The backend holds each assignment for **two minutes**, including earlier targets when you open another one. Your browser also skips players you opened in the last 10 minutes. You start the attack yourself. Older backends keep the existing coordinated finder and show an update notice. If target coordination is unavailable, NWA asks you to refresh instead of opening an unreserved target. Ordinary Torn links, including those in exports, do not acquire a reservation.
 
+Version 0.15.3 uses the backend's response time, when provided, to check status freshness and reservation expiry. This prevents a slightly incorrect phone or PC clock from rejecting a valid target. Status checks still expire after 30 seconds, response delays count toward that age, and an old or unavailable target remains blocked. Older backends keep the existing local-clock checks.
+
 The small **⚙** underneath opens the compact target list and suggestions. **Find target** in the panel works like the green NWA button. Search and **Min / Max** stay above the list; each row shows the player's estimated stats, percentage of your total, availability and attack controls. On Torn PDA, the panel opens nearly full width.
 
 Keyboard users can open settings with **Enter**, move through controls with **Tab**, and press **Escape** to close settings and return to the button that opened it. Focus stays in place when sections change or target rows update.

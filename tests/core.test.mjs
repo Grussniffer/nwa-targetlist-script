@@ -10,6 +10,49 @@ const Core = context.Core;
 
 // Fix the clock so freshness and live-status boundaries are reproducible.
 const NOW = Date.parse('2026-10-09T12:00:00Z');
+
+test('service clock corrects browser skew using a conservative response transit bound', () => {
+  for (const skew of [-31000, 31000]) {
+    let elapsed = 1000;
+    const clock = Core.createServiceClock({ wallNow: () => NOW + skew, monotonicNow: () => elapsed });
+    assert.equal(clock.now(), NOW + skew, 'legacy responses retain the strict local clock');
+    assert.equal(clock.observe(new Date(NOW).toISOString(), 800), true);
+    assert.equal(clock.now(), NOW + 800);
+    elapsed += 5000;
+    assert.equal(clock.now(), NOW + 5800);
+  }
+});
+
+test('service clock rejects malformed, implausible and unbounded time samples', () => {
+  const clock = Core.createServiceClock({ wallNow: () => NOW, monotonicNow: () => 0 });
+  for (const value of [null, '', 'invalid', 123, '2026-02-31T00:00:00.000Z', new Date(NOW + 86400001).toISOString()]) {
+    assert.equal(clock.observe(value, 0), false);
+    assert.equal(clock.now(), NOW);
+  }
+  for (const duration of [-1, NaN, Infinity, 10001]) assert.equal(clock.observe(new Date(NOW).toISOString(), duration), false);
+});
+
+test('older responses cannot rewind service time and local clock jumps do not extend status life', () => {
+  let wall = NOW + 31000, elapsed = 0;
+  const clock = Core.createServiceClock({ wallNow: () => wall, monotonicNow: () => elapsed });
+  clock.observe(new Date(NOW).toISOString(), 0);
+  wall -= 3600000; elapsed += 30000;
+  assert.equal(clock.now(), NOW + 30000);
+  assert.equal(clock.observe(new Date(NOW + 10000).toISOString(), 1000), false);
+  assert.equal(clock.now(), NOW + 30000);
+  clock.reset();
+  assert.equal(clock.now(), wall);
+});
+
+test('service time correction never turns a genuinely stale or delayed observation into ready', () => {
+  let elapsed = 0;
+  const clock = Core.createServiceClock({ wallNow: () => NOW - 31000, monotonicNow: () => elapsed });
+  clock.observe(new Date(NOW).toISOString(), 8000);
+  assert.equal(Core.assess(target({ checkedAt: new Date(NOW - 22000).toISOString() }), player, 0.6, clock.now()).ready, false);
+  assert.equal(Core.assess(target({ checkedAt: new Date(NOW).toISOString() }), player, 0.6, clock.now()).ready, true);
+  elapsed += 22000;
+  assert.equal(Core.assess(target({ checkedAt: new Date(NOW).toISOString() }), player, 0.6, clock.now()).ready, false);
+});
 const player = {
   id: 12345,
   name: 'Chain Player',

@@ -7,6 +7,35 @@ const TargetListCore = (() => {
   const LIVE_STATUS_MAX_AGE = 30 * 1000;
   const compactFormatter = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 });
 
+  // Provider timestamps use the service's clock. Local polling and recent-target
+  // preferences keep their existing browser clock. The full request duration is
+  // added as a conservative bound on response transit, never subtracted from an
+  // observation's age. A delayed older response cannot rewind the service clock.
+  function createServiceClock({ wallNow = Date.now, monotonicNow = () =>
+    typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : wallNow() } = {}) {
+    let anchor = null;
+    function now() {
+      if (!anchor) return wallNow();
+      const elapsed = monotonicNow() - anchor.monotonicAt;
+      if (!Number.isFinite(elapsed) || elapsed < 0) { anchor = null; return wallNow(); }
+      return anchor.time + elapsed;
+    }
+    return { now,
+      observe(value, requestElapsedMs = 0) {
+        if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+          || !Number.isFinite(requestElapsedMs) || requestElapsedMs < 0 || requestElapsedMs > 10000) return false;
+        const stamp = Date.parse(value), monotonicAt = monotonicNow();
+        if (!Number.isFinite(stamp) || new Date(stamp).toISOString() !== value || !Number.isFinite(monotonicAt)
+          || Math.abs(stamp - wallNow()) > 86400000) return false;
+        const time = stamp + requestElapsedMs;
+        if (anchor && time < now()) return false;
+        anchor = { time, monotonicAt };
+        return true;
+      },
+      reset() { anchor = null; },
+    };
+  }
+
   function serviceUrl(value) {
     const url = new URL(value);
     const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
@@ -191,5 +220,5 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, createServiceClock, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
 })();

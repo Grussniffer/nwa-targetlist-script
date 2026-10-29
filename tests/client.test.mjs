@@ -104,7 +104,7 @@ function visible(element) {
 async function flush() { for (let index = 0; index < 12; index++) await Promise.resolve(); }
 
 function fixture(saved = null, preferences = null, existingHost = null, initialNow = NOW, visibility = 'visible', clipboard = {}) {
-  let clock = initialNow;
+  let clock = initialNow, monotonic = 0;
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
   const body = new Element('body'); const requests = []; const navigations = []; const storage = new Map(); const writes = []; const timers = []; const timeouts = new Map(); const timeoutDelays = new Map();
   const document = new Element('document');
@@ -125,7 +125,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   if (saved) storage.set(storageKey, saved);
   if (preferences) storage.set(preferencesKey, preferences);
   const context = vm.createContext({
-    URL, Blob, Intl, Date: Clock, console, IntersectionObserver,
+    URL, Blob, Intl, Date: Clock, console, IntersectionObserver, performance: { now: () => monotonic },
     navigator: { clipboard: { writeText: async value => {
       if (clipboard.reject) throw new Error('Mock clipboard unavailable');
       copied.push(value);
@@ -160,7 +160,8 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     const input = find(element => element.tagName === 'INPUT' && element.type === 'password'); input.value = KEY;
     find(element => element.tagName === 'FORM').emit('submit');
     const login = requests.at(-1);
-    response(login, { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage });
+    response(login, { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage,
+      ...(feed.serverTime === undefined ? {} : { serverTime: feed.serverTime }) });
     await flush();
     response(requests.at(-1), { player, targets, warnings: [], reservations: coordination, generatedAt: new Date(NOW).toISOString(), ...feed });
     await flush();
@@ -173,7 +174,8 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
   }
   return { root, host, body, runScript, requests, navigations, storage, writes, storageKey, preferencesKey, timers, clearedIntervals, intersections, timeouts, timeoutDelays, find, button, response, signIn, signOut, openPanel, closePanel, copied, copyCommands,
     settings: () => find(element => element.className === 'settings-toggle'),
-    text: () => textContent(root), setNow: value => { clock = value; },
+    text: () => textContent(root), setNow: value => { monotonic += Math.max(0, value - clock); clock = value; },
+    setWallNow: value => { clock = value; }, advanceMonotonic: amount => { monotonic += amount; },
     setVisibility: value => { document.visibilityState = value; document.emit('visibilitychange'); } };
 }
 
@@ -1475,6 +1477,86 @@ test('a capable backend finds and reserves in one request with inclusive prefere
   app.response(next, { player, target: { ...target, checkedAt: new Date(NOW).toISOString(), reserved: false, reservationExpiresAt: new Date(NOW + 120000).toISOString() } }); await flush();
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
   assert.equal(app.requests.length, before + 1);
+});
+
+test('server time lets the automatic finder accept a valid reservation with a skewed PC clock', async () => {
+  for (const skew of [-31000, 31000]) {
+    const app = fixture(null, null, null, NOW + skew);
+    await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click');
+    app.response(app.requests.at(-1), { serverTime: new Date(NOW).toISOString(), player,
+      target: { ...target, checkedAt: new Date(NOW).toISOString(), reserved: false, reservationExpiresAt: new Date(NOW + 120000).toISOString() } });
+    await flush();
+    assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+    assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  }
+});
+
+test('a wall clock adjustment does not expire a calibrated session or invalidate a fresh reserved target', async () => {
+  const app = fixture();
+  await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+  app.setWallNow(NOW + 2 * 3600000); app.timers[0](); await flush();
+  assert.equal(app.storage.get(app.storageKey).token, SESSION);
+  app.button('NWA').emit('click');
+  app.response(app.requests.at(-1), { serverTime: new Date(NOW).toISOString(), player,
+    target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } });
+  await flush();
+  assert.equal(app.navigations.length, 1);
+});
+
+test('server time retains strict stale-status and lease checks without automatically assigning another target', async () => {
+  for (const override of [{ checkedAt: new Date(NOW - 30000).toISOString() }, { reservationExpiresAt: new Date(NOW).toISOString() }]) {
+    const app = fixture(null, null, null, NOW - 31000);
+    await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click'); const count = app.requests.length;
+    app.response(app.requests.at(-1), { serverTime: new Date(NOW).toISOString(), player,
+      target: { ...target, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString(), ...override } });
+    await flush();
+    assert.equal(app.navigations.length, 0); assert.equal(app.requests.length, count);
+    assert.match(app.text(), /could not verify the reserved target: (the status check|the reservation)/);
+  }
+});
+
+test('a calibrated session still expires on elapsed service time', async () => {
+  const app = fixture(null, null, null, NOW - 31000);
+  await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+  app.advanceMonotonic(3600000); app.timers[0](); await flush();
+  assert.equal(app.storage.has(app.storageKey), false);
+  assert.match(app.text(), /Session expired/);
+});
+
+test('switching to a newer saved login preserves clock calibration while its restoring feed is pending', async () => {
+  const app = fixture();
+  await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+  const replacement = { token: 'newer-session-from-another-tab', expiresAt: new Date(NOW + 3600000).toISOString() };
+  app.storage.set(app.storageKey, replacement);
+  app.setWallNow(NOW + 2 * 3600000);
+  app.button('NWA').emit('click');
+  app.response(app.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401);
+  await flush();
+  const restoring = app.requests.at(-1);
+  assert.equal(restoring.method, 'GET');
+  assert.equal(restoring.headers.Authorization, `Bearer ${replacement.token}`);
+  app.timers[0](); await flush();
+  assert.equal(app.storage.get(app.storageKey).token, replacement.token, 'the local clock jump must not delete the replacement before its feed returns');
+  app.response(restoring, { serverTime: new Date(NOW).toISOString(), player, targets: [target], warnings: [], reservations: coordination });
+  await flush();
+  assert.match(app.text(), /Target Player/);
+  assert.equal(app.storage.get(app.storageKey).token, replacement.token);
+});
+
+test('delayed or malformed response time metadata cannot refresh an old observation', async () => {
+  for (const malformed of [false, true]) {
+    const app = fixture();
+    await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
+    app.button('NWA').emit('click'); const pending = app.requests.at(-1);
+    app.advanceMonotonic(8000);
+    app.response(pending, { serverTime: malformed ? 'invalid' : new Date(NOW).toISOString(), player,
+      target: { ...target, checkedAt: new Date(NOW - 22000).toISOString(), reservationExpiresAt: new Date(NOW + 120000).toISOString() } });
+    await flush();
+    assert.equal(app.navigations.length, 0);
+    assert.match(app.text(), /status check is too old/);
+  }
 });
 
 test('an uncertain next response reuses its request ID on deliberate retry and ignores late success', async () => {
