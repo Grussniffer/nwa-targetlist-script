@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NWA Target Finder
 // @namespace    torn-faction-targetlist
-// @version      0.15.4
+// @version      0.15.5
 // @description  North West Alliance chain targets.
 // @downloadURL  https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.user.js
 // @updateURL    https://raw.githubusercontent.com/Grussniffer/nwa-targetlist-script/main/dist/torn-targetlist.meta.js
@@ -434,7 +434,7 @@ const TargetListPlatform = (() => {
 })();
 
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.4' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.5' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -474,6 +474,7 @@ function mountTargetList(platform, storageWarning = '') {
   const serviceClock = C.createServiceClock();
   const serviceNow = () => serviceClock.now();
   const monotonicNow = () => typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+  const OPEN_FEED_REFRESH_MS = 5000;
   const FEED_REFRESH_MS = 10_000;
   const IDLE_FEED_REFRESH_MS = 30_000;
   const CARD_BATCH_SIZE = 50;
@@ -512,6 +513,7 @@ function mountTargetList(platform, storageWarning = '') {
   const state = {
     token: null, expiresAt: null, player: null, targets: [], feedTargets: [], feedCursor: null, warnings: [], generatedAt: null, poolLoadedAt: 0,
     authorizedPool: false, backgroundLoading: false, targetLoad: null, lastPoolAttemptAt: 0, backgroundRenderPending: false,
+    observationRevision: 0, availabilityHealth: null,
     busy: false, removingKey: false, open: false, generation: 0, error: '', query: '', mode: 'all',
     minRatio, maxRatio,
     excludedFactionIds: Array.isArray(preferences?.excludedFactionIds) ? C.parseExcludedFactions(preferences.excludedFactionIds.join(',')) || [] : [],
@@ -741,6 +743,7 @@ function mountTargetList(platform, storageWarning = '') {
     clearExport();
     state.generation++; state.token = null; state.player = null; state.targets = []; state.warnings = []; state.poolLoadedAt = 0;
     state.feedTargets = []; state.feedCursor = null; state.reservationsSupported = false; state.nextTargetSupported = null;
+    state.observationRevision = 0; state.availabilityHealth = null;
     state.targetExclusionsSupported = false;
     state.retryAttempt = null; state.backendNotice = ''; state.feedFailures = 0; state.nextFeedAt = 0; state.hardRetryAt = 0;
     state.authorizedPool = false; state.backgroundLoading = false; state.targetLoad = null; state.lastPoolAttemptAt = 0;
@@ -1454,6 +1457,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (state.targetLoad && !force) return state.targetLoad.promise;
     const generation = state.generation;
     const targetGeneration = ++state.targetGeneration;
+    const observationRevision = state.observationRevision;
     // Keep the server baseline separate from local status checks and expiry updates.
     const previousTargets = state.feedTargets, cursor = state.feedCursor;
     const pendingEpoch = state.pendingSuggestionEpoch, suggestionsCursor = state.pendingSuggestions.revision;
@@ -1467,6 +1471,10 @@ function mountTargetList(platform, storageWarning = '') {
         const path = '/api/targets' + (query ? '?' + query : '');
         const data = await request('GET', path, undefined, state.token, timeoutMs);
         if (generation !== state.generation || targetGeneration !== state.targetGeneration) return false;
+        // A status/lease result received after this feed started is newer local
+        // evidence. Discard the older whole feed, including its cursor, rather
+        // than merging observation fields into potentially changed membership.
+        if (observationRevision !== state.observationRevision) return false;
         const feed = C.applyFeed(data, previousTargets, cursor);
         state.feedTargets = feed.targets; state.feedCursor = feed.cursor;
         if (pendingEpoch === state.pendingSuggestionEpoch) {
@@ -1484,6 +1492,7 @@ function mountTargetList(platform, storageWarning = '') {
           }
         }
         state.player = data.player; state.targets = feed.targets; state.warnings = data.warnings || []; state.generatedAt = data.generatedAt;
+        state.availabilityHealth = readAvailabilityHealth(data.availability?.health);
         state.reservationsSupported = data.reservations?.supported === true;
         state.nextTargetSupported = data.capabilities?.nextTarget === true;
         state.targetExclusionsSupported = data.capabilities?.targetExclusions === true;
@@ -1569,6 +1578,7 @@ function mountTargetList(platform, storageWarning = '') {
           if (!assessment.ready) throw invalid('the player is no longer available');
           state.retryAttempt = null; state.nextTargetSupported = true;
           state.player = data.player; state.reservationsSupported = true;
+          state.observationRevision++;
           state.targets = state.targets.map(row => row.id === data.target.id ? data.target : row);
           rememberTarget(data.target.id); findNotice(`Opening ${data.target.name || 'target'}...`);
           window.location.assign(`https://www.torn.com/page.php?sid=attack&user2ID=${data.target.id}`);
@@ -1623,6 +1633,7 @@ function mountTargetList(platform, storageWarning = '') {
           undefined, state.token, 10000); }
         catch (error) {
           if (!current()) return;
+          state.observationRevision++;
           state.targets = state.targets.map(row => row.id === target.id ? { ...row, checkedAt: null } : row);
           if (['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION'].includes(error.code)) {
             state.targets = state.targets.filter(row => row.id !== target.id); updatePageNotice(); continue;
@@ -1642,6 +1653,7 @@ function mountTargetList(platform, storageWarning = '') {
         if (!state.reservationsSupported || !(Date.parse(checked.reservationExpiresAt) > serviceNow())) {
           throw new Error('NWA could not reserve this target. Try again.');
         }
+        state.observationRevision++;
         state.targets = state.targets.map(row => row.id === target.id ? { ...row, ...checked } : row);
         const latest = state.targets.find(row => row.id === target.id);
         const assessment = latest && assessTarget(latest);
@@ -1681,6 +1693,7 @@ function mountTargetList(platform, storageWarning = '') {
         `/api/targets/${id}/${openAttack ? 'reservation' : 'status'}`);
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
       if (checked?.id !== id) throw new Error('NWA could not verify this target. Try again.');
+      state.observationRevision++;
       state.targets = state.targets.map(target => target.id === id ? { ...target, ...checked } : target);
       if (openAttack) {
         const latest = state.targets.find(target => target.id === id);
@@ -1695,6 +1708,7 @@ function mountTargetList(platform, storageWarning = '') {
       }
     } catch (error) {
       if (generation !== state.generation || targetGeneration !== state.targetGeneration) return;
+      state.observationRevision++;
       state.targets = ['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION'].includes(error.code)
         ? state.targets.filter(target => target.id !== id)
         : state.targets.map(target => target.id === id ? { ...target, checkedAt: null,
@@ -2378,6 +2392,34 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }
 
+  function readAvailabilityHealth(value) {
+    const object = entry => entry !== null && typeof entry === 'object' && !Array.isArray(entry);
+    const count = entry => Number.isSafeInteger(entry) && entry >= 0 && entry <= 100000;
+    const fields = ['freshOkay', 'staleOkay', 'unknown', 'deferredNegative', 'credentialOwners'];
+    const cycleFields = ['requested', 'updated', 'failed', 'skipped', 'discarded'];
+    if (!object(value) || !fields.every(field => count(value[field])) || typeof value.inFlight !== 'boolean'
+      || typeof value.budgetLimited !== 'boolean' || !object(value.lastCycle)
+      || !cycleFields.every(field => count(value.lastCycle[field]))) return null;
+    if (value.lastRefreshAt !== null && (typeof value.lastRefreshAt !== 'string'
+      || !/^\d{4}-\d{2}-\d{2}T/.test(value.lastRefreshAt) || !Number.isFinite(Date.parse(value.lastRefreshAt)))) return null;
+    return { ...Object.fromEntries(fields.map(field => [field, value[field]])),
+      inFlight: value.inFlight, budgetLimited: value.budgetLimited, lastRefreshAt: value.lastRefreshAt,
+      lastCycle: Object.fromEntries(cycleFields.map(field => [field, value.lastCycle[field]])) };
+  }
+  function availabilityHealthSummary() {
+    const health = state.availabilityHealth;
+    if (!health) return '';
+    const age = serviceNow() - Date.parse(health.lastRefreshAt);
+    const delayed = health.lastRefreshAt !== null && (!Number.isFinite(age) || age >= C.LIVE_STATUS_MAX_AGE);
+    const progress = health.lastCycle.failed > 0 ? 'Some status checks failed; automatic retries continue.'
+      : health.lastRefreshAt === null ? health.inFlight ? 'Starting automatic checks.' : 'Status checks have not completed yet.'
+      : delayed ? health.inFlight ? 'Refresh is delayed; a new scan is running.' : 'Refresh is delayed; waiting for a new scan.'
+      : health.credentialOwners === 0 ? 'No contributing keys are available for automatic checks.'
+      : health.budgetLimited ? 'More checks are waiting for the shared API allowance.'
+      : health.lastCycle.requested === 0 && health.staleOkay + health.unknown > 0 ? 'Waiting for a usable contributor or provider retry.'
+      : health.inFlight ? 'Refreshing statuses now.' : 'Automatic status checks are active.';
+    return `Last scan: ${health.freshOkay} fresh Okay · ${health.staleOkay} stale Okay · ${health.unknown} unknown · ${health.deferredNegative} hospital/jail checks deferred. ${progress}`;
+  }
   function poolSummary() {
     let range = 0, old = 0, unknown = 0, ready = 0, recent = 0;
     const now = serviceNow();
@@ -2482,7 +2524,8 @@ function mountTargetList(platform, storageWarning = '') {
     }
     const visibleRows = rows.slice(0, visibleCardLimit), visibleIds = visibleRows.map(row => row.target.id), visibleIdSet = new Set(visibleIds);
     setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} ${rows.length > visibleRows.length ? 'matches' : 'shown'}${shownRecent ? ' · ' + shownRecent + ' recent' : ''}`);
-    setText(panelUi.countDetail, `${visibleRows.length} displayed · ${rows.length} matching · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
+    const refreshHealth = availabilityHealthSummary();
+    setText(panelUi.countDetail, `${visibleRows.length} displayed · ${rows.length} matching · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}${refreshHealth ? ' · ' + refreshHealth : ''}`);
     panelUi.moreCards.hidden = visibleRows.length >= rows.length;
     setText(panelUi.showMore, `Show more (${rows.length - visibleRows.length} remaining)`);
     lazyCardsObserver?.disconnect();
@@ -2524,9 +2567,11 @@ function mountTargetList(platform, storageWarning = '') {
       const ownLease = !target.reserved && Date.parse(target.reservationExpiresAt) > now;
       const canAttack = assessment.suggested && assessment.ready && freshPool && !target.reserved && state.reservationsSupported;
       const unavailable = assessment.live && (target.status?.state !== 'Okay' || assessment.timedUnavailable);
+      const staleNegative = !assessment.live && ['Hospital', 'Jail'].includes(target.status?.state);
       const availability = target.reserved ? 'Reserved by another NWA member' : unavailable ? target.status?.state || 'Unavailable' : ownLease ? 'Reserved by you'
-        : !assessment.live ? 'Status needs checking' : canAttack ? recentMs ? 'Opened recently' : 'Ready' : target.status?.state || 'Unknown';
+        : staleNegative ? `Last reported ${target.status.state}` : !assessment.live ? 'Status needs checking' : canAttack ? recentMs ? 'Opened recently' : 'Ready' : target.status?.state || 'Unknown';
       status.append(element('strong', availability), element('span', assessment.label, `badge ${assessment.tone}`));
+      if (staleNegative && !ownLease && !target.reserved) status.append(element('small', 'Status needs checking'));
       if (recentMs && assessment.suggested) status.append(element('small', `NWA skips for ${Math.ceil(recentMs / 60000)}m.${canAttack ? ' You can attack manually.' : ''}`));
       if (assessment.suggested && assessment.ready && !target.reserved && !freshPool) status.append(element('small', 'Refresh the list to open an attack'));
       if ((ownLease || target.reserved) && !assessment.live) status.append(element('small', 'Status needs checking'));
@@ -2663,8 +2708,8 @@ function mountTargetList(platform, storageWarning = '') {
       });
       if (expired) renderCards();
     }
-    const refreshMs = state.open || C.pageTargetId(window.location?.href) || Date.now() - state.lastFindAt < 120_000
-      ? FEED_REFRESH_MS : IDLE_FEED_REFRESH_MS;
+    const refreshMs = state.open ? OPEN_FEED_REFRESH_MS
+      : C.pageTargetId(window.location?.href) || Date.now() - state.lastFindAt < 120_000 ? FEED_REFRESH_MS : IDLE_FEED_REFRESH_MS;
     if (state.token && pageVisible() && !state.busy && !state.finding && !state.pendingChecks.size && !state.loading && !state.backgroundLoading
         && Date.now() >= state.nextFeedAt && Date.now() - state.lastPoolAttemptAt >= refreshMs) {
       void loadTargets(false, false, Boolean(state.player));

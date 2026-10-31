@@ -1297,26 +1297,26 @@ test('an ended hospital timer still needs a new Okay check before opening an att
   assert.deepEqual(app.navigations, []);
 });
 
-test('visible pages refresh the feed every ten seconds without hiding the target list or automatically navigating', async () => {
+test('the open panel refreshes the feed every five seconds without hiding targets or automatically navigating', async () => {
   const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
   app.openPanel();
   const before = app.requests.length;
-  app.setNow(NOW + 9_999); app.timers[0]();
+  app.setNow(NOW + 4_999); app.timers[0]();
   assert.equal(app.requests.length, before);
-  app.setNow(NOW + 10_000); app.timers[0]();
+  app.setNow(NOW + 5_000); app.timers[0]();
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
   assert.match(app.text(), /Target Player \[98765\]/);
   assert.equal(app.button('NWA').disabled, false);
   app.timers[0]();
   assert.equal(app.requests.length, before + 1, 'an in-flight background sync is shared');
-  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Refreshed Target', checkedAt: new Date(NOW + 10_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
+  app.response(app.requests.at(-1), { player, targets: [{ ...target, name: 'Refreshed Target', checkedAt: new Date(NOW + 5_000).toISOString() }], warnings: [], reservations: coordination }); await flush();
   assert.match(app.text(), /Refreshed Target/);
   assert.deepEqual(app.navigations, []);
   const refreshed = app.requests.length; app.button('NWA').emit('click');
   assert.equal(app.requests.length, refreshed + 1);
   assert.deepEqual(app.navigations, []);
-  await completeLease(app, target.id, NOW + 10000);
+  await completeLease(app, target.id, NOW + 5000);
   assert.equal(app.navigations.length, 1);
 });
 
@@ -1885,6 +1885,102 @@ test('background polling and visibility refresh defer while an explicit status c
   app.timers[0]();
   assert.equal(app.requests.length, before + 1);
   assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
+});
+
+test('an older in-flight feed cannot replace a newer manual status result or advance its cursor', async () => {
+  const app = fixture();
+  const old = { ...target, checkedAt: new Date(NOW - 10000).toISOString() };
+  await app.signIn([old], { sync: { version: 1, cursor: 'confirmed-baseline', reset: true } });
+  app.setNow(NOW + 5000); app.timers[0]();
+  const delayedFeed = app.requests.at(-1);
+  assert.match(delayedFeed.url, /cursor=confirmed-baseline$/);
+  app.setNow(NOW + 10000); app.button('Check status').emit('click');
+  app.response(app.requests.at(-1), { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 10000).toISOString() }); await flush();
+  const search = app.find(element => element.type === 'search'); search.focus();
+  app.setNow(NOW + 21000);
+  app.response(delayedFeed, { player, updates: [old], removed: [], reservations: coordination,
+    sync: { version: 1, cursor: 'older-feed-result', reset: false } }); await flush();
+  assert.match(app.text(), /Ready/);
+  assert.doesNotMatch(app.text(), /Status needs checking/);
+  assert.equal(app.root.activeElement, search);
+  app.setNow(NOW + 25000); app.timers[0]();
+  assert.match(app.requests.at(-1).url, /cursor=confirmed-baseline$/, 'discarding a feed retains its original baseline and cursor');
+  app.response(app.requests.at(-1), { player, updates: [{ ...target, checkedAt: new Date(NOW + 25000).toISOString() }], removed: [],
+    reservations: coordination, sync: { version: 1, cursor: 'newer-feed-result', reset: false } }); await flush();
+  assert.match(app.text(), /Ready/);
+  assert.deepEqual(app.navigations, []);
+});
+
+test('an older in-flight feed cannot undo a foreground target rejection', async () => {
+  const app = fixture(); await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+  app.setNow(NOW + 5000); app.timers[0](); const oldFeed = app.requests.at(-1);
+  app.button('Check status').emit('click');
+  app.response(app.requests.at(-1), { error: { code: 'TARGET_LEFT_FACTION', message: 'This player left the targeted faction.' } }, 409); await flush();
+  assert.doesNotMatch(app.text(), /Target Player \[98765\]/);
+  app.response(oldFeed, { player, targets: [{ ...target, checkedAt: new Date(NOW).toISOString() }], reservations: coordination }); await flush();
+  assert.doesNotMatch(app.text(), /Target Player \[98765\]/, 'the older snapshot cannot restore the rejected player');
+});
+
+test('a closed idle panel keeps its thirty-second polling cadence', async () => {
+  const app = fixture(); await app.signIn(); app.closePanel();
+  const before = app.requests.length;
+  for (const elapsed of [5000, 10000, 15000, 20000, 29999]) { app.setNow(NOW + elapsed); app.timers[0](); }
+  assert.equal(app.requests.length, before);
+  app.setNow(NOW + 30000); app.timers[0]();
+  assert.equal(app.requests.length, before + 1);
+  assert.equal(app.requests.at(-1).url, `${serviceBase}/api/targets`);
+});
+
+function refreshHealth(overrides = {}) {
+  return { freshOkay: 4, staleOkay: 3, unknown: 2, deferredNegative: 1, credentialOwners: 1,
+    inFlight: false, lastRefreshAt: new Date(NOW).toISOString(), budgetLimited: false,
+    lastCycle: { requested: 5, updated: 4, failed: 0, skipped: 0, discarded: 0 }, ...overrides };
+}
+
+test('optional refresh health explains freshness, missing keys, budget waits and failed checks with safe text', async () => {
+  for (const [health, expected] of [
+    [refreshHealth({ inFlight: true }), /Refreshing statuses now/],
+    [refreshHealth({ credentialOwners: 0 }), /No contributing keys are available/],
+    [refreshHealth({ budgetLimited: true }), /waiting for the shared API allowance/],
+    [refreshHealth({ lastCycle: { requested: 5, updated: 4, failed: 1, skipped: 0, discarded: 0 } }), /Some status checks failed/],
+  ]) {
+    const app = fixture(); await app.signIn([target], { availability: { health: { ...health, providerMessage: '<script>secret-key</script>' } } });
+    assert.match(app.text(), /Last scan: 4 fresh Okay · 3 stale Okay · 2 unknown · 1 hospital\/jail checks deferred/);
+    assert.match(app.text(), expected);
+    assert.doesNotMatch(app.text(), /secret-key|<script>/);
+  }
+});
+
+test('malformed refresh metadata is ignored and health is cleared when the session changes', async () => {
+  const app = fixture(); await app.signIn([target], { availability: { health: refreshHealth() } });
+  assert.match(app.text(), /Last scan: 4 fresh Okay/);
+  await app.signOut(); await app.signIn([target], { availability: { health: refreshHealth({ freshOkay: '<img src=x>' }) } });
+  assert.doesNotMatch(app.text(), /Last scan:|<img src=x>/);
+});
+
+test('old refresh health and a contributor retry do not claim automatic checks are currently healthy', async () => {
+  for (const [health, expected] of [
+    [refreshHealth({ lastRefreshAt: new Date(NOW - 30000).toISOString() }), /Refresh is delayed; waiting for a new scan/],
+    [refreshHealth({ lastCycle: { requested: 0, updated: 0, failed: 0, skipped: 0, discarded: 0 } }), /Waiting for a usable contributor or provider retry/],
+    [refreshHealth({ credentialOwners: 0, lastRefreshAt: null, inFlight: true }), /Starting automatic checks/],
+    [refreshHealth({ credentialOwners: 0, lastRefreshAt: null, lastCycle: { requested: 0, updated: 0, failed: 1, skipped: 0, discarded: 0 } }), /Some status checks failed/],
+  ]) {
+    const app = fixture(); await app.signIn([target], { availability: { health } });
+    assert.match(app.text(), expected);
+    assert.doesNotMatch(app.text(), /Automatic status checks are active/);
+  }
+});
+
+test('stale hospital and jail observations retain a last-reported label without becoming Ready', async () => {
+  for (const state of ['Hospital', 'Jail']) {
+    const app = fixture(); await app.signIn([{ ...target, status: { state, until: NOW / 1000 + 600 },
+      checkedAt: new Date(NOW - 60000).toISOString() }]);
+    assert.match(app.text(), new RegExp('Last reported ' + state));
+    assert.match(app.text(), /Status needs checking/);
+    assert.equal(descendants(app.root).some(element => element.className === 'attack'), false);
+    app.timers[0]();
+    assert.match(app.text(), new RegExp('Last reported ' + state), 'local expiry cleanup retains the last-known negative state');
+  }
 });
 
 test('NWA explains when the pool has no fresh target within the stat limit', async () => {
