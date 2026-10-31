@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.3' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.4' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -1722,6 +1722,7 @@ function mountTargetList(platform, storageWarning = '') {
     personalPreferences.addEventListener('toggle', () => { personalPreferencesOpen = personalPreferences.open; });
     personalPreferences.append(element('summary', 'My target preferences'),
       element('p', 'Personal settings for your own targets. Available to every member; they do not change the shared NWA list.', 'personal-help'), ageControls);
+    personalPreferences.append(element('p', 'NWA skips players opened in this browser for 10 minutes, even if no attack was completed. Clear recent targets to include them again.', 'personal-help'));
     const ageCaution = element('p', 'Older estimates can be inaccurate. Extra caution is needed beyond 28 days.', 'notice');
     ageCaution.hidden = state.estimateDays <= 28; panelUi.ageCaution = ageCaution; personalPreferences.append(ageCaution);
     const avoidSettings = element('section', null, 'avoid-settings'); avoidSettings.setAttribute('aria-label', 'Personal target exclusions');
@@ -1943,17 +1944,19 @@ function mountTargetList(platform, storageWarning = '') {
   }
 
   function poolSummary() {
-    let range = 0, old = 0, unknown = 0, ready = 0;
+    let range = 0, old = 0, unknown = 0, ready = 0, recent = 0;
     const now = serviceNow();
+    const cooldowns = C.recentTargetCooldowns(state.recentTargets);
     for (const target of state.targets) {
       if (C.avoidReason(target, state, now)) continue;
       const assessment = C.assess(target, state.player, state.maxRatio, now, state.minRatio, state.estimateDays);
       if (!assessment.allied && assessment.inRange) range++;
       if (assessment.ratio !== null && !assessment.fresh) old++;
       if (assessment.ratio === null) unknown++;
-      if (assessment.suggested && assessment.ready && !target.reserved) ready++;
+      if (assessment.suggested && !target.reserved && cooldowns.has(target.id)) recent++;
+      else if (assessment.suggested && assessment.ready && !target.reserved) ready++;
     }
-    return `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now`;
+    return `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now${recent ? ' · ' + recent + ' opened recently (skipped by NWA)' : ''}`;
   }
   function targetFilterKey() {
     return JSON.stringify([state.query.trim().toLowerCase(), state.mode, state.minRatio, state.maxRatio, state.estimateDays, state.excludedFactionIds, state.avoidActive, state.activityMinutes]);
@@ -2003,8 +2006,9 @@ function mountTargetList(platform, storageWarning = '') {
     if (filterKey !== cardFilterKey) { cardFilterKey = filterKey; visibleCardLimit = CARD_BATCH_SIZE; }
     updateExportControls();
     const now = serviceNow(), freshPool = authorizedPoolFresh(), query = state.query.trim().toLowerCase();
+    const cooldowns = C.recentTargetCooldowns(state.recentTargets);
     const selected = new Map();
-    let range = 0, old = 0, unknown = 0, ready = 0, suggestions = 0, excluded = 0;
+    let range = 0, old = 0, unknown = 0, ready = 0, recent = 0, suggestions = 0, excluded = 0;
     // Assess each target once for filtering, counts, ordering and its card.
     for (const target of state.targets) {
       if (C.avoidReason(target, state, now)) { excluded++; continue; }
@@ -2013,13 +2017,15 @@ function mountTargetList(platform, storageWarning = '') {
       if (assessment.ratio !== null && !assessment.fresh) old++;
       if (assessment.ratio === null) unknown++;
       if (assessment.suggested) suggestions++;
-      if (freshPool && state.reservationsSupported && assessment.suggested && assessment.ready && !target.reserved) ready++;
+      const recentMs = cooldowns.get(target.id) || 0;
+      if (assessment.suggested && !target.reserved && recentMs) recent++;
+      if (freshPool && state.reservationsSupported && assessment.suggested && assessment.ready && !target.reserved && !recentMs) ready++;
       if (state.mode === 'suggested' && !assessment.suggested) continue;
       if (query && !`${target.id} ${target.name} ${target.faction?.name || ''} ${C.reason(target)}`.toLowerCase().includes(query)) continue;
-      selected.set(target.id, { target, assessment });
+      selected.set(target.id, { target, assessment, recentMs });
     }
-    const priority = ({ target, assessment }) => assessment.suggested
-      ? target.reserved ? 1 : assessment.ready && freshPool && state.reservationsSupported ? 3 : 2 : 0;
+    const priority = ({ target, assessment, recentMs }) => assessment.suggested
+      ? target.reserved ? 1 : assessment.ready && freshPool && state.reservationsSupported && !recentMs ? 3 : 2 : 0;
     const orderKey = [...selected.values()].map(row => `${row.target.id}:${priority(row)}:${row.assessment.ratio}`).join('|');
     if (orderKey !== orderedRowsKey) {
       orderedRowsKey = orderKey;
@@ -2027,9 +2033,10 @@ function mountTargetList(platform, storageWarning = '') {
         || (a.assessment.ratio ?? Infinity) - (b.assessment.ratio ?? Infinity) || a.target.id - b.target.id).map(row => row.target.id);
     }
     const rows = orderedIds.map(id => selected.get(id));
-    const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now${excluded ? ' · ' + excluded + ' excluded by your settings' : ''}`;
+    const summary = `${range} in stat range · ${old} estimates too old or undated · ${unknown} stats unknown · ${ready} ready now${recent ? ' · ' + recent + ' opened recently (skipped by NWA)' : ''}${excluded ? ' · ' + excluded + ' excluded by your settings' : ''}`;
     const shownReady = freshPool && state.reservationsSupported
-      ? rows.filter(({ target, assessment }) => assessment.suggested && assessment.ready && !target.reserved).length : 0;
+      ? rows.filter(({ target, assessment, recentMs }) => assessment.suggested && assessment.ready && !target.reserved && !recentMs).length : 0;
+    const shownRecent = rows.filter(({ target, assessment, recentMs }) => assessment.suggested && !target.reserved && recentMs).length;
     if (viewport) {
       for (const anchor of viewport.anchors) {
         const index = orderedIds.indexOf(anchor.id);
@@ -2039,7 +2046,7 @@ function mountTargetList(platform, storageWarning = '') {
       }
     }
     const visibleRows = rows.slice(0, visibleCardLimit), visibleIds = visibleRows.map(row => row.target.id), visibleIdSet = new Set(visibleIds);
-    setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} ${rows.length > visibleRows.length ? 'matches' : 'shown'}`);
+    setText(panelUi.countSummary, state.loading ? 'Loading targets…' : `${shownReady} ready · ${rows.length} ${rows.length > visibleRows.length ? 'matches' : 'shown'}${shownRecent ? ' · ' + shownRecent + ' recent' : ''}`);
     setText(panelUi.countDetail, `${visibleRows.length} displayed · ${rows.length} matching · ${state.targets.length} in pool · ${suggestions} possible matches · ${summary}`);
     panelUi.moreCards.hidden = visibleRows.length >= rows.length;
     setText(panelUi.showMore, `Show more (${rows.length - visibleRows.length} remaining)`);
@@ -2056,10 +2063,10 @@ function mountTargetList(platform, storageWarning = '') {
       mountedIds = []; return;
     }
     emptyCard?.remove(); emptyCard = null;
-    for (const { target, assessment } of visibleRows) {
+    for (const { target, assessment, recentMs } of visibleRows) {
       const signature = JSON.stringify([target, assessment, freshPool, state.pendingChecks.has(target.id), state.loading,
         state.reservationsSupported, C.ageLabel(target.estimateUpdatedAt, now), C.ageLabel(target.lastAction, now),
-        Boolean(target.status?.until > now / 1000), Date.parse(target.reservationExpiresAt) > now]);
+        Boolean(target.status?.until > now / 1000), Date.parse(target.reservationExpiresAt) > now, Math.ceil(recentMs / 60000)]);
       let cached = cardNodes.get(target.id);
       if (cached?.signature === signature) continue;
       if (!cached) {
@@ -2083,8 +2090,9 @@ function mountTargetList(platform, storageWarning = '') {
       const canAttack = assessment.suggested && assessment.ready && freshPool && !target.reserved && state.reservationsSupported;
       const unavailable = assessment.live && (target.status?.state !== 'Okay' || assessment.timedUnavailable);
       const availability = target.reserved ? 'Reserved by another NWA member' : unavailable ? target.status?.state || 'Unavailable' : ownLease ? 'Reserved by you'
-        : !assessment.live ? 'Status needs checking' : canAttack ? 'Ready' : target.status?.state || 'Unknown';
+        : !assessment.live ? 'Status needs checking' : canAttack ? recentMs ? 'Opened recently' : 'Ready' : target.status?.state || 'Unknown';
       status.append(element('strong', availability), element('span', assessment.label, `badge ${assessment.tone}`));
+      if (recentMs && assessment.suggested) status.append(element('small', `NWA skips for ${Math.ceil(recentMs / 60000)}m.${canAttack ? ' You can attack manually.' : ''}`));
       if (assessment.suggested && assessment.ready && !target.reserved && !freshPool) status.append(element('small', 'Refresh the list to open an attack'));
       if ((ownLease || target.reserved) && !assessment.live) status.append(element('small', 'Status needs checking'));
       if (!assessment.live && target.status?.state) status.append(element('small', `Last known: ${target.status.state}`));

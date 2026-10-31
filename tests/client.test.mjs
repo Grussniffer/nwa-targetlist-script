@@ -920,13 +920,57 @@ test('clear recent targets explicitly restores a depleted finder pool', async ()
   const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
   const app = fixture(null, { recentTargets: [{ id: target.id, at: NOW }], lastTargetId: target.id });
   await app.signIn([ready]);
+  assert.match(app.text(), /0 ready · 1 shown · 1 recent/);
+  assert.match(app.text(), /Opened recently.*NWA skips for 10m/s);
   app.button('NWA').emit('click'); await flush();
   assert.deepEqual(app.navigations, []);
   app.button('Clear recent targets').emit('click');
   assert.deepEqual([...app.storage.get(app.preferencesKey).recentTargets], []);
   assert.equal(app.storage.get(app.preferencesKey).lastTargetId, null);
+  assert.match(app.text(), /1 ready · 1 shown/);
+  assert.doesNotMatch(app.text(), /Opened recently/);
   app.button('NWA').emit('click'); await completeLease(app);
   assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+});
+
+test('recent matching players stay visible with a skip reason and are excluded from automatic ready counts', async () => {
+  const ready = { ...target, checkedAt: new Date(NOW).toISOString() };
+  const app = fixture(null, { recentTargets: [{ id: target.id, at: NOW - 120000 }] });
+  await app.signIn([ready, { ...ready, id: target.id + 1, name: 'Fresh choice' }], { capabilities: { nextTarget: true } });
+  assert.match(app.text(), /1 ready · 2 shown · 1 recent/);
+  assert.match(app.text(), /1 ready now · 1 opened recently \(skipped by NWA\)/);
+  const recentCard = app.find(element => element.attributes.get('data-target-id') === String(target.id));
+  assert.match(textContent(recentCard), /Opened recently.*NWA skips for 8m\. You can attack manually\./s);
+  assert.doesNotMatch(textContent(recentCard), /\bReady\b/);
+  assert.equal(descendants(recentCard).some(element => element.className === 'attack'), true,
+    'a deliberate manual attack remains available');
+  const search = app.find(element => element.attributes.get('aria-label') === 'Search targets');
+  search.value = 'Target Player'; search.emit('input');
+  assert.match(app.text(), /0 ready · 1 shown · 1 recent/);
+  app.button('NWA').emit('click');
+  assert.deepEqual(JSON.parse(app.requests.at(-1).data).recentTargetIds, [target.id],
+    'the displayed recent exclusion agrees with the actual automatic request');
+});
+
+test('a deliberate manual attack can override the automatic recent-target cooldown', async () => {
+  const app = fixture(null, { recentTargets: [{ id: target.id, at: NOW - 120000 }] });
+  await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+  assert.match(app.text(), /0 ready · 1 shown · 1 recent/);
+  app.button('Attack ↗').emit('click');
+  await completeLease(app);
+  assert.deepEqual(app.navigations, [`https://www.torn.com/page.php?sid=attack&user2ID=${target.id}`]);
+  assert.deepEqual(JSON.parse(JSON.stringify(app.storage.get(app.preferencesKey).recentTargets)), [{ id: target.id, at: NOW }]);
+});
+
+test('the recent notice and exclusion disappear after ten minutes without deleting history', async () => {
+  const app = fixture(null, { recentTargets: [{ id: target.id, at: NOW - 599999 }] });
+  await app.signIn([{ ...target, checkedAt: new Date(NOW).toISOString() }]);
+  assert.match(app.text(), /0 ready · 1 shown · 1 recent/);
+  assert.match(app.text(), /NWA skips for 1m/);
+  app.setNow(NOW + 1);
+  app.find(element => element.attributes.get('aria-label') === 'Search targets').emit('input');
+  assert.match(app.text(), /1 ready · 1 shown/);
+  assert.doesNotMatch(app.text(), /Opened recently|NWA skips for/);
 });
 
 test('estimate-age controls validate integer days, persist preferences and allow an older target after reload', async () => {

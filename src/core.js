@@ -146,6 +146,13 @@ const TargetListCore = (() => {
     return (Array.isArray(values) ? values : []).filter(value => value && Number.isSafeInteger(value.id) && value.id > 0
       && Number.isFinite(value.at) && value.at <= now && now - value.at < RECENT_TARGET_MS).slice(-50);
   }
+  function recentTargetCooldowns(values, now = Date.now()) {
+    const remaining = new Map();
+    for (const value of recentTargets(values, now)) {
+      remaining.set(value.id, Math.max(remaining.get(value.id) || 0, RECENT_TARGET_MS - (now - value.at)));
+    }
+    return remaining;
+  }
   function candidates(rows, recent = [], now = Date.now(), random = Math.random) {
     const visited = new Set(recentTargets(recent, now).map(value => value.id));
     const pool = rows.filter(row => !visited.has(row.target.id) && !row.target.reserved
@@ -220,5 +227,5 @@ const TargetListCore = (() => {
     return { targets: [...next.values()], cursor: sync.cursor };
   }
 
-  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, createServiceClock, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
+  return { DEFAULT_MIN_RATIO, DEFAULT_MAX_RATIO, DEFAULT_ESTIMATE_DAYS, ESTIMATE_MAX_AGE, RECENT_TARGET_MS, LIVE_STATUS_MAX_AGE, createServiceClock, serviceUrl, validKey, pageTargetId, reason, parseExcludedFactions, avoidReason, estimateSourceLabel, recentTargets, recentTargetCooldowns, candidates, compact, ageLabel, assess, select, applyFeed, applyPendingSuggestions };
 })();

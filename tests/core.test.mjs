@@ -256,6 +256,19 @@ test('finder candidates exclude recent, reserved and unavailable targets while s
   assert.equal(Core.candidates(rows, [{ id: 1, at: NOW - 600000 }], NOW, () => 0.999999).some(value => value.id === 1), true);
 });
 
+test('recent target cooldowns use the latest valid opening and expire at the same finder boundary', () => {
+  const history = [
+    { id: 1, at: NOW - 600000 }, { id: 2, at: NOW - 599999 },
+    { id: 3, at: NOW - 120000 }, { id: 3, at: NOW - 60000 },
+    { id: 4, at: NOW + 1 }, { id: '5', at: NOW }, null,
+  ];
+  const remaining = Core.recentTargetCooldowns(history, NOW);
+  assert.deepEqual(JSON.parse(JSON.stringify([...remaining])), [[2, 1], [3, 540000]]);
+  assert.equal(Core.recentTargetCooldowns(history, NOW + 1).has(2), false);
+  assert.deepEqual([...Core.recentTargetCooldowns(null, NOW)], []);
+  assert.equal(history.length, 7, 'displaying cooldowns does not rewrite the saved history');
+});
+
 test('Ready requires an Okay status checked less than thirty seconds ago', () => {
   assert.equal(Core.LIVE_STATUS_MAX_AGE, 30_000);
   assert.equal(Core.assess(target(), player, 0.6, NOW).ready, true);
