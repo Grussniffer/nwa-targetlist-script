@@ -109,6 +109,56 @@ test('Torn PDA native storage is authoritative and restores sessions and prefere
   assert.equal(gm.writes.length, 0); assert.equal(local.getItem(SESSION), JSON.stringify({ token: 'obsolete-browser-session' }));
 });
 
+test('a stale PDA view cannot delete a newer sign-in saved by another view', async () => {
+  const native = pdaStorage([[SESSION, value]]);
+  const oldView = create({ pdaStorage: native.env });
+  const newView = create({ pdaStorage: native.env });
+  await Promise.all([oldView.prepare(keys), newView.prepare(keys)]);
+  const replacement = { ...value, token: 'replacement-opaque-session' };
+  await newView.setValue(SESSION, replacement);
+  assert.equal(oldView.getValue(SESSION, null).token, value.token, 'the old view cached its original token');
+  assert.equal(await oldView.deleteValueIf(SESSION, saved => saved?.token === value.token), false);
+  assert.deepEqual(native.deletions, []);
+  assert.deepEqual(native.values.get(SESSION), replacement);
+  assert.deepEqual(plain(oldView.getValue(SESSION, null)), replacement, 'the stale view can recover the newer value');
+
+  assert.equal(await newView.deleteValueIf(SESSION, saved => saved?.token === replacement.token), true);
+  assert.deepEqual(native.deletions, [SESSION]);
+  assert.equal(newView.getValue(SESSION, null), null);
+});
+
+test('PDA conditional deletion stops when the same view saves a replacement during the read', async () => {
+  const native = pdaStorage([[SESSION, value]]);
+  const platform = create({ pdaStorage: native.env });
+  await platform.prepare(keys);
+  const reading = deferred();
+  const result = deferred();
+  native.env.loadAll = () => { reading.resolve(); return result.promise; };
+  const removing = platform.deleteValueIf(SESSION, saved => saved?.token === value.token);
+  await reading.promise;
+  const replacement = { ...value, token: 'new-local-opaque-session' };
+  const saving = platform.setValue(SESSION, replacement);
+  result.resolve({ [SESSION]: value });
+
+  assert.equal(await removing, false);
+  await saving;
+  assert.deepEqual(native.deletions, []);
+  assert.deepEqual(native.values.get(SESSION), replacement);
+  assert.deepEqual(plain(platform.getValue(SESSION, null)), replacement);
+});
+
+test('PDA conditional deletion leaves saved data alone if the fresh read fails', async () => {
+  const native = pdaStorage([[SESSION, value]]);
+  const platform = create({ pdaStorage: native.env });
+  await platform.prepare(keys);
+  native.env.loadAll = async () => { throw new Error('native database unavailable'); };
+
+  await assert.rejects(platform.deleteValueIf(SESSION, saved => saved?.token === value.token), /saved data/i);
+  assert.deepEqual(native.deletions, []);
+  assert.deepEqual(native.values.get(SESSION), value);
+  assert.deepEqual(plain(platform.getValue(SESSION, null)), value);
+});
+
 test('missing native values migrate only the requested legacy session and preferences once', async () => {
   const native = pdaStorage();
   const gm = gmStorage([[SESSION, value], [PREFERENCES, { minRatio: 12, maxRatio: 55 }], ['torn-api-key', 'fixture-only-unused']]);

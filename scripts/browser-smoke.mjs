@@ -803,12 +803,20 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
   });
   await wait(page, () => window.__mock.pending.length === 1);
   await page.evaluate(() => { window.__mockNow += 3600001; window.__mock.runIntervals(); });
-  await wait(page, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
+  await wait(page, () => [...window.__targetlistShadow.querySelectorAll('button')].some(button => button.textContent === 'Retry saved login'));
+  assert.equal(await page.evaluate(() => window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`)), true,
+    `${mode}: the local deadline does not erase the saved token`);
   await page.evaluate(() => window.__mock.release('/api/targets'));
   await page.waitForTimeout(30);
   assert.equal(await page.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0,
     `${mode}: a late delta cannot restore expired access`);
   assert.equal(await page.evaluate(() => Boolean(document.getElementById('nwa-target-page-notice'))), false);
+  await page.evaluate(() => {
+    window.__mock.overrides['/api/targets'] = { status: 401, data: { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } } };
+  });
+  await clickButton(page, 'Retry saved login');
+  await wait(page, () => Boolean(window.__targetlistShadow.querySelector('form.login')));
+  await wait(page, () => !window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`));
   await page.close();
   console.log(`PASS ${mode} delta synchronization, lazy 1,000-target settings, keyed status patches, preserved controls/scroll/focus, delisting, unknown-cursor reset and expiry races`);
   console.log(`PERF ${mode}: closed ${closed.cards} cards/${closed.nodes} nodes; initial lazy 50 cards/${initialNodes} nodes; fully expanded 1,000 cards/${openedNodes} nodes; full ${metrics.full} bytes; unchanged delta ${metrics.unchanged} bytes; one-status delta ${metrics.oneStatus} bytes`);
@@ -833,7 +841,7 @@ async function checkDeltaRendering(pageContext, scripts, mode) {
     `${mode}: revocation is tested on a cursor request`);
   assert.equal(await denied.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0);
   assert.equal(await denied.evaluate(() => Boolean(document.getElementById('nwa-target-page-notice'))), false);
-  assert.equal(await denied.evaluate(() => window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`)), false);
+  await wait(denied, () => !window.__mock.store.has(`targetlist.session.${window.__mock.serviceOrigin}`));
   await denied.close();
   console.log(`PASS ${mode} deltas preserve unfinished stat edits and suggestion drafts; unchanged feeds retain status age, and cursor requests cannot bypass revoked faction authorization`);
 }
@@ -1817,16 +1825,14 @@ try {
   await shadow(legacyBackend, 'form', 'submit');
   await wait(legacyBackend, () => window.__targetlistShadow.querySelector('.error').textContent.includes('Update the NWA backend to enable encrypted key storage'));
   const legacyRequests = await legacyBackend.evaluate(() => structuredClone(window.__mock.requests));
-  assert.equal(legacyRequests.length, 2);
+  assert.equal(legacyRequests.length, 1, 'invalid login metadata cannot trigger owner-wide sign out');
   assert.equal(legacyRequests[0].method, 'POST');
   assert.equal(JSON.parse(legacyRequests[0].data).storeKey, true);
-  assert.equal(legacyRequests[1].method, 'DELETE');
-  assert.equal(legacyRequests[1].headers.Authorization, 'Bearer legacy-backend-session');
   assert.equal(await legacyBackend.evaluate(() => window.__mock.store.size), 0);
   assert.equal(await legacyBackend.evaluate(() => window.__targetlistShadow.querySelectorAll('.card').length), 0);
   assert.equal(legacyBackend.url(), 'about:blank');
   await legacyBackend.close();
-  console.log('PASS incompatible backend storage confirmation triggers session cleanup and never adopts a token or loads targets');
+  console.log('PASS incompatible backend storage confirmation never revokes existing logins, adopts a token, or loads targets');
 
   const quick = await mount();
   await login(quick);
@@ -3118,14 +3124,20 @@ try {
     assert.match(await shadow(unavailablePdaStore, '.error', 'text'), /could not access saved data/);
     assert.equal(await unavailablePdaStore.evaluate(() => {
       const root = window.__targetlistShadow;
-      return Boolean(root.querySelector('form.login')) && !root.querySelector('input[type=password]').disabled
+      const retry = [...root.querySelectorAll('button')].find(button => button.textContent === 'Retry saved sign-in');
+      return !root.querySelector('form.login') && Boolean(retry) && !retry.disabled
         && !root.querySelector('.settings-toggle').disabled && !root.querySelector('.error').hidden;
-    }), true, 'a transient storage read failure leaves the NWA controls usable with a clear error');
+    }), true, 'a storage read failure offers a retry without asking for a replacement key');
     await unavailablePdaStore.waitForTimeout(30);
     assert.equal(await unavailablePdaStore.evaluate(() => window.__mock.pda.storageCalls.some(call => call.method === 'delete')), false, 'unread native data must never be treated as an expired token');
     assert.equal(await unavailablePdaStore.evaluate(() => window.__mock.pda.calls.some(call => call.name === 'PDA_httpDelete')), false);
     const retainedPda = await unavailablePdaStore.evaluate(() => [...window.__mock.store]);
     assert.deepEqual(retainedPda, persistedPda, 'token and preferences survive transient native storage failure');
+    await unavailablePdaStore.evaluate(() => { window.__mock.pdaLoadAllFailure = false; });
+    await clickButton(unavailablePdaStore, 'Retry saved sign-in');
+    await wait(unavailablePdaStore, () => window.__targetlistShadow.querySelectorAll('.card').length === 4);
+    assert.equal(await unavailablePdaStore.evaluate(() => document.querySelectorAll('#torn-targetlist-host').length), 1);
+    assert.equal(await unavailablePdaStore.evaluate(() => window.__mock.requests.some(request => request.path === '/api/session' && request.method === 'POST')), false);
     await unavailablePdaStore.close();
     const recoveredPdaStore = await mount({ width: 320, height: 844 }, [pdaRuntimeSource, source], pdaContext, entries => {
       for (const [key, value] of entries) window.__mock.store.set(key, value);
@@ -3137,7 +3149,7 @@ try {
     assert.equal(await recoveredPdaStore.evaluate(() => window.__mock.requests.find(request => request.path === '/api/targets').headers.Authorization), 'Bearer mock-session-token');
     assert.equal(await recoveredPdaStore.evaluate(() => window.__targetlistShadow.querySelector('[aria-label="Minimum target stats as percent of your total"]').value), '15');
     await recoveredPdaStore.close();
-    console.log('PASS transient PDA storage failure keeps the saved token and preferences; a fresh successful document restores without entering the key again');
+    console.log('PASS transient PDA storage failure keeps the saved token and preferences; retry and reload both restore the saved sign-in');
   } finally { await pdaContext.close(); }
 
   await checkSingleRequestFinder(context, [source], 'GM');

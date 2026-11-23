@@ -75,6 +75,42 @@ const TargetListPlatform = (() => {
           try { legacyDelete(key); } catch { /* Never restore a withdrawn legacy session. */ }
         });
       },
+      deleteValueIf(key, matches) {
+        if (!native) {
+          const value = legacyGet(key, missing);
+          if (value === missing || !matches(value)) return false;
+          legacyDelete(key);
+          return true;
+        }
+
+        const revision = revisions.get(key) || 0;
+        const unchanged = () => (revisions.get(key) || 0) === revision;
+        return enqueue(async () => {
+          if (!unchanged()) return false;
+          // Another WebView can save a newer login after this view loads.
+          // PDA exposes separate read and delete calls, so check its store
+          // immediately before deleting instead of comparing the local cache.
+          const values = await native.loadAll();
+          if (!values || typeof values !== 'object' || Array.isArray(values)) throw storageError();
+          if (!unchanged()) return false;
+          if (!Object.prototype.hasOwnProperty.call(values, key)) {
+            cache.delete(key);
+            return false;
+          }
+          const value = values[key];
+          if (!matches(value)) {
+            cache.set(key, value);
+            return false;
+          }
+          await native.delete(key);
+          if (unchanged()) {
+            revisions.set(key, revision + 1);
+            cache.delete(key);
+          }
+          try { legacyDelete(key); } catch { /* Never restore a withdrawn legacy session. */ }
+          return true;
+        });
+      },
       xmlHttpRequest(options) {
         if (!isPda && typeof env.gmRequest === 'function') return env.gmRequest(options);
         const method = options.method.toUpperCase();

@@ -78,4 +78,6 @@ Your Limited key verifies your name and faction and reads your battle stats. We 
 
 Only allowed factions can use the list. Instant selection requires an availability check under 30 seconds old. A target can still enter hospital after a check. Battle stats are estimates; attacks are manual.
 
+From version 0.15.6, NWA asks the backend to confirm expiry before clearing a saved sign-in. If the device estimates that the login has expired while the service is unavailable, the panel keeps the saved login available to retry. Backend 0.20.5 also preserves the sign-in when Torn temporarily blocks use of the key.
+
 Disable any separate old **Torn Faction Target List** entry. Your installed version appears at the bottom of the target panel.

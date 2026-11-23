@@ -1,5 +1,5 @@
 // Keep this service hostname and @connect in metadata.txt in sync when deploying elsewhere.
-const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.5' });
+const CONFIG = Object.freeze({ serviceUrl: 'https://targetlist.grusmedia.no', version: '0.15.6' });
 
 function startTargetList() {
   const platform = TargetListPlatform.create({
@@ -14,17 +14,33 @@ function startTargetList() {
     pdaReady: window.__PDA_platformReadyPromise, pdaBridge: () => window.flutter_inappwebview,
     localStorage: () => window.localStorage
   });
-  function mount(storageWarning = '') {
+  const base = TargetListCore.serviceUrl(CONFIG.serviceUrl);
+  const keys = [`targetlist.session.${base}`, `targetlist.preferences.${base}`];
+  function readSavedData() {
+    const [saved, preferences] = keys.map(key => platform.getValue(key, null));
+    return { saved, preferences };
+  }
+  function mount(storageWarning = '', retryingHost = null, savedData = {}) {
     const previousHost = document.getElementById('torn-targetlist-host');
     const mountedVersion = previousHost?.getAttribute('data-nwa-version') || '';
-    if (previousHost && /^\d+\.\d+\.\d+$/.test(mountedVersion)
+    if (retryingHost && previousHost !== retryingHost) return;
+    if (!retryingHost && previousHost && /^\d+\.\d+\.\d+$/.test(mountedVersion)
         && mountedVersion.localeCompare(CONFIG.version, undefined, { numeric: true }) >= 0) return;
+    if (!storageWarning && !retryingHost) {
+      try { savedData = readSavedData(); }
+      catch { storageWarning = 'NWA could not read saved data on this device.'; }
+    }
     previousHost?.__nwaDispose?.();
     if (previousHost && typeof Event === 'function') previousHost.dispatchEvent?.(new Event('nwa:dispose'));
-    previousHost?.remove(); mountTargetList(platform, storageWarning);
+    previousHost?.remove();
+    mountTargetList(platform, { ...savedData, storageWarning, openOnMount: Boolean(retryingHost),
+      async retryStorage(host) {
+        await platform.prepare(keys);
+        mount('', host, readSavedData());
+      },
+    });
   }
-  const base = TargetListCore.serviceUrl(CONFIG.serviceUrl);
-  const ready = platform.prepare([`targetlist.session.${base}`, `targetlist.preferences.${base}`]);
+  const ready = platform.prepare(keys);
   if (ready?.then) ready.then(() => mount()).catch(error => mount(error.message)); else mount();
 }
 // PDA can inject at page start regardless of @run-at. Mount only in the main
@@ -34,7 +50,7 @@ if (!window.top || window.top === window.self) {
   else document.addEventListener('DOMContentLoaded', startTargetList, { once: true });
 }
 
-function mountTargetList(platform, storageWarning = '') {
+function mountTargetList(platform, { saved, preferences, storageWarning, retryStorage, openOnMount }) {
   const C = TargetListCore;
   const serviceClock = C.createServiceClock();
   const serviceNow = () => serviceClock.now();
@@ -45,7 +61,7 @@ function mountTargetList(platform, storageWarning = '') {
   const CARD_BATCH_SIZE = 50;
   const DEFINITE_SELECTION_FAILURES = new Set(['TORN_UNAVAILABLE', 'FACTIONS_UNAVAILABLE', 'TARGETS_UNAVAILABLE',
     'TARGETS_SCHEMA_MISMATCH', 'TARGETS_LIMIT_EXCEEDED', 'FACTIONS_NOT_CONFIGURED', 'SESSION_STORAGE_UNAVAILABLE',
-    'KEY_STORAGE_UNAVAILABLE', 'KEY_REMOVAL_PENDING', 'SESSION_CAPACITY', 'CAPACITY_LIMIT', 'SERVICE_CLOSED']);
+    'KEY_STORAGE_UNAVAILABLE', 'KEY_REMOVAL_PENDING', 'SESSION_CAPACITY', 'CAPACITY_LIMIT', 'SERVICE_CLOSED', 'TORN_KEY_UNAVAILABLE']);
   let disposed = false;
   const lifecycleListeners = [], taskTimers = new Set(), pendingRequests = new Set();
   const downloadUrls = new Set();
@@ -64,7 +80,6 @@ function mountTargetList(platform, storageWarning = '') {
   catch (error) { console.error('[NWA] Invalid service address:', error.message); return; }
   const storageKey = `targetlist.session.${base}`;
   const preferencesKey = `targetlist.preferences.${base}`;
-  const preferences = platform.getValue(preferencesKey, null);
   const savedMaxRatio = preferences?.maxRatio;
   const maxRatio = Number.isFinite(savedMaxRatio) && savedMaxRatio >= 0.01 && savedMaxRatio <= 5 ? savedMaxRatio : C.DEFAULT_MAX_RATIO;
   const savedMinRatio = preferences?.minRatio;
@@ -299,7 +314,7 @@ function mountTargetList(platform, storageWarning = '') {
   function saveSession() {
     return platform.setValue(storageKey, { token: state.token, expiresAt: state.expiresAt });
   }
-  function clearSession({ preserveClock = false } = {}) {
+  function clearSession({ preserveClock = false, keepSavedLogin = false } = {}) {
     const clearedToken = state.token;
     if (!preserveClock) serviceClock.reset();
     pageSuggestedIds.clear(); pageSuggestion = { id: null, comment: '', message: '' }; pagePendingDetails = null; state.pendingSuggestionDetailsSupported = false;
@@ -322,22 +337,40 @@ function mountTargetList(platform, storageWarning = '') {
     pageAdminDraft = { id: null, reason: '', confirm: false, feedback: '' };
     state.canReview = false; state.suggestionsLoading = false; state.suggestionGeneration++;
     state.suggestionMutation = null; state.suggestionNotice = ''; state.suggestionDraft = { type: 'player', targetId: '', comment: '' };
-    persist(() => {
-      // GM storage is shared between Torn tabs. This tab can clear only its
-      // own token, never a newer login written by another tab.
-      if (platform.getValue(storageKey, null)?.token === clearedToken) return platform.deleteValue(storageKey);
-    });
+    if (!keepSavedLogin && clearedToken) {
+      persist(() => platform.deleteValueIf(storageKey, saved => saved?.token === clearedToken));
+    }
     updatePageNotice();
+  }
+  function validSavedLogin(saved) {
+    return typeof saved?.token === 'string' && !!saved.token.trim()
+      && typeof saved.expiresAt === 'string' && Number.isFinite(Date.parse(saved.expiresAt));
   }
   function restoreNewerSession() {
     let saved;
     try { saved = platform.getValue(storageKey, null); } catch { return false; }
-    if (!saved || typeof saved.token !== 'string' || !saved.token || saved.token === state.token
-      || !(Date.parse(saved.expiresAt) > serviceNow())) return false;
+    if (!validSavedLogin(saved) || saved.token === state.token) return false;
     clearSession({ preserveClock: true });
     state.token = saved.token; state.expiresAt = saved.expiresAt;
     // Restore through the backend before showing protected data or allowing a hit.
     void loadTargets();
+    return true;
+  }
+  function checkSessionExpiry() {
+    if (!state.token || state.removingKey || Date.parse(state.expiresAt) > serviceNow()) return false;
+    if (!state.busy && !restoreNewerSession() && state.player) {
+      const { token, expiresAt, feedFailures, nextFeedAt, hardRetryAt, lastPoolAttemptAt } = state;
+      const pendingFeed = state.targetLoad;
+      clearSession({ preserveClock: true, keepSavedLogin: true });
+      Object.assign(state, { token, expiresAt, feedFailures, nextFeedAt, hardRetryAt, lastPoolAttemptAt });
+      message('Checking your saved sign-in.');
+      render();
+      if (pendingFeed) {
+        state.targetLoad = pendingFeed;
+        const clearPending = () => { if (state.targetLoad === pendingFeed) state.targetLoad = null; };
+        void pendingFeed.promise.then(clearPending, clearPending);
+      } else if (pageVisible()) void loadTargets();
+    }
     return true;
   }
   function handleError(error) {
@@ -349,7 +382,7 @@ function mountTargetList(platform, storageWarning = '') {
     if (authStatus && confirmed) {
       if (restoreNewerSession()) return;
       clearSession(); toggle(true); render();
-    } else if (authStatus && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'PLAYER_NOT_FOUND', 'REVIEW_NOT_ALLOWED'].includes(error.code)) {
+    } else if (error.code === 'TORN_KEY_UNAVAILABLE' || authStatus && !['FRIENDLY_TARGET', 'TARGET_NOT_FOUND', 'TARGET_LEFT_FACTION', 'PLAYER_NOT_FOUND', 'REVIEW_NOT_ALLOWED'].includes(error.code)) {
       // An ambiguous proxy/service denial cannot prove that the saved token
       // expired. Hide protected data but keep the credential for a later retry.
       state.authorizedPool = false; state.targets = []; clearExport(); updatePageNotice(); render();
@@ -419,9 +452,6 @@ function mountTargetList(platform, storageWarning = '') {
       const storedUntil = Date.parse(data?.keyStorage?.expiresAt);
       if (data?.keyStorage?.mode !== 'encrypted' || !Number.isFinite(storedUntil) || storedUntil <= serviceNow()
           || storedUntil > serviceNow() + 7 * 24 * 60 * 60 * 1000 + 5000) {
-        if (typeof data?.token === 'string' && data.token) {
-          try { await request('DELETE', '/api/session', undefined, data.token); } catch { /* Best-effort cleanup of an incompatible backend session. */ }
-        }
         throw new Error('Update the NWA backend to enable encrypted key storage.');
       }
       state.token = data.token; state.expiresAt = data.expiresAt; state.player = data.player;
@@ -432,7 +462,7 @@ function mountTargetList(platform, storageWarning = '') {
     } catch (error) { if (generation === state.generation) handleError(error); }
     finally {
       if (generation === state.generation) {
-        state.busy = false; render();
+        state.busy = false; checkSessionExpiry(); render();
         if (state.findAfterLogin && state.player && !state.error) {
           state.findAfterLogin = false; void findTarget();
         }
@@ -1040,6 +1070,12 @@ function mountTargetList(platform, storageWarning = '') {
         // evidence. Discard the older whole feed, including its cursor, rather
         // than merging observation fields into potentially changed membership.
         if (observationRevision !== state.observationRevision) return false;
+        if (Date.parse(state.expiresAt) <= serviceNow()) {
+          state.nextFeedAt = Date.now() + OPEN_FEED_REFRESH_MS;
+          message('Your saved sign-in is being checked.');
+          checkSessionExpiry();
+          return false;
+        }
         const feed = C.applyFeed(data, previousTargets, cursor);
         state.feedTargets = feed.targets; state.feedCursor = feed.cursor;
         if (pendingEpoch === state.pendingSuggestionEpoch) {
@@ -1092,10 +1128,9 @@ function mountTargetList(platform, storageWarning = '') {
   async function findTarget() {
     if (disposed || state.finding || state.busy) return;
     message('');
-    if (!state.token || Date.parse(state.expiresAt) <= serviceNow()) {
-      if (state.token && restoreNewerSession()) return;
-      if (state.token) clearSession();
-      state.findAfterLogin = true; toggle(true, launcher); render(); return;
+    if (!state.token || checkSessionExpiry()) {
+      state.findAfterLogin = !state.token && !storageWarning;
+      toggle(true, launcher); render(); return;
     }
     if (Date.now() < state.hardRetryAt) {
       findNotice(`The target service asked us to wait. Retry in ${Math.ceil((state.hardRetryAt - Date.now()) / 1000)}s.`); return;
@@ -1239,9 +1274,7 @@ function mountTargetList(platform, storageWarning = '') {
     } finally {
       if (findGeneration === state.findGeneration) {
         state.finding = false;
-        if (state.token && Date.parse(state.expiresAt) <= serviceNow()) {
-          if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); findNotice('Session expired. Open NWA settings to sign in again.'); }
-        }
+        checkSessionExpiry();
         render();
       }
     }
@@ -1542,6 +1575,11 @@ function mountTargetList(platform, storageWarning = '') {
     panelUi.factionClear.hidden = !state.excludedFactionIds.length;
   }
   function updatePanelControls() {
+    if (storageWarning) {
+      panelUi.retry.disabled = state.busy;
+      setText(panelUi.retry, state.busy ? 'Reading saved sign-in…' : 'Retry saved sign-in');
+      return;
+    }
     if (!state.player && state.token) {
       panelUi.retry.disabled = state.busy || state.loading || state.removingKey;
       panelUi.signOut.disabled = state.busy || state.loading || state.removingKey;
@@ -1600,13 +1638,25 @@ function mountTargetList(platform, storageWarning = '') {
     if (!state.player && renderedKind?.startsWith('member:')) resetPanel();
     if (!state.open) { state.backgroundRenderPending = true; return; }
     state.backgroundRenderPending = false;
-    const kind = state.player ? `member:${state.player.id}:${state.view}` : state.token ? 'saved-login' : 'login';
+    const kind = storageWarning ? 'storage-unavailable'
+      : state.player ? `member:${state.player.id}:${state.view}` : state.token ? 'saved-login' : 'login';
     if (renderedKind === kind) {
       updatePanelControls();
       if (state.player) { if (state.view === 'targets') renderCards(); else renderSuggestions(); }
       return;
     }
     resetPanel(); renderedKind = kind;
+    if (storageWarning) {
+      const retry = button('Retry saved sign-in', async () => {
+        if (state.busy) return;
+        state.busy = true; render();
+        try { await retryStorage(host); }
+        catch { if (!disposed) message(storageWarning); }
+        finally { if (!disposed) { state.busy = false; render(); } }
+      });
+      panelUi = { retry }; content.append(retry);
+      return;
+    }
     if (!state.player && state.token) {
       const intro = element('p', 'Your login is saved on this device. NWA will reconnect without asking for your key again.');
       const retry = button(state.loading ? 'Restoring session…' : 'Retry saved login', () => void loadTargets(true));
@@ -2207,10 +2257,9 @@ function mountTargetList(platform, storageWarning = '') {
       void loadTargets(false, false, Boolean(state.player));
     }
   }
-  const saved = platform.getValue(storageKey, null);
-  if (saved?.token && Date.parse(saved.expiresAt) > serviceNow()) {
+  if (!storageWarning && validSavedLogin(saved)) {
     state.token = saved.token; state.expiresAt = saved.expiresAt;
-  } else if (!storageWarning) persist(() => platform.deleteValue(storageKey));
+  }
   function updateViewport() {
     const viewport = window.visualViewport;
     if (viewport && Number.isFinite(viewport.height) && viewport.height > 0 && host.isConnected !== false) {
@@ -2230,7 +2279,8 @@ function mountTargetList(platform, storageWarning = '') {
   listen(document, 'visibilitychange', () => {
     updatePageNotice();
     if (!pageVisible()) lazyCardsObserver?.disconnect();
-    if (pageVisible() && state.token && Date.parse(state.expiresAt) > serviceNow() && !state.busy) {
+    if (pageVisible() && state.token && !state.busy) {
+      checkSessionExpiry();
       void loadTargets(false, false, Boolean(state.player));
     }
   });
@@ -2256,14 +2306,11 @@ function mountTargetList(platform, storageWarning = '') {
     downloadUrls.clear();
   }
   host.__nwaDispose = dispose; listen(host, 'nwa:dispose', dispose);
-  // Expire the session and checked attack links even while the panel is idle.
+  // Refresh authorization and checked attack links even while the panel is idle.
   const maintenanceTimer = setInterval(() => {
     if (disposed) return;
     updatePageNotice();
-    if (state.token && Date.parse(state.expiresAt) <= serviceNow()) {
-      if (!restoreNewerSession()) { clearSession(); message('Session expired. Sign in again.'); render(); }
-    }
-    else if (pageVisible() && state.open && state.player && !state.pendingChecks.size) {
+    if (!checkSessionExpiry() && pageVisible() && state.open && state.player && !state.pendingChecks.size) {
       let expired = false;
       state.targets = state.targets.map(target => {
         if (target.checkedAt && !assessTarget(target).live) {
@@ -2281,6 +2328,7 @@ function mountTargetList(platform, storageWarning = '') {
     }
   }, 5000);
   if (storageWarning) message(storageWarning);
-  render();
-  if (state.token && pageVisible()) void loadTargets();
+  if (openOnMount) toggle(true, settings);
+  else render();
+  if (state.token && pageVisible() && !state.targetLoad) void loadTargets();
 }

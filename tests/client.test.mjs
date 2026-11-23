@@ -133,7 +133,7 @@ function fixture(saved = null, preferences = null, existingHost = null, initialN
     window: { location: { assign: url => navigations.push(url) } },
     document,
     GM_xmlhttpRequest: options => { requests.push(options); },
-    GM_getValue: (key, fallback) => storage.get(key) ?? fallback,
+    GM_getValue: (key, fallback) => { clipboard.beforeStorageRead?.(key); return storage.get(key) ?? fallback; },
     GM_setValue: (key, value) => { storage.set(key, value); writes.push(value); },
     GM_deleteValue: key => storage.delete(key),
     setInterval: callback => { timers.push(callback); },
@@ -277,7 +277,7 @@ test('login posts the key once, stores only the session token, and authorizes ta
   assert.equal(descendants(app.root).some(element => element.className === 'attack'), false, 'cached Okay status has no attack link');
 });
 
-test('incompatible backend storage confirmation is rejected before saving a token and cleans up its session', async () => {
+test('incompatible backend storage confirmation cannot save a token or revoke all sessions', async () => {
   for (const metadata of [undefined, { mode: 'memory', expiresAt: keyStorage.expiresAt },
     { mode: 'encrypted', expiresAt: 'invalid' }, { mode: 'encrypted', expiresAt: new Date(NOW - 1).toISOString() },
     { mode: 'encrypted', expiresAt: new Date(NOW + 8 * 86400000).toISOString() }]) {
@@ -287,29 +287,13 @@ test('incompatible backend storage confirmation is rejected before saving a toke
     app.response(app.requests[0], { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player, keyStorage: metadata });
     await flush();
     assert.equal(app.storage.has(app.storageKey), false, 'unconfirmed encrypted storage must never adopt the token');
-    assert.equal(app.requests.length, 2);
-    const cleanup = app.requests[1];
-    assert.equal(cleanup.method, 'DELETE');
-    assert.equal(cleanup.url, `${serviceBase}/api/session`);
-    assert.equal(cleanup.headers.Authorization, `Bearer ${SESSION}`);
-    assert.equal(cleanup.data, undefined);
-    app.response(cleanup, null, 204); await flush();
+    assert.equal(app.requests.length, 1, 'client rejection must not send the owner-wide key removal request');
     assert.match(app.text(), /Update the NWA backend to enable encrypted key storage/);
     assert.equal(app.button('Sign in and save key').disabled, false);
     assert.equal(app.storage.size, 0);
     assert.equal(app.requests.some(request => request.url.endsWith('/api/targets')), false);
     assert.deepEqual(app.navigations, []);
   }
-});
-
-test('incompatible backend cleanup failure does not adopt the token or hide the required backend update', async () => {
-  const app = fixture(); app.openPanel(); app.find(element => element.type === 'password').value = KEY;
-  app.find(element => element.tagName === 'FORM').emit('submit');
-  app.response(app.requests[0], { token: SESSION, expiresAt: new Date(NOW + 3_600_000).toISOString(), player }); await flush();
-  app.requests[1].onerror(); await flush();
-  assert.equal(app.storage.size, 0);
-  assert.match(app.text(), /Update the NWA backend to enable encrypted key storage/);
-  assert.equal(app.button('Sign in and save key').disabled, false);
 });
 
 test('a stored session verifies authorization before displaying any targets', async () => {
@@ -359,11 +343,12 @@ test('a seven-day saved session restores after 30 minutes and on day six without
 
     const beforeExpiry = app.requests.length;
     app.setNow(NOW + lifetime); app.timers[0]();
-    assert.equal(app.storage.has(app.storageKey), false, 'the seven-day deadline is not extended by use');
+    assert.equal(app.storage.has(app.storageKey), true, 'a local time estimate cannot erase the saved login');
     assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
-    assert.match(app.text(), /Session expired/);
-    app.button('NWA').emit('click'); await flush();
-    assert.equal(app.requests.length, beforeExpiry);
+    assert.equal(app.requests.length, beforeExpiry + 1);
+    assert.equal(app.requests.at(-1).headers.Authorization, `Bearer ${SESSION}`);
+    app.response(app.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401); await flush();
+    assert.equal(app.storage.has(app.storageKey), false, 'server confirms the original seven-day expiry');
     assert.match(app.text(), /Torn Limited API key/);
   }
 });
@@ -376,12 +361,16 @@ test('target rows label FFScouter model estimates with the provider name', async
   assert.equal(textContent(card).includes('model'), false);
 });
 
-test('a seven-day token already at its deadline is cleared on reload before any authorization request', () => {
+test('a seven-day token at its deadline on reload is cleared only after the service confirms expiry', async () => {
   const deadline = NOW + 7 * 24 * 60 * 60 * 1000;
   const app = fixture({ token: SESSION, expiresAt: new Date(deadline).toISOString() }, null, null, deadline);
-  assert.equal(app.storage.has(app.storageKey), false);
+  assert.equal(app.storage.has(app.storageKey), true);
   app.settings().emit('click');
-  assert.equal(app.requests.length, 0);
+  assert.equal(app.requests.length, 1);
+  assert.equal(app.requests[0].headers.Authorization, `Bearer ${SESSION}`);
+  app.response(app.requests[0], { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401);
+  await flush();
+  assert.equal(app.storage.has(app.storageKey), false);
   assert.match(app.text(), /Torn Limited API key/);
   assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
 });
@@ -403,11 +392,40 @@ test('a concurrent login cannot strand a restored session in the loading state',
   assert.equal(app.button('Refresh list').disabled, false);
 });
 
-test('expired saved credentials are removed before a request is made', () => {
-  const app = fixture({ token: SESSION, expiresAt: new Date(NOW - 1).toISOString() });
-  app.settings().emit('click');
+test('reload restores a valid login when the device clock is beyond its expiry', async () => {
+  const saved = { token: SESSION, expiresAt: new Date(NOW + 10000).toISOString() };
+  const app = fixture(saved, null, null, NOW + 3600000);
+  app.openPanel();
+  assert.equal(app.requests.length, 1);
+  app.response(app.requests[0], { error: { code: 'TORN_KEY_UNAVAILABLE', message: 'Torn could not verify the saved key yet.' } }, 503);
+  await flush();
+  assert.equal(app.storage.get(app.storageKey), saved);
+  assert.equal(descendants(app.root).some(element => element.type === 'password' || element.className === 'card'), false);
+  app.button('Retry saved login').emit('click');
+  assert.equal(app.requests.at(-1).headers.Authorization, `Bearer ${SESSION}`);
+  app.response(app.requests.at(-1), { player, targets: [target], warnings: [], serverTime: new Date(NOW).toISOString() }); await flush();
+  assert.match(app.text(), /Target Player/);
+  assert.equal(app.storage.get(app.storageKey), saved);
+});
+
+test('a device storage read failure offers retry without prompting for a replacement API key', async () => {
+  let blocked = true;
+  const saved = { token: SESSION, expiresAt: new Date(NOW + 3600000).toISOString() };
+  const app = fixture(saved, null, null, NOW, 'visible', { beforeStorageRead() { if (blocked) throw new Error('Storage temporarily unavailable'); } });
+  app.openPanel();
   assert.equal(app.requests.length, 0);
-  assert.equal(app.storage.size, 0);
+  assert.equal(descendants(app.root).some(element => element.type === 'password'), false);
+  app.button('Retry saved sign-in').emit('click'); await flush();
+  assert.equal(app.requests.length, 0);
+  assert.equal(app.storage.get(app.storageKey), saved);
+  blocked = false;
+  app.button('Retry saved sign-in').emit('click'); await flush();
+  assert.equal(app.requests.length, 1);
+  assert.equal(app.requests[0].headers.Authorization, `Bearer ${SESSION}`);
+  const mounted = app.body.children.filter(element => element.id === 'torn-targetlist-host');
+  assert.equal(mounted.length, 1);
+  app.response(app.requests[0], { player, targets: [target], warnings: [] }); await flush();
+  assert.match(textContent(mounted[0].shadow), /Target Player/);
 });
 
 test('an in-flight status response cannot restore targets after sign out', async () => {
@@ -566,13 +584,16 @@ test('a forced-fetch timeout unblocks login and ignores a late successful respon
   assert.match(app.text(), /Torn Limited API key/);
 });
 
-test('the idle timer clears expired sessions while the panel is closed', async () => {
+test('the idle timer verifies suspected expiry before clearing a saved session', async () => {
   const app = fixture(); await app.signIn();
   app.setNow(NOW + 3_600_000);
   app.timers[0]();
+  assert.equal(app.storage.has(app.storageKey), true);
+  assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
+  assert.equal(app.requests.at(-1).headers.Authorization, `Bearer ${SESSION}`);
+  app.response(app.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401); await flush();
   assert.equal(app.storage.size, 0);
   assert.match(app.text(), /Session expired/);
-  assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
 });
 
 test('the NWA launcher opens login without requesting a target when signed out', async () => {
@@ -1561,10 +1582,13 @@ test('server time retains strict stale-status and lease checks without automatic
   }
 });
 
-test('a calibrated session still expires on elapsed service time', async () => {
+test('a calibrated session checks authorization when its local estimate expires', async () => {
   const app = fixture(null, null, null, NOW - 31000);
   await app.signIn([target], { serverTime: new Date(NOW).toISOString(), capabilities: { nextTarget: true } });
   app.advanceMonotonic(3600000); app.timers[0](); await flush();
+  assert.equal(app.storage.has(app.storageKey), true);
+  assert.equal(descendants(app.root).some(element => element.className === 'card'), false);
+  app.response(app.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401); await flush();
   assert.equal(app.storage.has(app.storageKey), false);
   assert.match(app.text(), /Session expired/);
 });
@@ -2052,7 +2076,7 @@ test('signout, expiry, or a refreshed pool prevents an old NWA status response f
     app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW).toISOString(), reservationExpiresAt: new Date((NOW) + 120000).toISOString() }); await flush();
     assert.deepEqual(app.navigations, [], interruption);
     assert.equal(app.requests.length, after, 'stale checks cannot continue to another candidate');
-    if (interruption !== 'refresh') assert.equal(app.storage.has(app.storageKey), false);
+    if (interruption !== 'refresh') assert.equal(app.storage.has(app.storageKey), interruption === 'expire');
     else {
       app.response(app.requests.at(-1), { player, targets: [{ ...target, id: 40001 }], warnings: [], reservations: coordination }); await flush();
       assert.deepEqual(app.navigations, []);
@@ -2066,7 +2090,8 @@ test('NWA rechecks session expiry at navigation time even before the idle timer 
   app.response(live, { id: target.id, status: { state: 'Okay' }, checkedAt: new Date(NOW + 3_600_000).toISOString(), reservationExpiresAt: new Date((NOW + 3_600_000) + 120000).toISOString() });
   await flush();
   assert.deepEqual(app.navigations, []);
-  assert.equal(app.storage.has(app.storageKey), false);
+  assert.equal(app.storage.has(app.storageKey), true);
+  assert.equal(app.requests.at(-1).method, 'GET');
 });
 
 test('revocation during NWA selection stops further checks and clears the session', async () => {
@@ -2573,6 +2598,9 @@ test('session expiry and revocation during a suggestion request cannot restore r
     if (outcome === 'expire') {
       app.setNow(NOW + 3_600_000); app.timers[0]();
       app.response(post, { suggestion: suggestion() }, 201);
+      await flush();
+      assert.equal(app.storage.get(app.storageKey).token, SESSION);
+      app.response(app.requests.at(-1), { error: { code: 'SESSION_EXPIRED', message: 'Session expired.' } }, 401);
     } else app.response(post, { error: { code: 'FACTION_NOT_ALLOWED', message: 'Faction access revoked.' } }, 403);
     await flush(); assert.equal(app.storage.size, 0); assert.match(app.text(), /Torn Limited API key/);
     assert.equal(descendants(app.root).some(element => element.textContent === 'Approve'), false);
@@ -2662,7 +2690,7 @@ test('sign out and expiry clear the export text and retained controls cannot exp
     assert.equal(preview.value, '', `${interruption} clears text even from the removed textarea node`);
     retained.emit('click');
     assert.equal(descendants(app.root).some(element => element.attributes.get('aria-label') === 'Exported target list'), false);
-    assert.equal(app.storage.has(app.storageKey), false);
+    assert.equal(app.storage.has(app.storageKey), interruption === 'expiry');
   }
 });
 
